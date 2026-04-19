@@ -10,7 +10,7 @@ struct VendorProduct {
 fn main() -> anyhow::Result<()> {
     // 1. Load the container
     let file = RsmfFile::open("cpe_embeddings_nf4.rsmf")?;
-    
+
     // 2. Load the metadata asset (to find the right indices)
     let asset = file.asset("augmented_vendor_products.json").unwrap();
     let db: Vec<VendorProduct> = serde_json::from_slice(asset.bytes)?;
@@ -30,14 +30,16 @@ fn main() -> anyhow::Result<()> {
         if entry.product.contains("windows_11") && product_idx.is_none() {
             product_idx = Some(i);
         }
-        if vendor_idx.is_some() && product_idx.is_some() { break; }
+        if vendor_idx.is_some() && product_idx.is_some() {
+            break;
+        }
     }
 
     // 4. ACTIVATE THE MODEL: Retrieve and Decode NF4 Embeddings
     println!("Activating NF4 Model for verification...");
     let tensor_name = "embeddings_sentence-transformers_all-mpnet-base-v2";
     let nf4_view = file.tensor_view_variant(tensor_name, 1)?; // Use index 1 (the NF4 variant)
-    
+
     // Dequantize the entire tensor to retrieve high-precision vectors
     // (In a real system, we'd use a SIMD row-lookup, here we decode the variant)
     let all_embeddings = nf4_view.decode_f32()?;

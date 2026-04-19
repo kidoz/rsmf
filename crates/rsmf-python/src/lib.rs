@@ -21,12 +21,37 @@ use rsmf_core::{LogicalDtype, RsmfError as CoreError, RsmfFile as CoreFile};
 // matching on `.args[0]`.
 // ---------------------------------------------------------------------------
 
-create_exception!(rsmf, RsmfError, PyException, "Base class for all rsmf errors.");
-create_exception!(rsmf, RsmfNotFound, RsmfError, "Tensor, asset, graph, or shard not found.");
-create_exception!(rsmf, RsmfStructuralError, RsmfError, "Malformed file: bad preamble, overlapping sections, bad manifest.");
-create_exception!(rsmf, RsmfVerificationError, RsmfError, "BLAKE3 checksum mismatch on preamble, section, variant, graph, or asset.");
+create_exception!(
+    rsmf,
+    RsmfError,
+    PyException,
+    "Base class for all rsmf errors."
+);
+create_exception!(
+    rsmf,
+    RsmfNotFound,
+    RsmfError,
+    "Tensor, asset, graph, or shard not found."
+);
+create_exception!(
+    rsmf,
+    RsmfStructuralError,
+    RsmfError,
+    "Malformed file: bad preamble, overlapping sections, bad manifest."
+);
+create_exception!(
+    rsmf,
+    RsmfVerificationError,
+    RsmfError,
+    "BLAKE3 checksum mismatch on preamble, section, variant, graph, or asset."
+);
 create_exception!(rsmf, RsmfIoError, RsmfError, "Underlying I/O failure.");
-create_exception!(rsmf, RsmfUnsupportedError, RsmfError, "Format or dtype is not supported by this build.");
+create_exception!(
+    rsmf,
+    RsmfUnsupportedError,
+    RsmfError,
+    "Format or dtype is not supported by this build."
+);
 
 fn map_core_error(err: CoreError) -> PyErr {
     let msg = err.to_string();

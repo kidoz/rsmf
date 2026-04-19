@@ -4,11 +4,11 @@
 //! table, manifest, cross-references). Optional full checksum verification is
 //! exposed through [`RsmfFile::full_verify`] and [`crate::validator::Validator`].
 
-use std::sync::OnceLock;
 use std::collections::HashMap;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::OnceLock;
 
 use memmap2::Mmap;
 
