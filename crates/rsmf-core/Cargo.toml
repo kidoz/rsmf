@@ -1,0 +1,47 @@
+[package]
+name = "rsmf-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Core reader, writer, validator, and variant selection for the Rust Split Model Format (RSMF)."
+readme = "../../README.md"
+
+[lib]
+name = "rsmf_core"
+path = "src/lib.rs"
+
+[dependencies]
+memmap2.workspace = true
+bytemuck.workspace = true
+blake3.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+half.workspace = true
+wide.workspace = true
+tracing = { workspace = true, optional = true }
+safetensors = { workspace = true, optional = true }
+gguf-rs-lib = { workspace = true, optional = true, features = ["mmap"] }
+ndarray = { version = "0.17", optional = true }
+ndarray-npy = { workspace = true, optional = true }
+zstd = { workspace = true, optional = true }
+
+[features]
+default = ["safetensors", "gguf", "npy"]
+# Enables `rsmf_core::safetensors` module which converts HuggingFace safetensors
+# archives into RSMF files. Keeps the default build useful for the CLI.
+safetensors = ["dep:safetensors"]
+# Enables `rsmf_core::gguf` module for GGUF conversion.
+gguf = ["dep:gguf-rs-lib"]
+# Enables `rsmf_core::npy` module for NumPy conversion.
+npy = ["dep:ndarray", "dep:ndarray-npy"]
+# Enables zstd compression for graph and asset sections.
+compression = ["dep:zstd"]
+# Enables instrumentation spans for performance debugging.
+tracing = ["dep:tracing"]
+
+[dev-dependencies]
+tempfile.workspace = true
+safetensors.workspace = true
