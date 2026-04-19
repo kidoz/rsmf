@@ -1,0 +1,68 @@
+[build-system]
+requires = ["maturin>=1.5,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "rsmf"
+version = "0.1.0"
+description = "Python bindings for the Rust Split Model Format (rsmf) — mmap-backed ML model tensors with quantized variants, BLAKE3 integrity, and bundled ONNX / asset distribution."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.11"
+authors = [
+    { name = "Aleksandr Pavlov", email = "ckidoz@gmail.com" },
+]
+keywords = [
+    "machine-learning",
+    "ml",
+    "tensors",
+    "safetensors",
+    "gguf",
+    "quantization",
+    "onnx",
+    "mmap",
+    "blake3",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Programming Language :: Rust",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Libraries",
+    "Typing :: Typed",
+]
+dependencies = [
+    "numpy>=1.23",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7",
+    "maturin>=1.5,<2.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/kidoz/rsmf"
+Repository = "https://github.com/kidoz/rsmf"
+Issues = "https://github.com/kidoz/rsmf/issues"
+
+[tool.maturin]
+# The native extension is a private submodule of the public Python package.
+# `python-source` tells maturin where the pure-Python wrapper lives.
+python-source = "python"
+module-name = "rsmf._rsmf"
+features = ["pyo3/extension-module"]
+# Wheel is abi3-py38 under the hood (pyo3 feature pin in workspace
+# Cargo.toml), so a single wheel works on every Python >= 3.11 declared
+# above. Lowering the minimum advertised version is a later decision.

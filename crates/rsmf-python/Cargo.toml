@@ -1,0 +1,24 @@
+[package]
+name = "rsmf-python"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Python bindings for RSMF — mmap-backed ML model loading for Python."
+
+[lib]
+name = "_rsmf"
+crate-type = ["cdylib"]
+
+[dependencies]
+# `compression` is required so the Python wheel can read files produced by
+# the CLI with `--compress-tensors` / `--compress-graph` / `--compress-assets`
+# (the CLI enables the feature by default). `tracing` opts in to the shared
+# instrumentation spans so `RUST_LOG=info` works across the stack.
+rsmf-core = { path = "../rsmf-core", version = "0.1.0", features = ["compression", "tracing"] }
+pyo3.workspace = true
+numpy.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
