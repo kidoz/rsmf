@@ -20,6 +20,14 @@ pub struct Args {
     /// Input NumPy (.npy) file.
     #[arg(long = "from-npy", value_name = "PATH")]
     pub from_npy: Option<PathBuf>,
+    /// Input PyTorch checkpoint (.pt / .pth / .bin). Requires `python3`
+    /// with `torch` and `safetensors` installed on PATH; rsmf shells out
+    /// to it with `torch.load(..., weights_only=True)` so arbitrary-code
+    /// execution is blocked during conversion. Set env var
+    /// `RSMF_ALLOW_UNSAFE_PICKLE=1` only if you trust the source and the
+    /// safe loader rejects it.
+    #[arg(long = "from-torch", value_name = "PATH")]
+    pub from_torch: Option<PathBuf>,
     /// Output RSMF file.
     #[arg(long = "out", value_name = "PATH")]
     pub out: PathBuf,
@@ -103,7 +111,27 @@ pub fn run(args: Args) -> Result<(), CliError> {
         .map(super::parse_target_tag)
         .transpose()?;
 
-    let mut writer = if let Some(input) = args.from_safetensors {
+    // Resolve --from-torch by shelling out to python3 to produce a temp
+    // safetensors file. Any --quantize / --cast-f16 flags then apply to it
+    // through the existing safetensors pipeline below. The NamedTempFile is
+    // held in a guard local so it lives until this function returns and is
+    // unlinked automatically on drop.
+    let _torch_tmp_guard;
+    let effective_from_safetensors: Option<PathBuf> = if let Some(pt_path) = args.from_torch {
+        let tmp = tempfile::Builder::new()
+            .prefix("rsmf-torch-")
+            .suffix(".safetensors")
+            .tempfile()
+            .map_err(|e| CliError::user(anyhow!("tempfile: {e}")))?;
+        convert_torch_to_safetensors(&pt_path, tmp.path())?;
+        let path = tmp.path().to_path_buf();
+        _torch_tmp_guard = tmp;
+        Some(path)
+    } else {
+        args.from_safetensors
+    };
+
+    let mut writer = if let Some(input) = effective_from_safetensors {
         let bytes = std::fs::read(&input)
             .map_err(|e| CliError::user(anyhow!("{}: {e}", input.display())))?;
 
@@ -256,7 +284,7 @@ pub fn run(args: Args) -> Result<(), CliError> {
         }
     } else {
         return Err(CliError::user(anyhow!(
-            "one of --from-safetensors, --from-gguf or --from-npy must be provided"
+            "one of --from-safetensors, --from-torch, --from-gguf, or --from-npy must be provided"
         )));
     };
 
@@ -319,4 +347,125 @@ pub fn run(args: Args) -> Result<(), CliError> {
         output = args.out.display(),
     );
     Ok(())
+}
+
+/// Python one-liner that converts a PyTorch checkpoint to safetensors.
+///
+/// Uses `torch.load(..., weights_only=True)` so arbitrary-code execution
+/// on pickle load is blocked by default. Setting
+/// `RSMF_ALLOW_UNSAFE_PICKLE=1` re-attempts with `weights_only=False` —
+/// use only for trusted files that contain custom pickled classes.
+///
+/// The script walks up to two nesting levels (`state_dict`, `model`,
+/// `model_state_dict`) to locate a tensor-valued dict, filters to
+/// `torch.Tensor` values, and calls `safetensors.torch.save_file`.
+const TORCH_TO_SAFETENSORS_SCRIPT: &str = r#"
+import os
+import sys
+
+try:
+    import torch
+except ImportError:
+    raise SystemExit("rsmf --from-torch requires Python with `torch` installed")
+try:
+    import safetensors.torch
+except ImportError:
+    raise SystemExit("rsmf --from-torch requires `safetensors` installed alongside torch")
+
+
+def find_state_dict(obj):
+    if isinstance(obj, torch.Tensor):
+        return {"tensor": obj}
+    if isinstance(obj, dict):
+        if any(isinstance(v, torch.Tensor) for v in obj.values()):
+            return obj
+        for k in ("state_dict", "model", "model_state_dict"):
+            nested = obj.get(k)
+            if isinstance(nested, dict) and any(isinstance(v, torch.Tensor) for v in nested.values()):
+                return nested
+    raise SystemExit(
+        f"rsmf could not locate a tensor state_dict in {type(obj).__name__}"
+    )
+
+
+pt_path, out_path = sys.argv[1], sys.argv[2]
+try:
+    loaded = torch.load(pt_path, map_location="cpu", weights_only=True)
+except Exception as err:
+    if os.getenv("RSMF_ALLOW_UNSAFE_PICKLE", "0").lower() in ("1", "true", "yes"):
+        loaded = torch.load(pt_path, map_location="cpu", weights_only=False)
+    else:
+        raise SystemExit(
+            f"torch.load rejected this file in safe mode: {err}\n"
+            "Set RSMF_ALLOW_UNSAFE_PICKLE=1 only for files you trust."
+        )
+
+state = find_state_dict(loaded)
+tensors = {}
+for name, val in state.items():
+    if not isinstance(val, torch.Tensor):
+        continue
+    # contiguous() + clone() guarantees owned, non-aliased storage that
+    # safetensors.torch.save_file accepts without "shared memory" errors.
+    tensors[name] = val.detach().contiguous().clone()
+
+if not tensors:
+    raise SystemExit("rsmf found no tensors in the input")
+
+safetensors.torch.save_file(tensors, out_path)
+sys.stderr.write(f"[rsmf] converted {len(tensors)} tensors via python subprocess\n")
+"#;
+
+/// Convert a PyTorch checkpoint at `pt_path` into a safetensors file at
+/// `out_path` by shelling out to `python3`.
+fn convert_torch_to_safetensors(
+    pt_path: &std::path::Path,
+    out_path: &std::path::Path,
+) -> Result<(), CliError> {
+    if !pt_path.exists() {
+        return Err(CliError::user(anyhow!(
+            "torch input not found: {}",
+            pt_path.display()
+        )));
+    }
+
+    let python = resolve_python_binary()?;
+    let status = std::process::Command::new(&python)
+        .arg("-c")
+        .arg(TORCH_TO_SAFETENSORS_SCRIPT)
+        .arg(pt_path)
+        .arg(out_path)
+        .status()
+        .map_err(|e| {
+            CliError::user(anyhow!(
+                "failed to invoke {}: {e}. Install python3 with `torch` and `safetensors` to use --from-torch.",
+                python
+            ))
+        })?;
+
+    if !status.success() {
+        return Err(CliError::user(anyhow!(
+            "python torch→safetensors conversion failed (exit code {:?})",
+            status.code()
+        )));
+    }
+
+    if !out_path.exists() || std::fs::metadata(out_path).map(|m| m.len()).unwrap_or(0) == 0 {
+        return Err(CliError::user(anyhow!(
+            "torch→safetensors produced no output at {}",
+            out_path.display()
+        )));
+    }
+    Ok(())
+}
+
+/// Resolve the Python executable. Honours `RSMF_PYTHON_BIN` for
+/// environments that need a specific venv interpreter.
+fn resolve_python_binary() -> Result<String, CliError> {
+    if let Ok(explicit) = std::env::var("RSMF_PYTHON_BIN") {
+        if !explicit.is_empty() {
+            return Ok(explicit);
+        }
+    }
+    Ok("python3".to_string())
 }

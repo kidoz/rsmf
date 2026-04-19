@@ -54,13 +54,20 @@ Install the `rsmf` CLI locally:
 cargo install --path crates/rsmf-cli
 ```
 
-### Pack from safetensors, GGUF, or NumPy
+### Pack from safetensors, GGUF, NumPy, or PyTorch
 
 ```sh
 rsmf pack --from-safetensors model.safetensors --out model.rsmf
 rsmf pack --from-gguf        model.gguf        --out model.rsmf
 rsmf pack --from-npy         embeddings.npy    --out embeddings.rsmf
+rsmf pack --from-torch       checkpoint.pt     --out model.rsmf
 ```
+
+`--from-torch` shells out to `python3` with `torch` and `safetensors`
+installed; it uses `torch.load(..., weights_only=True)` so arbitrary-code
+execution on pickle load is blocked by default. Override the interpreter
+with `RSMF_PYTHON_BIN=/path/to/python3`; set `RSMF_ALLOW_UNSAFE_PICKLE=1`
+only for checkpoints you trust that the safe loader rejects.
 
 ### Add packed variants during pack
 

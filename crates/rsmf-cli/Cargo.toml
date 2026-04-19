@@ -25,6 +25,7 @@ tracing-subscriber = { workspace = true }
 ndarray = { version = "0.17", optional = true }
 ndarray-npy = { workspace = true, optional = true }
 bytemuck.workspace = true
+tempfile.workspace = true
 
 [features]
 default = ["safetensors", "gguf", "npy", "compression", "tracing"]

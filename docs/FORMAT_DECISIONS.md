@@ -29,3 +29,29 @@ The `rsmf-python` crate exposes `RsmfFile` with two tensor-access paths:
 Graph and asset accessors return `bytes`. No attempt is made to parse ONNX or to wrap it in a higher-level runtime object; that belongs to `rsmf-runtime` or the caller.
 
 PyO3 is pinned to `v0.22` with `abi3-py38`, producing a single wheel that loads on Python ≥ 3.8. Build via `maturin develop -m crates/rsmf-python/Cargo.toml`.
+
+## D8 — Source-format conversion priorities
+
+The `rsmf pack` and `rsmf import` CLIs ingest from a fixed priority-ordered
+list of source formats. The order was chosen against four criteria — reach,
+quality/security win vs. the source, Rust dep cost, and fit with rsmf's
+tensor/graph/asset model.
+
+- **Currently shipped:** safetensors (`--from-safetensors`, used also by
+  `rsmf import` on HuggingFace Hub), GGUF (`--from-gguf`), NumPy
+  (`--from-npy`), PyTorch checkpoints (`--from-torch`).
+- **PyTorch `.pt` / `.pth` / `.bin`** uses a `python3` subprocess that
+  calls `torch.load(..., weights_only=True)` and
+  `safetensors.torch.save_file` into a temp file, then delegates to the
+  existing safetensors pipeline. The safe loader blocks arbitrary code
+  execution; `RSMF_ALLOW_UNSAFE_PICKLE=1` opts back in for trusted files
+  the safe loader refuses. Pure-Rust pickle parsing is a follow-up.
+- **HuggingFace imports** auto-bundle `config.json`, `generation_config.json`,
+  `tokenizer.json`, `tokenizer_config.json`, `special_tokens_map.json`,
+  `vocab.json`, `merges.txt`, `added_tokens.json`, `preprocessor_config.json`,
+  and `chat_template.json` as rsmf assets when the remote repo carries them.
+- **Next up**, in order: ONNX with initializer extraction, `--from-tflite`,
+  `--from-h5`, and export paths (`rsmf export safetensors` / `gguf` / `onnx`).
+  Tier-C formats (TensorRT engines, Qualcomm SNPE, NCNN, MNN, GGML legacy)
+  are explicitly out of scope because their bytes are hardware- or
+  driver-bound and cannot be portably re-emitted.
