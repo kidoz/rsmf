@@ -1,0 +1,23 @@
+[package]
+name = "rsmf-runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "High-level inference runtime for RSMF — wires mmap tensors into ONNX Runtime."
+
+[dependencies]
+rsmf-core = { path = "../rsmf-core", version = "0.1.0", features = ["compression"] }
+ort.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+ndarray = "0.17"
+tracing = { workspace = true, optional = true }
+
+[features]
+default = ["tracing"]
+tracing = ["rsmf-core/tracing", "dep:tracing"]
