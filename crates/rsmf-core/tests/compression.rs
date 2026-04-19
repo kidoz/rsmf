@@ -173,7 +173,7 @@ fn uncompressed_files_still_open_unchanged() {
 fn fail_when_compression_requested_without_feature() {
     let writer = RsmfWriter::new()
         .with_tensor(basic_tensor())
-        .with_graph(GraphInput::ort("data".to_vec()).with_compression(3));
+        .with_graph(GraphInput::ort(b"data".to_vec()).with_compression(3));
     let err = writer.write_to_bytes().unwrap_err();
     let msg = err.to_string();
     assert!(

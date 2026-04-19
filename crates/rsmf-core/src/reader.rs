@@ -479,28 +479,74 @@ impl RsmfFile {
     }
 
     /// Run the full checksum-verification pass.
+    ///
+    /// With the `parallel` cargo feature enabled the section and variant
+    /// hash loops fan out over rayon's global thread pool — an N-core
+    /// machine verifies a multi-GB file ~N× faster. The parallel path
+    /// is numerically and error-wise identical to the sequential one;
+    /// the first mismatch (by any thread) wins.
     pub fn full_verify(&self) -> Result<()> {
         #[cfg(feature = "tracing")]
         let _span = info_span!("full_verify").entered();
 
-        for (i, s) in self.sections.iter().enumerate() {
-            let bytes = &self.master_mmap[s.offset as usize..(s.offset + s.length) as usize];
-            let got = digest_128(bytes);
-            if got != s.checksum {
-                return Err(RsmfError::ChecksumMismatch {
-                    kind: format!("section[{i}] {}", s.kind.name()),
-                });
+        #[cfg(feature = "parallel")]
+        {
+            use rayon::prelude::*;
+
+            // Section hashes are embarrassingly parallel: each section's
+            // byte range is a disjoint subslice of the mmap.
+            let section_err = self.sections.par_iter().enumerate().find_map_any(|(i, s)| {
+                let bytes = &self.master_mmap[s.offset as usize..(s.offset + s.length) as usize];
+                if digest_128(bytes) != s.checksum {
+                    Some(RsmfError::ChecksumMismatch {
+                        kind: format!("section[{i}] {}", s.kind.name()),
+                    })
+                } else {
+                    None
+                }
+            });
+            if let Some(e) = section_err {
+                return Err(e);
+            }
+
+            // Variant hashes fan out too, but `variant_bytes` may return
+            // `Result`; bubble the first error out.
+            let variant_result: Result<()> = self.manifest.variants.par_iter().try_for_each(|v| {
+                let bytes = self.variant_bytes(v)?;
+                if digest_128(bytes) != v.checksum {
+                    return Err(RsmfError::ChecksumMismatch {
+                        kind: format!("variant target={}", v.target.name()),
+                    });
+                }
+                Ok(())
+            });
+            variant_result?;
+        }
+
+        #[cfg(not(feature = "parallel"))]
+        {
+            for (i, s) in self.sections.iter().enumerate() {
+                let bytes = &self.master_mmap[s.offset as usize..(s.offset + s.length) as usize];
+                let got = digest_128(bytes);
+                if got != s.checksum {
+                    return Err(RsmfError::ChecksumMismatch {
+                        kind: format!("section[{i}] {}", s.kind.name()),
+                    });
+                }
+            }
+            for v in &self.manifest.variants {
+                let bytes = self.variant_bytes(v)?;
+                let got = digest_128(bytes);
+                if got != v.checksum {
+                    return Err(RsmfError::ChecksumMismatch {
+                        kind: format!("variant target={}", v.target.name()),
+                    });
+                }
             }
         }
-        for v in &self.manifest.variants {
-            let bytes = self.variant_bytes(v)?;
-            let got = digest_128(bytes);
-            if got != v.checksum {
-                return Err(RsmfError::ChecksumMismatch {
-                    kind: format!("variant target={}", v.target.name()),
-                });
-            }
-        }
+
+        // Graphs and assets stay sequential: typically <5 items per
+        // file, so the rayon dispatch overhead would dominate.
         let payloads = self.graph_payloads();
         for (i, g) in self.manifest.graphs.iter().enumerate() {
             if let Some(payload) = payloads.get(i) {

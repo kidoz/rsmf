@@ -22,6 +22,7 @@ anyhow.workspace = true
 half.workspace = true
 wide.workspace = true
 tracing = { workspace = true, optional = true }
+rayon = { workspace = true, optional = true }
 safetensors = { workspace = true, optional = true }
 gguf-rs-lib = { workspace = true, optional = true, features = ["mmap"] }
 ndarray = { version = "0.17", optional = true }
@@ -41,6 +42,11 @@ npy = ["dep:ndarray", "dep:ndarray-npy"]
 compression = ["dep:zstd"]
 # Enables instrumentation spans for performance debugging.
 tracing = ["dep:tracing"]
+# Parallelises `full_verify` over rayon. BLAKE3 hashing on a multi-GB
+# file drops from O(file_size / single-core) to O(file_size / cores).
+# Sequential path stays as the default; turn this on when the caller
+# can spare the rayon global thread pool.
+parallel = ["dep:rayon"]
 
 [dev-dependencies]
 tempfile.workspace = true

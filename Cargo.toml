@@ -37,6 +37,7 @@ thiserror = "2.0"
 anyhow = "1.0"
 half = { version = "2.4", features = ["bytemuck"] }
 wide = "0.7"
+rayon = "1.10"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
