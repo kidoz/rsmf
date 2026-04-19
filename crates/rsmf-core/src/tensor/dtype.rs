@@ -101,6 +101,18 @@ impl LogicalDtype {
 ///
 /// For RSMF v1, this includes all [`LogicalDtype`] plus specialized
 /// block-quantized formats.
+///
+/// Discriminants 1-13 are reserved for [`LogicalDtype`]. Discriminants
+/// 100+ are block / specialty formats; new values are appended at
+/// increasing indices. Old readers reject unknown discriminants with a
+/// structural error (non-silent), so new entries are format-compatible
+/// per the v1 evolution rules.
+///
+/// Not all reserved discriminants have a full decoder yet — unimplemented
+/// ones surface as `RsmfError::Unsupported` from
+/// [`crate::TensorView::decode_f32`]. Writers that emit them are
+/// documenting the format's forward direction; decoders can land later
+/// without a format-level change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u16)]
 pub enum StorageDtype {
@@ -117,6 +129,27 @@ pub enum StorageDtype {
     NF4 = 103,
     /// 8-bit float (E4M3). Standard OCP FP8 format.
     Fp8E4M3 = 104,
+    /// 4-bit K-quant (Q4K). llama.cpp super-block-with-sub-blocks
+    /// format — 4 bits per weight at ~4.5 bpw including scales.
+    /// Discriminant reserved; decoder not yet implemented.
+    Q4K = 105,
+    /// 5-bit linear block quant (Q5_0). llama.cpp legacy variant.
+    /// Discriminant reserved; decoder not yet implemented.
+    Q5_0 = 106,
+    /// 5-bit K-quant (Q5K). ~5.5 bpw.
+    /// Discriminant reserved; decoder not yet implemented.
+    Q5K = 107,
+    /// 6-bit K-quant (Q6K). ~6.5 bpw, near-lossless.
+    /// Discriminant reserved; decoder not yet implemented.
+    Q6K = 108,
+    /// 2-bit K-quant (Q2K). ~2.6 bpw, extreme compression.
+    /// Discriminant reserved; decoder not yet implemented.
+    Q2K = 109,
+    /// 8-bit float (E5M2). The other standard OCP FP8 format; used
+    /// alongside Fp8E4M3 on H100/Blackwell inference for the layers
+    /// that need larger dynamic range.
+    /// Discriminant reserved; decoder not yet implemented.
+    Fp8E5M2 = 110,
 }
 
 impl StorageDtype {
@@ -131,6 +164,12 @@ impl StorageDtype {
             102 => Self::Q3K,
             103 => Self::NF4,
             104 => Self::Fp8E4M3,
+            105 => Self::Q4K,
+            106 => Self::Q5_0,
+            107 => Self::Q5K,
+            108 => Self::Q6K,
+            109 => Self::Q2K,
+            110 => Self::Fp8E5M2,
             other => {
                 return Err(RsmfError::structural(format!(
                     "unknown storage dtype {other}"
@@ -149,6 +188,12 @@ impl StorageDtype {
             Self::Q3K => 102,
             Self::NF4 => 103,
             Self::Fp8E4M3 => 104,
+            Self::Q4K => 105,
+            Self::Q5_0 => 106,
+            Self::Q5K => 107,
+            Self::Q6K => 108,
+            Self::Q2K => 109,
+            Self::Fp8E5M2 => 110,
         }
     }
 
@@ -162,6 +207,12 @@ impl StorageDtype {
             Self::Q3K => "q3_k",
             Self::NF4 => "nf4",
             Self::Fp8E4M3 => "fp8_e4m3",
+            Self::Q4K => "q4_k",
+            Self::Q5_0 => "q5_0",
+            Self::Q5K => "q5_k",
+            Self::Q6K => "q6_k",
+            Self::Q2K => "q2_k",
+            Self::Fp8E5M2 => "fp8_e5m2",
         }
     }
 
@@ -171,8 +222,16 @@ impl StorageDtype {
     pub fn size_bytes(self) -> Option<usize> {
         match self {
             Self::Logical(dt) => Some(dt.size_bytes()),
-            Self::Fp8E4M3 => Some(1),
-            Self::Q4_0 | Self::Q8_0 | Self::Q3K | Self::NF4 => None, // Blocked
+            Self::Fp8E4M3 | Self::Fp8E5M2 => Some(1),
+            Self::Q4_0
+            | Self::Q8_0
+            | Self::Q3K
+            | Self::NF4
+            | Self::Q4K
+            | Self::Q5_0
+            | Self::Q5K
+            | Self::Q6K
+            | Self::Q2K => None, // Blocked
         }
     }
 }

@@ -5,6 +5,11 @@ use crate::error::{Result, RsmfError};
 use crate::tensor::dtype::{DTYPE_NONE, StorageDtype};
 
 /// Backend / capability tag carried on a variant.
+///
+/// Discriminants are stable u16 wire values. New values are added at
+/// increasing indices; old readers reject unknown values with a
+/// structural error (non-silent) so this enum can grow without a format
+/// version bump (per ADR D7).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u16)]
 pub enum TargetTag {
@@ -25,6 +30,17 @@ pub enum TargetTag {
     Cuda = 6,
     /// Metal-specific layout.
     Metal = 7,
+    /// Vulkan compute (distinct from WGPU — bypasses the WebGPU
+    /// abstraction for direct vendor-specific SPIR-V kernels).
+    Vulkan = 8,
+    /// AMD ROCm / HIP (MI250, MI300, …).
+    RocmHip = 9,
+    /// Google TPU (v4, v5p, v5e, …).
+    Tpu = 10,
+    /// ARMv9 Scalable Vector Extension (SVE / SVE2).
+    CpuSve = 11,
+    /// RISC-V Vector extension (RVV 1.0).
+    CpuRiscvV = 12,
 }
 
 impl TargetTag {
@@ -39,13 +55,20 @@ impl TargetTag {
             5 => Self::Wgpu,
             6 => Self::Cuda,
             7 => Self::Metal,
+            8 => Self::Vulkan,
+            9 => Self::RocmHip,
+            10 => Self::Tpu,
+            11 => Self::CpuSve,
+            12 => Self::CpuRiscvV,
             other => {
                 return Err(RsmfError::structural(format!("unknown target tag {other}")));
             }
         })
     }
 
-    /// Human-readable name.
+    /// Human-readable name. Used by the CLI (`--quantize-q4_0 cpu_generic`)
+    /// and by `rsmf-python`'s `target=` kwarg; names are user-facing so
+    /// they must stay stable across releases.
     #[must_use]
     pub fn name(self) -> &'static str {
         match self {
@@ -57,20 +80,37 @@ impl TargetTag {
             Self::Wgpu => "wgpu",
             Self::Cuda => "cuda",
             Self::Metal => "metal",
+            Self::Vulkan => "vulkan",
+            Self::RocmHip => "rocm_hip",
+            Self::Tpu => "tpu",
+            Self::CpuSve => "cpu_sve",
+            Self::CpuRiscvV => "cpu_riscv_v",
         }
     }
 
     /// Return the arena grouping for this target tag. Packed variants are
-    /// placed in a `PackedArena` per group so that CPU and GPU data can live
-    /// in separate sections with independent alignment requirements.
+    /// placed in a `PackedArena` per group so that CPU and GPU data can
+    /// live in separate sections with independent alignment requirements.
     #[must_use]
     pub fn arena_group(self) -> ArenaGroup {
         match self {
             Self::Canonical => ArenaGroup::Cpu, // not used for packed, but defensively mapped
-            Self::CpuGeneric | Self::CpuAvx2 | Self::CpuAvx512 | Self::CpuNeon => ArenaGroup::Cpu,
-            Self::Wgpu => ArenaGroup::Wgpu,
-            Self::Cuda => ArenaGroup::Cuda,
+            Self::CpuGeneric
+            | Self::CpuAvx2
+            | Self::CpuAvx512
+            | Self::CpuNeon
+            | Self::CpuSve
+            | Self::CpuRiscvV => ArenaGroup::Cpu,
+            // Vulkan and WGPU share memory-layout expectations closely
+            // enough that collocating them keeps packed-arena count low.
+            // Callers who want them separated can still tag variants
+            // individually; the grouping only affects PackedArena
+            // section partitioning at write time.
+            Self::Wgpu | Self::Vulkan => ArenaGroup::Wgpu,
+            // ROCm/HIP shares NVIDIA-style memory + alignment assumptions.
+            Self::Cuda | Self::RocmHip => ArenaGroup::Cuda,
             Self::Metal => ArenaGroup::Metal,
+            Self::Tpu => ArenaGroup::Tpu,
         }
     }
 }
@@ -79,14 +119,17 @@ impl TargetTag {
 /// sections.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum ArenaGroup {
-    /// All CPU-targeted variants (generic, AVX2, AVX-512, NEON).
+    /// All CPU-targeted variants (generic, AVX2, AVX-512, NEON, SVE, RVV).
     Cpu = 0,
-    /// WGPU-targeted variants.
+    /// Portable-GPU-targeted variants (WGPU, Vulkan).
     Wgpu = 1,
-    /// CUDA-targeted variants.
+    /// NVIDIA-class GPU variants (CUDA, ROCm/HIP).
     Cuda = 2,
-    /// Metal-targeted variants.
+    /// Apple Metal.
     Metal = 3,
+    /// Google TPU variants; distinct from GPU arenas because TPU memory
+    /// layout requirements diverge from both WGPU and CUDA.
+    Tpu = 4,
 }
 
 /// Kind of encoding transformation applied to get from logical tensor to

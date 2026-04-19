@@ -264,6 +264,13 @@ fn base_score(t: TargetTag, mode: ExecutionMode, caps: &Capabilities) -> i32 {
             let ok = caps.gpu.is_some_and(|g| matches!(g, GpuBackend::Metal));
             (0, if ok { 28 } else { 0 }, if ok { 26 } else { 0 })
         }
+        // Variants for target tags that don't yet have a matching
+        // `GpuBackend` / CPU-feature flag score 0 across the board so
+        // they never get picked by mistake. They're still addressable
+        // explicitly via `tensor_view_variant(name, idx)` so callers who
+        // know better can opt in.
+        TargetTag::Vulkan | TargetTag::RocmHip | TargetTag::Tpu => (0, 0, 0),
+        TargetTag::CpuSve | TargetTag::CpuRiscvV => (0, 0, 0),
     };
     match mode {
         ExecutionMode::CpuOnly => cpu_only,
