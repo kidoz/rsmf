@@ -1,0 +1,17 @@
+[package]
+name = "rsmf-metal"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Metal upload path for RSMF — direct zero-copy GPU materialization."
+
+[dependencies]
+rsmf-core.workspace = true
+metal.workspace = true
+objc.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+bytemuck.workspace = true
