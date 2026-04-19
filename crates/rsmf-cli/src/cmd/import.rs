@@ -182,13 +182,28 @@ pub fn run(args: Args) -> Result<(), CliError> {
         }
     }
 
-    // 3. Optional assets and graphs
-    for asset_name in ["config.json", "tokenizer.json"] {
+    // 3. Optional assets and graphs. Bundle the standard transformers /
+    //    tokenizers sidecar files so the imported rsmf is self-contained
+    //    (model weights + tokenizer + runtime configs, one artifact).
+    const HF_ASSET_CANDIDATES: &[&str] = &[
+        "config.json",
+        "generation_config.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "special_tokens_map.json",
+        "vocab.json",
+        "merges.txt",
+        "added_tokens.json",
+        "preprocessor_config.json",
+        "chat_template.json",
+    ];
+    for asset_name in HF_ASSET_CANDIDATES {
         if let Ok(asset_path) = repo.get(asset_name) {
             println!("Bundling {} as asset...", asset_name);
             let bytes = std::fs::read(&asset_path)
                 .map_err(|e| CliError::user(anyhow!("Failed to read {}: {e}", asset_name)))?;
-            writer = writer.with_asset(rsmf_core::AssetInput::new(asset_name.to_string(), bytes));
+            writer =
+                writer.with_asset(rsmf_core::AssetInput::new((*asset_name).to_string(), bytes));
         }
     }
 
