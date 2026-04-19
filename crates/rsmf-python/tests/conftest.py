@@ -122,3 +122,36 @@ def open_file(sample_rsmf: Path):
     import rsmf
 
     return rsmf.RsmfFile(sample_rsmf)
+
+
+@pytest.fixture(scope="session")
+def sample_rsmf_uncompressed(
+    tmp_path_factory: pytest.TempPathFactory, rsmf_binary: str
+) -> Path:
+    """Synthesise an `.rsmf` with **no compression** on any section.
+
+    Needed by tests that verify the zero-copy path is actually zero-copy —
+    i.e. the pointer backing the NumPy array lives inside the mmap (or the
+    stable decompressed-section cache). The compressed variant in
+    ``sample_rsmf`` also zero-copies (OnceLock stability), but an
+    uncompressed fixture pins the "directly into mmap" branch.
+    """
+    work = tmp_path_factory.mktemp("rsmf-fixture-uncompressed")
+
+    array = np.arange(16 * 8, dtype=np.float32).reshape(16, 8)
+    npy_path = work / "weights.npy"
+    np.save(npy_path, array)
+
+    out_path = work / "sample_uncompressed.rsmf"
+    subprocess.run(
+        [
+            rsmf_binary,
+            "pack",
+            "--from-npy",
+            str(npy_path),
+            "--out",
+            str(out_path),
+        ],
+        check=True,
+    )
+    return out_path
