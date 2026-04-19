@@ -1,0 +1,48 @@
+[package]
+name = "rsmf-bench"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Benchmarks for RSMF CPU open, tensor access, and optional WGPU upload."
+publish = false
+
+[dependencies]
+rsmf-core.workspace = true
+anyhow.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+tempfile.workspace = true
+
+[features]
+default = []
+# Optional GPU-backed upload bench.
+wgpu = ["dep:rsmf-wgpu", "dep:wgpu", "dep:pollster"]
+
+[dependencies.rsmf-wgpu]
+workspace = true
+optional = true
+
+[dependencies.wgpu]
+workspace = true
+optional = true
+
+[dependencies.pollster]
+workspace = true
+optional = true
+
+[[bench]]
+name = "cpu_open"
+harness = false
+
+[[bench]]
+name = "tensor_access"
+harness = false
+
+[[bench]]
+name = "wgpu_upload"
+harness = false
+required-features = ["wgpu"]
