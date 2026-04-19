@@ -1,0 +1,85 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/rsmf-core",
+    "crates/rsmf-cli",
+    "crates/rsmf-wgpu",
+    "crates/rsmf-cuda",
+    "crates/rsmf-metal",
+    "crates/rsmf-bench",
+    "crates/rsmf-runtime",
+    "crates/rsmf-python",
+]
+# `rsmf-wgpu` is excluded from default-members so `cargo build` / `cargo test`
+# (run with no `-p`) stays GPU-free and fast. Enable explicitly via `-p rsmf-wgpu`
+# or through the `wgpu` feature on the CLI / bench crates.
+default-members = [
+    "crates/rsmf-core",
+    "crates/rsmf-cli",
+    "crates/rsmf-bench",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+authors = ["Aleksandr Pavlov <ckidoz@gmail.com>"]
+license = "MIT"
+repository = "https://github.com/kidoz/rsmf"
+readme = "README.md"
+
+[workspace.dependencies]
+# Core format deps.
+memmap2 = "0.9"
+bytemuck = { version = "1.19", features = ["derive", "extern_crate_alloc"] }
+blake3 = "1.5"
+thiserror = "2.0"
+anyhow = "1.0"
+half = { version = "2.4", features = ["bytemuck"] }
+wide = "0.7"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Compression (optional).
+zstd = "0.13"
+
+# CLI / conversion.
+clap = { version = "4.5", features = ["derive"] }
+safetensors = "0.4"
+gguf-rs-lib = { version = "0.2", features = ["mmap"] }
+ndarray-npy = "0.10"
+hf-hub = "0.4"
+serde = "1.0"
+serde_json = "1.0"
+tempfile = "3.10"
+hex = "0.4"
+
+# Bench.
+criterion = { version = "0.5", default-features = false, features = ["html_reports"] }
+
+# Optional GPU.
+wgpu = { version = "22", default-features = false, features = ["wgsl"] }
+pollster = "0.4"
+cudarc = { version = "0.12", features = ["cuda-12000"] }
+metal = "0.29"
+objc = "0.2"
+ort = { version = "2.0.0-rc.12", features = ["ndarray"] }
+pyo3 = { version = "0.22", features = ["extension-module", "abi3-py38"] }
+numpy = "0.22"
+
+# Internal crates.
+rsmf-core = { path = "crates/rsmf-core", version = "0.1.0" }
+rsmf-wgpu = { path = "crates/rsmf-wgpu", version = "0.1.0" }
+rsmf-cuda = { path = "crates/rsmf-cuda", version = "0.1.0" }
+rsmf-metal = { path = "crates/rsmf-metal", version = "0.1.0" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+opt-level = 3
+debug = false
+
+[profile.bench]
+lto = "thin"
+codegen-units = 1
+opt-level = 3
