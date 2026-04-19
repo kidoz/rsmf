@@ -1,0 +1,39 @@
+[package]
+name = "rsmf-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Command-line interface for inspecting, verifying, and packing RSMF files."
+
+[[bin]]
+name = "rsmf"
+path = "src/main.rs"
+
+[dependencies]
+rsmf-core = { workspace = true }
+clap.workspace = true
+anyhow.workspace = true
+hex.workspace = true
+safetensors.workspace = true
+hf-hub = { workspace = true }
+serde_json = { workspace = true }
+tracing.workspace = true
+tracing-subscriber = { workspace = true }
+ndarray = { version = "0.17", optional = true }
+ndarray-npy = { workspace = true, optional = true }
+bytemuck.workspace = true
+
+[features]
+default = ["safetensors", "gguf", "npy", "compression", "tracing"]
+safetensors = ["rsmf-core/safetensors"]
+gguf = ["rsmf-core/gguf"]
+npy = ["dep:ndarray", "dep:ndarray-npy", "rsmf-core/npy"]
+compression = ["rsmf-core/compression"]
+tracing = ["rsmf-core/tracing"]
+
+[dev-dependencies]
+tempfile.workspace = true
+safetensors.workspace = true
