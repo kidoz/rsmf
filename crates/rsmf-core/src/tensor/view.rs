@@ -32,6 +32,10 @@ pub struct TensorView<'a> {
     pub bytes: &'a [u8],
     /// Encoding kind of the variant (Raw, CastF16, …).
     pub encoding: EncodingKind,
+    /// Physical layout of the variant bytes (row-major vs blocked).
+    /// Consumers that want zero-copy access to `bytes` must check this
+    /// before re-interpreting the payload as a C-contiguous array.
+    pub layout: crate::tensor::variant::LayoutTag,
     /// Variant metadata (block shapes, quant params).
     pub meta: &'a crate::tensor::variant::VariantMeta,
     /// Storage dtype.

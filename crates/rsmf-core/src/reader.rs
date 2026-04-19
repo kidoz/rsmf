@@ -336,6 +336,7 @@ impl RsmfFile {
             descriptor: t,
             bytes,
             encoding: v.encoding,
+            layout: v.layout,
             meta: &v.meta,
             storage_dtype: v.storage_dtype,
         })
@@ -371,6 +372,7 @@ impl RsmfFile {
             descriptor: t,
             bytes,
             encoding: v.encoding,
+            layout: v.layout,
             meta: &v.meta,
             storage_dtype: v.storage_dtype,
         })

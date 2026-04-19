@@ -8,11 +8,43 @@ use numpy::{IntoPyArray, PyArrayMethods};
 use pyo3::create_exception;
 use pyo3::exceptions::{PyException, PyIndexError};
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyDict};
+use pyo3::types::{PyBytes, PyDict, PyTuple};
 use std::collections::HashMap;
 
 use rsmf_core::manifest::GraphKind;
 use rsmf_core::{LogicalDtype, RsmfError as CoreError, RsmfFile as CoreFile};
+
+/// A NumPy-compatible view over raw variant bytes.
+///
+/// The `owner` field is load-bearing: it holds a Python-level reference
+/// to the native `RsmfFile` so the backing mmap (or decompressed-section
+/// cache) stays alive as long as any NumPy array built from this view is
+/// reachable. `dead_code` is allowed only because the field is consumed
+/// by `Drop`, never read.
+#[pyclass(frozen, unsendable)]
+struct ZeroCopyView {
+    #[allow(dead_code)] // read only via Drop to keep the mmap alive.
+    owner: Py<RsmfFile>,
+    ptr: usize,
+    typestr: String,
+    shape: Vec<usize>,
+}
+
+#[pymethods]
+impl ZeroCopyView {
+    #[getter]
+    fn __array_interface__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let dict = PyDict::new_bound(py);
+        dict.set_item("version", 3)?;
+        // `shape` MUST be a Python tuple per the array-interface spec;
+        // passing a list makes NumPy reject the view with
+        // `TypeError: shape must be a tuple`.
+        dict.set_item("shape", PyTuple::new_bound(py, &self.shape))?;
+        dict.set_item("typestr", &self.typestr)?;
+        dict.set_item("data", (self.ptr, true))?; // (ptr, readonly)
+        Ok(dict)
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Exception hierarchy. `RsmfError` is the shared base so callers can write
@@ -199,15 +231,16 @@ impl RsmfFile {
     /// default — pass `strict=True` to raise instead.
     #[pyo3(signature = (name, target=None, strict=false))]
     fn get_tensor<'py>(
-        &self,
-        py: Python<'py>,
+        slf: &Bound<'py, Self>,
         name: &str,
         target: Option<&str>,
         strict: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
+        let py = slf.py();
+        let this = slf.borrow();
         if let Some(t) = target {
-            if let Some(idx) = self.find_variant_idx_by_target(name, t)? {
-                return self.decode_variant(py, name, idx);
+            if let Some(idx) = this.find_variant_idx_by_target(name, t)? {
+                return this.decode_variant(slf, py, name, idx);
             }
             if strict {
                 return Err(RsmfNotFound::new_err(format!(
@@ -215,7 +248,7 @@ impl RsmfFile {
                 )));
             }
         }
-        self.decode_canonical(py, name)
+        this.decode_canonical(slf, py, name)
     }
 
     /// Return per-variant metadata for the named tensor. The first entry is
@@ -261,12 +294,13 @@ impl RsmfFile {
     }
 
     fn get_tensor_variant<'py>(
-        &self,
-        py: Python<'py>,
+        slf: &Bound<'py, Self>,
         name: &str,
         variant_idx: u32,
     ) -> PyResult<Bound<'py, PyAny>> {
-        self.decode_variant(py, name, variant_idx)
+        let py = slf.py();
+        let this = slf.borrow();
+        this.decode_variant(slf, py, name, variant_idx)
     }
 
     fn get_asset<'py>(&self, py: Python<'py>, name: &str) -> PyResult<Option<Bound<'py, PyAny>>> {
@@ -302,13 +336,19 @@ impl RsmfFile {
         Ok(None)
     }
 
-    fn decode_canonical<'py>(&self, py: Python<'py>, name: &str) -> PyResult<Bound<'py, PyAny>> {
+    fn decode_canonical<'py>(
+        &self,
+        slf: &Bound<'py, Self>,
+        py: Python<'py>,
+        name: &str,
+    ) -> PyResult<Bound<'py, PyAny>> {
         let view = self.inner.tensor_view(name).map_err(map_core_error)?;
-        decode_view_to_pyarray(py, &view)
+        decode_view_to_pyarray(py, slf.clone().unbind(), &view)
     }
 
     fn decode_variant<'py>(
         &self,
+        slf: &Bound<'py, Self>,
         py: Python<'py>,
         name: &str,
         variant_idx: u32,
@@ -317,7 +357,7 @@ impl RsmfFile {
             .inner
             .tensor_view_variant(name, variant_idx)
             .map_err(map_core_error)?;
-        decode_view_to_pyarray(py, &view)
+        decode_view_to_pyarray(py, slf.clone().unbind(), &view)
     }
 }
 
@@ -337,12 +377,80 @@ enum DecodedBuf {
     U8(Vec<u8>),
 }
 
+/// Zero-copy-eligible dtype metadata.
+///
+/// Returns `None` for dtypes that don't have a native NumPy typestr
+/// (currently `F16`, `BF16`) — those always go through the decode/copy
+/// path and land as `float32` arrays.
+fn zero_copy_dtype_info(dtype: LogicalDtype) -> Option<(&'static str, usize)> {
+    use LogicalDtype::*;
+    Some(match dtype {
+        F32 => ("<f4", 4),
+        F64 => ("<f8", 8),
+        I64 => ("<i8", 8),
+        I32 => ("<i4", 4),
+        I16 => ("<i2", 2),
+        I8 => ("|i1", 1),
+        U64 => ("<u8", 8),
+        U32 => ("<u4", 4),
+        U16 => ("<u2", 2),
+        U8 => ("|u1", 1),
+        Bool => ("|b1", 1),
+        F16 | BF16 => return None,
+    })
+}
+
 fn decode_view_to_pyarray<'py>(
     py: Python<'py>,
+    owner: Py<RsmfFile>,
     view: &rsmf_core::TensorView<'_>,
 ) -> PyResult<Bound<'py, PyAny>> {
     let shape: Vec<usize> = view.shape().iter().map(|&d| d as usize).collect();
     let dtype = view.dtype();
+
+    // Zero-copy path: expose the mmap (or decompressed-cache) bytes to
+    // NumPy via __array_interface__ v3. All four conditions must hold:
+    //
+    //   1. Raw encoding — dequantized formats need a copy through
+    //      `decode_f32`.
+    //   2. Row-major layout — `Blocked` layout cannot be re-interpreted
+    //      as C-contiguous without permutation.
+    //   3. Non-empty bytes — a zero-length slice's pointer is dangling
+    //      per the Rust aliasing model and some NumPy versions refuse it.
+    //   4. Pointer aligned to the dtype's native alignment — unaligned
+    //      F64/I64/U64 access faults on strict-alignment ISAs.
+    //
+    // Any failing condition silently falls through to the decode/copy
+    // path so functional behaviour is unchanged, just slower.
+    if view.encoding == rsmf_core::tensor::variant::EncodingKind::Raw
+        && view.layout == rsmf_core::tensor::variant::LayoutTag::RowMajor
+        && !view.bytes.is_empty()
+    {
+        if let Some((typestr, required_align)) = zero_copy_dtype_info(dtype) {
+            let ptr = view.bytes.as_ptr() as usize;
+            if ptr % required_align == 0 {
+                // SAFETY invariant for the consumer: `ptr` points either
+                // directly into the mmap held alive by `owner`, or into
+                // the `Vec<u8>` in `RsmfFile`'s decompressed-section
+                // `OnceLock`. Both have stable addresses for the lifetime
+                // of the RsmfFile — OnceLock is single-init, the mmap is
+                // only dropped when the Py<RsmfFile> refcount hits zero.
+                // The ZeroCopyView holds that Py reference, so any
+                // NumPy array with this view as its `.base` keeps the
+                // memory alive.
+                let zc_view = ZeroCopyView {
+                    owner,
+                    ptr,
+                    typestr: typestr.to_string(),
+                    shape: shape.clone(),
+                };
+                let py_view = Bound::new(py, zc_view)?;
+                let np = py.import_bound("numpy")?;
+                let arr = np.getattr("asarray")?.call1((py_view,))?;
+                return Ok(arr.into_any());
+            }
+        }
+    }
 
     // Decode / copy happens without the GIL. The result is an owned `Vec`
     // moved into NumPy via `into_pyarray_bound` (no second copy).
