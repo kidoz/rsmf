@@ -6,8 +6,11 @@
 
 use std::io::Write;
 
+#[cfg(feature = "compression")]
 use rsmf_core::SectionKind;
-use rsmf_core::writer::{AssetInput, GraphInput, RsmfWriter, TensorInput, VariantInput};
+#[cfg(feature = "compression")]
+use rsmf_core::writer::AssetInput;
+use rsmf_core::writer::{GraphInput, RsmfWriter, TensorInput, VariantInput};
 use rsmf_core::{LogicalDtype, RsmfFile};
 use tempfile::NamedTempFile;
 
