@@ -629,7 +629,7 @@ impl RsmfFile {
     }
 }
 
-fn validate_section_table(sections: &[SectionDescriptor], file_len: u64) -> Result<()> {
+pub(crate) fn validate_section_table(sections: &[SectionDescriptor], file_len: u64) -> Result<()> {
     let mut last_end: u64 = 0;
     for (i, s) in sections.iter().enumerate() {
         if s.length == 0 {
@@ -664,7 +664,7 @@ fn validate_section_table(sections: &[SectionDescriptor], file_len: u64) -> Resu
     Ok(())
 }
 
-fn decompress_zstd(compressed: &[u8], bit_shuffled: bool) -> Result<Vec<u8>> {
+pub(crate) fn decompress_zstd(compressed: &[u8], bit_shuffled: bool) -> Result<Vec<u8>> {
     #[cfg(feature = "compression")]
     {
         let decompressed = zstd::decode_all(std::io::Cursor::new(compressed))
@@ -691,7 +691,7 @@ fn decompress_zstd(compressed: &[u8], bit_shuffled: bool) -> Result<Vec<u8>> {
     }
 }
 
-fn validate_manifest(
+pub(crate) fn validate_manifest(
     manifest: &Manifest,
     sections: &[SectionDescriptor],
     packed_section_indices: &[usize],

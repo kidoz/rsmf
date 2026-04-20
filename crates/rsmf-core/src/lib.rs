@@ -15,6 +15,7 @@ pub mod adapter;
 pub mod bit_shuffle;
 pub mod checksum;
 pub mod error;
+pub mod lazy_reader;
 pub mod manifest;
 pub mod preamble;
 pub mod reader;
@@ -38,6 +39,7 @@ pub use adapter::{
     Adapter, AdapterEntry, AdapterIndex, AdapterKind, AdapterRole, adapter_index_from_manifest,
 };
 pub use error::{Result, RsmfError};
+pub use lazy_reader::{LazyRsmfFile, RangeReader, SliceRangeReader};
 pub use preamble::{FORMAT_MAJOR, FORMAT_MINOR, MAGIC, Preamble};
 pub use reader::{AssetRef, GraphPayload, RsmfFile};
 pub use section::{SectionDescriptor, SectionKind};
