@@ -221,6 +221,110 @@ fn multiple_graphs_round_trip() {
     file.full_verify().expect("full_verify");
 }
 
+#[cfg(feature = "compression")]
+#[test]
+fn compressed_canonical_arena_round_trips() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("compressed_canonical.rsmf");
+
+    // Enough tensors that zstd produces a noticeably-shrunk arena.
+    let a_bytes = f32_bytes(&(0..256).map(|i| (i as f32) * 0.125).collect::<Vec<_>>());
+    let b_bytes = f32_bytes(&(0..128).map(|i| (i as f32).sin()).collect::<Vec<_>>());
+
+    let mut w = StreamingRsmfWriter::new(&path)
+        .expect("new")
+        .with_canonical_compression(3);
+    w.stream_canonical_tensor("a", LogicalDtype::F32, vec![16, 16], Cursor::new(&a_bytes))
+        .expect("a");
+    w.stream_canonical_tensor("b", LogicalDtype::F32, vec![128], Cursor::new(&b_bytes))
+        .expect("b");
+    w.finish().expect("finish");
+
+    let file = RsmfFile::open(&path).expect("open");
+    assert_eq!(file.tensor_view("a").unwrap().bytes(), a_bytes.as_slice());
+    assert_eq!(file.tensor_view("b").unwrap().bytes(), b_bytes.as_slice());
+    file.full_verify().expect("full_verify");
+}
+
+#[cfg(feature = "compression")]
+#[test]
+fn compressed_graph_and_assets_round_trip() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("compressed_bundle.rsmf");
+
+    let tensor_bytes = f32_bytes(&[1.0, 2.0, 3.0, 4.0]);
+    let graph_bytes = b"ONNX-compressible-graph-bytes-".repeat(64);
+    let asset_bytes = b"{\"vocab\":[\"<pad>\"]}".to_vec();
+
+    let mut w = StreamingRsmfWriter::new(&path)
+        .expect("new")
+        .with_graph_compression(5)
+        .with_assets_compression(3);
+    w.stream_canonical_tensor(
+        "w",
+        LogicalDtype::F32,
+        vec![2, 2],
+        Cursor::new(&tensor_bytes),
+    )
+    .expect("tensor");
+    w.stream_graph(GraphKind::Onnx, Cursor::new(&graph_bytes))
+        .expect("graph");
+    w.stream_asset("tokenizer.json", Cursor::new(&asset_bytes))
+        .expect("asset");
+    w.finish().expect("finish");
+
+    let file = RsmfFile::open(&path).expect("open");
+    let payloads = file.graph_payloads();
+    assert_eq!(payloads.len(), 1);
+    assert_eq!(payloads[0].bytes, graph_bytes.as_slice());
+    assert_eq!(
+        file.asset("tokenizer.json").unwrap().bytes,
+        asset_bytes.as_slice()
+    );
+    file.full_verify().expect("full_verify");
+}
+
+#[cfg(feature = "compression")]
+#[test]
+fn all_sections_compressed_round_trip() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("all_compressed.rsmf");
+
+    let tensor_bytes = f32_bytes(&(0..1024).map(|i| i as f32).collect::<Vec<_>>());
+    let graph_bytes = b"ORT-graph-payload-".repeat(32);
+    let asset_bytes = b"{\"config\":42}".to_vec();
+
+    let mut w = StreamingRsmfWriter::new(&path)
+        .expect("new")
+        .with_canonical_compression(3)
+        .with_graph_compression(3)
+        .with_assets_compression(3);
+    w.stream_canonical_tensor(
+        "t",
+        LogicalDtype::F32,
+        vec![1024],
+        Cursor::new(&tensor_bytes),
+    )
+    .expect("t");
+    w.stream_graph(GraphKind::Ort, Cursor::new(&graph_bytes))
+        .expect("g");
+    w.stream_asset("config.json", Cursor::new(&asset_bytes))
+        .expect("a");
+    w.finish().expect("finish");
+
+    let file = RsmfFile::open(&path).expect("open");
+    assert_eq!(
+        file.tensor_view("t").unwrap().bytes(),
+        tensor_bytes.as_slice()
+    );
+    assert_eq!(file.graph_payloads()[0].bytes, graph_bytes.as_slice());
+    assert_eq!(
+        file.asset("config.json").unwrap().bytes,
+        asset_bytes.as_slice()
+    );
+    file.full_verify().expect("full_verify");
+}
+
 #[test]
 fn duplicate_asset_name_is_rejected() {
     let dir = tempdir().unwrap();

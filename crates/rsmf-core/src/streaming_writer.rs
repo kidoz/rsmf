@@ -49,9 +49,17 @@
 //! - Multiple named assets.
 //! - Global manifest metadata.
 //!
+//! Currently supported (additions beyond the initial MVP):
+//! - Per-section zstd compression via `with_canonical_compression(level)`,
+//!   `with_graph_compression(level)`, and `with_assets_compression(level)`
+//!   (requires the `compression` feature on `rsmf-core`). Unlike the
+//!   batch writer the streaming path does not apply bit-shuffle — it
+//!   can't, bit-shuffle is not streaming-friendly. The on-disk file
+//!   sets `SECTION_FLAG_COMPRESSED` without `SECTION_FLAG_BIT_SHUFFLED`,
+//!   which the reader honours by skipping the un-shuffle step.
+//!
 //! Not yet supported:
 //! - Packed / quantized variants.
-//! - Compression on any section (`zstd`).
 //! - Tensor-level, variant-level, graph-level, or asset-level metadata.
 
 use std::fs::File;
@@ -64,7 +72,7 @@ use crate::checksum::{CHECKSUM_LEN, PREAMBLE_CHECKSUM_LEN};
 use crate::error::{Result, RsmfError};
 use crate::manifest::{AssetDescriptor, GraphDescriptor, GraphKind, MANIFEST_VERSION, Manifest};
 use crate::preamble::{FORMAT_MAJOR, FORMAT_MINOR, MAGIC, PREAMBLE_LEN, Preamble};
-use crate::section::{SECTION_DESC_LEN, SectionDescriptor, SectionKind};
+use crate::section::{SECTION_DESC_LEN, SECTION_FLAG_COMPRESSED, SectionDescriptor, SectionKind};
 use crate::tensor::descriptor::TensorDescriptor;
 use crate::tensor::dtype::{LogicalDtype, StorageDtype};
 use crate::tensor::variant::{EncodingKind, LayoutTag, TargetTag, VariantDescriptor, VariantMeta};
@@ -95,23 +103,30 @@ enum Cursor {
 /// Partial section state kept while the cursor is inside one.
 struct SectionInProgress {
     file_off: u64,
-    bytes_written: u64,
-    hasher: Hasher,
+    /// On-disk bytes written so far — also the section's final `length`
+    /// and the number of bytes covered by `section_hasher`. For an
+    /// uncompressed section this equals `logical_bytes_written`.
+    on_disk_bytes_written: u64,
+    /// Pre-compression (logical / decompressed-view) bytes. Used as the
+    /// coordinate space for variant / graph / asset descriptors and for
+    /// body alignment inside the section.
+    logical_bytes_written: u64,
+    /// Hasher over the on-disk bytes (post-compression for compressed
+    /// sections) — becomes the section-table `checksum`.
+    section_hasher: Hasher,
+    /// Zstd compression level for this section, if compressed.
+    compression_level: Option<i32>,
 }
 
 impl SectionInProgress {
-    fn new(file_off: u64) -> Self {
+    fn new(file_off: u64, compression_level: Option<i32>) -> Self {
         Self {
             file_off,
-            bytes_written: 0,
-            hasher: Hasher::new(),
+            on_disk_bytes_written: 0,
+            logical_bytes_written: 0,
+            section_hasher: Hasher::new(),
+            compression_level,
         }
-    }
-
-    fn finalize(self) -> (u64, u64, [u8; CHECKSUM_LEN]) {
-        let mut cs = [0u8; CHECKSUM_LEN];
-        cs.copy_from_slice(&self.hasher.finalize().as_bytes()[..CHECKSUM_LEN]);
-        (self.file_off, self.bytes_written, cs)
     }
 }
 
@@ -122,6 +137,7 @@ struct ClosedSection {
     file_off: u64,
     length: u64,
     checksum: [u8; CHECKSUM_LEN],
+    compressed: bool,
 }
 
 /// RSMF writer that streams payloads straight to disk.
@@ -138,6 +154,10 @@ pub struct StreamingRsmfWriter {
     asset_names: Vec<String>,
     active: Option<SectionInProgress>,
     closed: Vec<ClosedSection>,
+    /// Compression levels. `None` => uncompressed.
+    canonical_compression: Option<i32>,
+    graph_compression: Option<i32>,
+    assets_compression: Option<i32>,
 }
 
 impl StreamingRsmfWriter {
@@ -164,8 +184,17 @@ impl StreamingRsmfWriter {
             asset_descriptors: Vec::new(),
             tensor_names: Vec::new(),
             asset_names: Vec::new(),
-            active: Some(SectionInProgress::new(canonical_arena_file_off)),
+            // Compression defaults off; builder methods flip them on.
+            // The canonical-arena section opens straight away, so we
+            // initialise it with the current canonical_compression
+            // (which is None here and can be flipped later as long as
+            // the first tensor hasn't been streamed yet — see
+            // `with_canonical_compression`).
+            active: Some(SectionInProgress::new(canonical_arena_file_off, None)),
             closed: Vec::new(),
+            canonical_compression: None,
+            graph_compression: None,
+            assets_compression: None,
         };
 
         // Preamble + section-table slots stay as a zero-filled hole
@@ -185,6 +214,38 @@ impl StreamingRsmfWriter {
     #[must_use]
     pub fn with_metadata(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.metadata.push((key.into(), value.into()));
+        self
+    }
+
+    /// Compress the canonical-arena section with zstd at `level`. Must
+    /// be called before any tensor has been streamed.
+    #[must_use]
+    pub fn with_canonical_compression(mut self, level: i32) -> Self {
+        self.canonical_compression = Some(level);
+        // The canonical section is opened in `new()` with compression
+        // off; re-initialise it if the user opts in before any tensor
+        // has landed.
+        if let Some(active) = self.active.as_mut() {
+            if active.on_disk_bytes_written == 0 && active.logical_bytes_written == 0 {
+                active.compression_level = Some(level);
+            }
+        }
+        self
+    }
+
+    /// Compress the graph section with zstd at `level`. Takes effect
+    /// when the first graph is streamed.
+    #[must_use]
+    pub fn with_graph_compression(mut self, level: i32) -> Self {
+        self.graph_compression = Some(level);
+        self
+    }
+
+    /// Compress the assets section with zstd at `level`. Takes effect
+    /// when the first asset is streamed.
+    #[must_use]
+    pub fn with_assets_compression(mut self, level: i32) -> Self {
+        self.assets_compression = Some(level);
         self
     }
 
@@ -341,12 +402,20 @@ impl StreamingRsmfWriter {
             .copy_from_slice(&blake3::hash(&manifest_bytes).as_bytes()[..CHECKSUM_LEN]);
 
         // Build the full section list. Order must be ascending by offset.
+        // Compressed sections set `SECTION_FLAG_COMPRESSED`; the
+        // streaming path never bit-shuffles so `SECTION_FLAG_BIT_SHUFFLED`
+        // stays clear (the reader honours the flag and skips un-shuffle).
         let mut sections: Vec<SectionDescriptor> = Vec::with_capacity(self.closed.len() + 1);
         for c in &self.closed {
+            let flags = if c.compressed {
+                SECTION_FLAG_COMPRESSED
+            } else {
+                0
+            };
             sections.push(SectionDescriptor {
                 kind: c.kind,
                 align: c.align,
-                flags: 0,
+                flags,
                 offset: c.file_off,
                 length: c.length,
                 checksum: c.checksum,
@@ -412,16 +481,52 @@ impl StreamingRsmfWriter {
     fn append_body_to_active<R: Read>(
         &mut self,
         body_align: u64,
-        mut reader: R,
+        reader: R,
     ) -> Result<(u64, u64, [u8; CHECKSUM_LEN])> {
-        let active = self.active.as_mut().ok_or_else(|| {
+        let mut active = self.active.take().ok_or_else(|| {
             RsmfError::structural("streaming writer: no active section".to_string())
         })?;
 
-        // Align inside the section.
-        let aligned_off = align_up(active.bytes_written, body_align);
-        if aligned_off > active.bytes_written {
-            let pad_len = (aligned_off - active.bytes_written) as usize;
+        let aligned_off = align_up(active.logical_bytes_written, body_align);
+        let pad_len = (aligned_off - active.logical_bytes_written) as usize;
+
+        let result = match active.compression_level {
+            None => self.pump_plain(&mut active, pad_len, reader),
+            #[cfg(feature = "compression")]
+            Some(level) => self.pump_compressed(&mut active, pad_len, level, reader),
+            #[cfg(not(feature = "compression"))]
+            Some(_) => Err(RsmfError::unsupported(
+                "streaming writer: compression requested but the `compression` feature is not enabled"
+                    .to_string(),
+            )),
+        };
+
+        match result {
+            Ok((body_len, body_checksum)) => {
+                active.logical_bytes_written = aligned_off + body_len;
+                self.active = Some(active);
+                Ok((aligned_off, body_len, body_checksum))
+            }
+            Err(e) => {
+                // Restore the active section so the caller can retry or
+                // abandon cleanly; the file itself is in an ill-defined
+                // state either way.
+                self.active = Some(active);
+                Err(e)
+            }
+        }
+    }
+
+    /// Uncompressed path — padding + body go straight to disk and feed
+    /// the section hasher 1:1 (the on-disk byte count equals the
+    /// logical byte count).
+    fn pump_plain<R: Read>(
+        &mut self,
+        active: &mut SectionInProgress,
+        pad_len: usize,
+        mut reader: R,
+    ) -> Result<(u64, [u8; CHECKSUM_LEN])> {
+        if pad_len > 0 {
             let zeros = vec![0u8; pad_len];
             self.file
                 .write_all(&zeros)
@@ -429,11 +534,9 @@ impl StreamingRsmfWriter {
                     path: self.path.clone(),
                     source: e,
                 })?;
-            active.hasher.update(&zeros);
-            active.bytes_written = aligned_off;
+            active.section_hasher.update(&zeros);
+            active.on_disk_bytes_written += pad_len as u64;
         }
-
-        // Stream.
         let mut body_hasher = Hasher::new();
         let mut body_len: u64 = 0;
         let mut buf = [0u8; 65536];
@@ -451,15 +554,83 @@ impl StreamingRsmfWriter {
                     path: self.path.clone(),
                     source: e,
                 })?;
-            active.hasher.update(&buf[..n]);
+            active.section_hasher.update(&buf[..n]);
             body_hasher.update(&buf[..n]);
+            active.on_disk_bytes_written += n as u64;
             body_len += n as u64;
         }
-        active.bytes_written += body_len;
+        let mut body_checksum = [0u8; CHECKSUM_LEN];
+        body_checksum.copy_from_slice(&body_hasher.finalize().as_bytes()[..CHECKSUM_LEN]);
+        Ok((body_len, body_checksum))
+    }
+
+    /// Compressed path — one zstd frame per call. `zstd::decode_all`
+    /// concatenates frames on the read side, which reproduces
+    /// `padding + body + padding + body + ...` exactly — the same
+    /// logical arena layout the plain path produces.
+    ///
+    /// The section hasher covers the compressed on-disk bytes (matches
+    /// `SectionDescriptor.checksum` semantics); the body hasher covers
+    /// the pre-compression body bytes, which is what the reader will
+    /// re-hash after decompression to validate the descriptor's own
+    /// checksum.
+    #[cfg(feature = "compression")]
+    fn pump_compressed<R: Read>(
+        &mut self,
+        active: &mut SectionInProgress,
+        pad_len: usize,
+        level: i32,
+        mut reader: R,
+    ) -> Result<(u64, [u8; CHECKSUM_LEN])> {
+        use std::io::Write as _;
+
+        let mut body_hasher = Hasher::new();
+        let mut body_len: u64 = 0;
+
+        // Buffer compressed output per call. zstd frames are typically
+        // a few KB to a few MB in size — the streaming guarantee is
+        // bounded memory per call, not zero-copy through the encoder.
+        let compressed: Vec<u8> = {
+            let mut encoder = zstd::stream::write::Encoder::new(Vec::new(), level)
+                .map_err(|e| RsmfError::structural(format!("zstd encoder init failed: {e}")))?;
+            if pad_len > 0 {
+                let zeros = vec![0u8; pad_len];
+                encoder
+                    .write_all(&zeros)
+                    .map_err(|e| RsmfError::structural(format!("zstd write failed: {e}")))?;
+            }
+            let mut buf = [0u8; 65536];
+            loop {
+                let n = reader.read(&mut buf).map_err(|e| RsmfError::IoWithPath {
+                    path: self.path.clone(),
+                    source: e,
+                })?;
+                if n == 0 {
+                    break;
+                }
+                encoder
+                    .write_all(&buf[..n])
+                    .map_err(|e| RsmfError::structural(format!("zstd write failed: {e}")))?;
+                body_hasher.update(&buf[..n]);
+                body_len += n as u64;
+            }
+            encoder
+                .finish()
+                .map_err(|e| RsmfError::structural(format!("zstd finish failed: {e}")))?
+        };
+
+        self.file
+            .write_all(&compressed)
+            .map_err(|e| RsmfError::IoWithPath {
+                path: self.path.clone(),
+                source: e,
+            })?;
+        active.section_hasher.update(&compressed);
+        active.on_disk_bytes_written += compressed.len() as u64;
 
         let mut body_checksum = [0u8; CHECKSUM_LEN];
         body_checksum.copy_from_slice(&body_hasher.finalize().as_bytes()[..CHECKSUM_LEN]);
-        Ok((aligned_off, body_len, body_checksum))
+        Ok((body_len, body_checksum))
     }
 
     /// Close the currently active section, recording it in `closed`.
@@ -486,16 +657,18 @@ impl StreamingRsmfWriter {
         // Graph / Asset sections disallow zero length per section-table
         // validator; skip recording them if they're empty (the cursor
         // transitioned into them but nothing was actually streamed).
-        if active.bytes_written == 0 && !matches!(kind, SectionKind::CanonicalArena) {
+        if active.on_disk_bytes_written == 0 && !matches!(kind, SectionKind::CanonicalArena) {
             return Ok(());
         }
-        let (file_off, length, checksum) = active.finalize();
+        let mut checksum = [0u8; CHECKSUM_LEN];
+        checksum.copy_from_slice(&active.section_hasher.finalize().as_bytes()[..CHECKSUM_LEN]);
         self.closed.push(ClosedSection {
             kind,
             align,
-            file_off,
-            length,
+            file_off: active.file_off,
+            length: active.on_disk_bytes_written,
             checksum,
+            compressed: active.compression_level.is_some(),
         });
         Ok(())
     }
@@ -505,10 +678,10 @@ impl StreamingRsmfWriter {
     fn transition_to(&mut self, next: Cursor) -> Result<()> {
         debug_assert!(next != self.cursor);
         self.close_active_section()?;
-        let next_section_align = match next {
-            Cursor::Canonical => CANONICAL_ARENA_ALIGN,
-            Cursor::Graph => GRAPH_SECTION_ALIGN,
-            Cursor::Asset => ASSETS_SECTION_ALIGN,
+        let (next_section_align, next_compression) = match next {
+            Cursor::Canonical => (CANONICAL_ARENA_ALIGN, self.canonical_compression),
+            Cursor::Graph => (GRAPH_SECTION_ALIGN, self.graph_compression),
+            Cursor::Asset => (ASSETS_SECTION_ALIGN, self.assets_compression),
             Cursor::Finished => {
                 return Err(RsmfError::structural(
                     "streaming writer: cannot transition to Finished directly".to_string(),
@@ -521,7 +694,7 @@ impl StreamingRsmfWriter {
             let pad_len = (aligned - here) as usize;
             self.write_all(&vec![0u8; pad_len])?;
         }
-        self.active = Some(SectionInProgress::new(aligned));
+        self.active = Some(SectionInProgress::new(aligned, next_compression));
         self.cursor = next;
         Ok(())
     }
