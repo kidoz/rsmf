@@ -30,6 +30,7 @@ namespace are writer-specific and should be avoided in published files.
 | `variant.*` | Per-variant annotations | Per-variant metadata |
 | `graph.*` | Graph-payload hints | Per-graph metadata |
 | `asset.*` | Asset-payload hints | Per-asset metadata |
+| `adapter.*` | LoRA / DoRA / IA³ adapter tensors | Manifest (global) + per-tensor metadata |
 | `bench.*` | Measured performance | Per-variant metadata |
 | `safetensors.*` | Verbatim safetensors metadata (import only) | Manifest metadata |
 | `x-*` / `vendor.<name>.*` | Vendor extensions | Any; collision-free namespace |
@@ -143,6 +144,47 @@ names for cross-tool interop:
 | `chat_template.jinja` | `chat_template` | `application/x-jinja` |
 | `license.txt` or `LICENSE` | `license` | `text/plain` |
 | `README.md` | `model_card` | `text/markdown` |
+
+---
+
+## Adapter-level (`adapter.*`)
+
+Adapters (LoRA, DoRA, IA³, …) are stored as **regular tensors** annotated with
+`adapter.*` keys. This keeps streaming, compression, verification, and
+`rsmf rewrite` working against adapter files with no format changes. Readers
+use `RsmfFile::adapters()` to group annotated tensors by adapter name.
+
+### Manifest-level (global)
+
+| Key | Value |
+|---|---|
+| `adapter.base_model_name` | Human / HF-style base model identifier. `meta-llama/Llama-3.1-8B` |
+| `adapter.base_model_sha256` | Hex BLAKE3 / SHA-256 of the base model artifact (provenance). |
+
+### Per-tensor
+
+| Key | Value |
+|---|---|
+| `adapter.name` | Adapter name. All tensors sharing this value belong to one adapter. Required for the tensor to be indexed. |
+| `adapter.kind` | Family. `lora`, `lora_plus`, `dora`, `ia3`, or an unrecognised string (preserved verbatim). Defaults to `lora` when absent. |
+| `adapter.role` | Role within the adapter. `lora_a`, `lora_b`, `magnitude`, `scale`, `base_weight`. |
+| `adapter.target` | Target tensor in the base model this adapter modifies. `model.layers.0.self_attn.q_proj.weight` |
+| `adapter.rank` | Decimal string. Rank `r` of the low-rank update. |
+| `adapter.alpha` | Decimal string. Scaling factor `α`; effective scale is `α / r`. |
+
+`adapter.kind`, `adapter.rank`, and `adapter.alpha` MUST agree across tensors
+that share the same `adapter.name`. Readers return a structural error on
+conflict — the failure is silent numerical corruption otherwise.
+
+Shape convention for a LoRA adapter targeting a weight of shape
+`[out_features, in_features]`:
+
+- `lora_a` tensor has shape `[rank, in_features]`.
+- `lora_b` tensor has shape `[out_features, rank]`.
+- The delta is `(α/r) · B · A`.
+
+For DoRA, a `magnitude` tensor of shape `[out_features]` is added.
+For IA³, a single `scale` tensor of shape `[out_features]` replaces the LoRA pair.
 
 ---
 

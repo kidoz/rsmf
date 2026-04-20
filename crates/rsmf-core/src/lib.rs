@@ -11,6 +11,7 @@
 #![warn(missing_docs)]
 #![warn(clippy::all)]
 
+pub mod adapter;
 pub mod bit_shuffle;
 pub mod checksum;
 pub mod error;
@@ -33,6 +34,9 @@ pub mod gguf_convert;
 #[cfg(feature = "npy")]
 pub mod npy_convert;
 
+pub use adapter::{
+    Adapter, AdapterEntry, AdapterIndex, AdapterKind, AdapterRole, adapter_index_from_manifest,
+};
 pub use error::{Result, RsmfError};
 pub use preamble::{FORMAT_MAJOR, FORMAT_MINOR, MAGIC, Preamble};
 pub use reader::{AssetRef, GraphPayload, RsmfFile};

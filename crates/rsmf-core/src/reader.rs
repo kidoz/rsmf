@@ -290,6 +290,15 @@ impl RsmfFile {
         &self.manifest
     }
 
+    /// Index the file's adapter tensors (LoRA / DoRA / IA³).
+    ///
+    /// Walks tensors carrying `adapter.*` metadata and groups them by
+    /// `adapter.name`. Returns an empty index for files without adapter
+    /// annotations. See `docs/CONVENTIONS.md` for the metadata convention.
+    pub fn adapters(&self) -> Result<crate::adapter::AdapterIndex> {
+        crate::adapter::adapter_index_from_manifest(&self.manifest)
+    }
+
     /// Build a high-level summary.
     #[must_use]
     pub fn inspect(&self) -> ManifestSummary {
