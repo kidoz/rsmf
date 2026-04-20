@@ -188,6 +188,63 @@ fn stream_pack_roundtrips_multi_tensor_safetensors() {
 }
 
 #[test]
+fn stream_pack_bundles_graph_and_asset() {
+    let dir = tempdir().unwrap();
+    let st_path = build_multi_tensor_fixture(dir.path());
+    let graph_path = dir.path().join("intent.onnx");
+    let asset_path = dir.path().join("tokenizer.json");
+    std::fs::write(&graph_path, b"ONNX-stream-bundle-graph-bytes").unwrap();
+    std::fs::write(&asset_path, br#"{"vocab":["<pad>","<bos>"]}"#).unwrap();
+    let rsmf_path = dir.path().join("bundle_stream.rsmf");
+
+    let out = Command::new(rsmf_bin())
+        .args(["pack", "--stream", "--from-safetensors"])
+        .arg(&st_path)
+        .args(["--graph"])
+        .arg(&graph_path)
+        .args(["--asset"])
+        .arg(&asset_path)
+        .arg("--out")
+        .arg(&rsmf_path)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "stream bundle pack failed: {out:?}");
+
+    // verify --full
+    let out = Command::new(rsmf_bin())
+        .args(["verify", "--full"])
+        .arg(&rsmf_path)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "verify failed: {out:?}");
+
+    // inspect: both tensors + 1 graph + 1 asset.
+    let out = Command::new(rsmf_bin())
+        .arg("inspect")
+        .arg(&rsmf_path)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "inspect failed: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("Tensors:  2"));
+    assert!(stdout.contains("Assets:   1"), "inspect stdout: {stdout}");
+
+    // extract-asset round-trips the tokenizer.
+    let extracted_asset = dir.path().join("tokenizer_out.json");
+    let out = Command::new(rsmf_bin())
+        .args(["extract-asset", "--name", "tokenizer.json"])
+        .arg(&rsmf_path)
+        .arg(&extracted_asset)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "extract-asset failed: {out:?}");
+    assert_eq!(
+        std::fs::read(&extracted_asset).unwrap(),
+        br#"{"vocab":["<pad>","<bos>"]}"#.to_vec()
+    );
+}
+
+#[test]
 fn stream_pack_rejects_incompatible_flags() {
     let dir = tempdir().unwrap();
     let st_path = build_fixture(dir.path());

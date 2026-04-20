@@ -69,12 +69,12 @@ pub struct Args {
     /// Compress the assets section with zstd.
     #[arg(long)]
     pub compress_assets: bool,
-    /// Stream tensor bodies from the source straight to disk without
-    /// buffering them in RAM. Unlocks packing of multi-hundred-GB
-    /// checkpoints. Currently compatible with `--from-safetensors` and
-    /// `--from-npy`; incompatible with `--quantize-*`, `--cast-f16`,
-    /// `--compress-*`, `--graph`, and `--asset` (the streaming writer
-    /// MVP only emits raw canonical tensors).
+    /// Stream tensor, graph, and asset bodies from the source straight
+    /// to disk without buffering them in RAM. Unlocks packing of
+    /// multi-hundred-GB checkpoints and full model bundles in one pass.
+    /// Currently compatible with `--from-safetensors` and `--from-npy`
+    /// plus `--graph` and `--asset`; not yet with `--quantize-*`,
+    /// `--cast-f16`, or `--compress-*` (those land in a follow-up).
     #[arg(long)]
     pub stream: bool,
 }
@@ -511,12 +511,6 @@ fn run_streaming(args: &Args) -> Result<(), CliError> {
             "--stream does not yet support --compress-* flags"
         )));
     }
-    if !args.graphs.is_empty() || !args.assets.is_empty() {
-        return Err(CliError::user(anyhow!(
-            "--stream does not yet support --graph / --asset; \
-             those will land in a follow-up"
-        )));
-    }
     if args.from_gguf.is_some() {
         return Err(CliError::user(anyhow!(
             "--stream does not yet support --from-gguf"
@@ -531,12 +525,12 @@ fn run_streaming(args: &Args) -> Result<(), CliError> {
     }
 
     if let Some(path) = args.from_safetensors.as_deref() {
-        return stream_from_safetensors(path, &args.out);
+        return stream_from_safetensors(path, &args.out, &args.graphs, &args.assets);
     }
     if let Some(path) = args.from_npy.as_deref() {
         #[cfg(feature = "npy")]
         {
-            return stream_from_npy(path, &args.out);
+            return stream_from_npy(path, &args.out, &args.graphs, &args.assets);
         }
         #[cfg(not(feature = "npy"))]
         {
@@ -549,8 +543,48 @@ fn run_streaming(args: &Args) -> Result<(), CliError> {
     )))
 }
 
+/// Append the graphs and assets given on the CLI to the open
+/// `StreamingRsmfWriter`. Called after all tensors have been streamed.
+fn append_graphs_and_assets(
+    writer: &mut rsmf_core::StreamingRsmfWriter,
+    graphs: &[std::path::PathBuf],
+    assets: &[std::path::PathBuf],
+) -> Result<(), CliError> {
+    for graph_path in graphs {
+        let ext = graph_path
+            .extension()
+            .and_then(std::ffi::OsStr::to_str)
+            .unwrap_or("")
+            .to_lowercase();
+        let kind = match ext.as_str() {
+            "onnx" => rsmf_core::manifest::GraphKind::Onnx,
+            "ort" => rsmf_core::manifest::GraphKind::Ort,
+            _ => rsmf_core::manifest::GraphKind::Other,
+        };
+        let file = std::fs::File::open(graph_path)
+            .map_err(|e| CliError::user(anyhow!("{}: {e}", graph_path.display())))?;
+        writer.stream_graph(kind, file).map_err(CliError::from)?;
+    }
+    for asset_path in assets {
+        let name = asset_path
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .ok_or_else(|| anyhow!("invalid asset filename: {}", asset_path.display()))?
+            .to_string();
+        let file = std::fs::File::open(asset_path)
+            .map_err(|e| CliError::user(anyhow!("{}: {e}", asset_path.display())))?;
+        writer.stream_asset(name, file).map_err(CliError::from)?;
+    }
+    Ok(())
+}
+
 /// Stream every tensor out of an mmap'd safetensors file into a fresh rsmf.
-fn stream_from_safetensors(src: &std::path::Path, out: &std::path::Path) -> Result<(), CliError> {
+fn stream_from_safetensors(
+    src: &std::path::Path,
+    out: &std::path::Path,
+    graphs: &[std::path::PathBuf],
+    assets: &[std::path::PathBuf],
+) -> Result<(), CliError> {
     let file =
         std::fs::File::open(src).map_err(|e| CliError::user(anyhow!("{}: {e}", src.display())))?;
     // SAFETY: we treat the mmap as read-only; safetensors::deserialize
@@ -576,6 +610,7 @@ fn stream_from_safetensors(src: &std::path::Path, out: &std::path::Path) -> Resu
             .stream_canonical_tensor(name.clone(), dtype, shape, tv.data())
             .map_err(CliError::from)?;
     }
+    append_graphs_and_assets(&mut writer, graphs, assets)?;
     writer.finish().map_err(CliError::from)?;
     println!(
         "packed (stream): wrote {} from {}",
@@ -591,7 +626,12 @@ fn stream_from_safetensors(src: &std::path::Path, out: &std::path::Path) -> Resu
 /// output side — bytes hit disk as they're produced without being
 /// re-buffered through the batch `RsmfWriter`.
 #[cfg(feature = "npy")]
-fn stream_from_npy(src: &std::path::Path, out: &std::path::Path) -> Result<(), CliError> {
+fn stream_from_npy(
+    src: &std::path::Path,
+    out: &std::path::Path,
+    graphs: &[std::path::PathBuf],
+    assets: &[std::path::PathBuf],
+) -> Result<(), CliError> {
     use std::io::Cursor;
 
     let array: ndarray::ArrayD<f32> = ndarray_npy::read_npy(src)
@@ -620,6 +660,7 @@ fn stream_from_npy(src: &std::path::Path, out: &std::path::Path) -> Result<(), C
             Cursor::new(bytes),
         )
         .map_err(CliError::from)?;
+    append_graphs_and_assets(&mut writer, graphs, assets)?;
     writer.finish().map_err(CliError::from)?;
     println!(
         "packed (stream): wrote {} from {}",
