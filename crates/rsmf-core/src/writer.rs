@@ -4,6 +4,7 @@
 //! See [`crate::reader::RsmfFile`] for the reading side and `docs/SPEC.md` for
 //! the authoritative layout rules.
 
+use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -745,6 +746,8 @@ pub struct RsmfWriter {
     packed_section_alignment: u16,
     canonical_compress: Option<i32>,
     packed_compress: Option<i32>,
+    dedup_canonical: bool,
+    dedup_packed: bool,
 }
 
 impl RsmfWriter {
@@ -760,6 +763,8 @@ impl RsmfWriter {
             packed_section_alignment: 64,
             canonical_compress: None,
             packed_compress: None,
+            dedup_canonical: false,
+            dedup_packed: false,
         }
     }
 
@@ -891,6 +896,35 @@ impl RsmfWriter {
         self
     }
 
+    /// Enable content-addressable dedup for both the canonical and packed
+    /// arenas. Variants whose raw bytes hash to the same BLAKE3-128 digest
+    /// and whose existing offset satisfies the new variant's alignment
+    /// share a single span in the arena — the common case is tied
+    /// embeddings, repeated bias vectors, or rewritten shards carrying
+    /// unchanged weights. Disabled by default: dedup is a semantic choice
+    /// (it implies byte-level identity is meaningful to downstream tools),
+    /// so callers opt in.
+    #[must_use]
+    pub fn with_dedup(mut self, enabled: bool) -> Self {
+        self.dedup_canonical = enabled;
+        self.dedup_packed = enabled;
+        self
+    }
+
+    /// Enable dedup for the canonical arena only.
+    #[must_use]
+    pub fn with_canonical_dedup(mut self, enabled: bool) -> Self {
+        self.dedup_canonical = enabled;
+        self
+    }
+
+    /// Enable dedup for the packed arena(s) only.
+    #[must_use]
+    pub fn with_packed_dedup(mut self, enabled: bool) -> Self {
+        self.dedup_packed = enabled;
+        self
+    }
+
     /// Encode the file to an in-memory byte vector.
     pub fn write_to_bytes(self) -> Result<Vec<u8>> {
         self.encode()
@@ -910,14 +944,19 @@ impl RsmfWriter {
         // 1. Lay out canonical arena bytes.
         let mut canonical_arena_raw: Vec<u8> = Vec::new();
         let mut canonical_layout: Vec<CanonicalLayout> = Vec::with_capacity(self.tensors.len());
+        let mut canonical_dedup: HashMap<[u8; CHECKSUM_LEN], (u64, u64)> = HashMap::new();
 
         for t in &self.tensors {
             let align = t.canonical.alignment as u64;
-            pad_to_alignment(&mut canonical_arena_raw, align);
-            let offset = canonical_arena_raw.len() as u64;
-            canonical_arena_raw.extend_from_slice(&t.canonical.bytes);
             let length = t.canonical.bytes.len() as u64;
             let checksum = digest_128(&t.canonical.bytes);
+            let offset = append_variant_bytes(
+                &mut canonical_arena_raw,
+                self.dedup_canonical.then_some(&mut canonical_dedup),
+                &t.canonical.bytes,
+                align,
+                checksum,
+            );
             let storage_dtype = t
                 .canonical
                 .storage_dtype
@@ -935,6 +974,8 @@ impl RsmfWriter {
         use crate::tensor::variant::ArenaGroup;
         use std::collections::BTreeMap;
         let mut arena_groups: BTreeMap<ArenaGroup, Vec<u8>> = BTreeMap::new();
+        let mut packed_dedups: BTreeMap<ArenaGroup, HashMap<[u8; CHECKSUM_LEN], (u64, u64)>> =
+            BTreeMap::new();
         let mut packed_layout: Vec<Vec<PackedLayout>> = Vec::with_capacity(self.tensors.len());
         for t in &self.tensors {
             let mut per_tensor = Vec::with_capacity(t.packed.len());
@@ -942,11 +983,14 @@ impl RsmfWriter {
                 let group = p.target.arena_group();
                 let arena = arena_groups.entry(group).or_default();
                 let align = p.alignment as u64;
-                pad_to_alignment(arena, align);
-                let offset = arena.len() as u64;
-                arena.extend_from_slice(&p.bytes);
                 let length = p.bytes.len() as u64;
                 let checksum = digest_128(&p.bytes);
+                let dedup = if self.dedup_packed {
+                    Some(packed_dedups.entry(group).or_default())
+                } else {
+                    None
+                };
+                let offset = append_variant_bytes(arena, dedup, &p.bytes, align, checksum);
                 let storage_dtype = p
                     .storage_dtype
                     .expect("packed variant must set storage_dtype");
@@ -1369,6 +1413,42 @@ fn pad_to_alignment(bytes: &mut Vec<u8>, align: u64) {
     let target = align_up_u64(bytes.len() as u64, align) as usize;
     if bytes.len() < target {
         bytes.resize(target, 0);
+    }
+}
+
+/// Append `bytes` to `arena` at the next aligned offset, optionally
+/// reusing an existing offset when a prior identical span is present.
+///
+/// When `dedup` is `Some`, the caller has opted into content-addressable
+/// storage: if the BLAKE3-128 digest has been seen before AND the earlier
+/// offset already satisfies `align`, the earlier offset is returned and
+/// `arena` is left unchanged. Otherwise the bytes are appended as usual
+/// and the new (offset, length) pair is memoised.
+fn append_variant_bytes(
+    arena: &mut Vec<u8>,
+    dedup: Option<&mut HashMap<[u8; CHECKSUM_LEN], (u64, u64)>>,
+    bytes: &[u8],
+    align: u64,
+    checksum: [u8; CHECKSUM_LEN],
+) -> u64 {
+    let length = bytes.len() as u64;
+    if let Some(map) = dedup {
+        if let Some(&(existing_offset, existing_len)) = map.get(&checksum)
+            && existing_len == length
+            && (align <= 1 || existing_offset % align == 0)
+        {
+            return existing_offset;
+        }
+        pad_to_alignment(arena, align);
+        let offset = arena.len() as u64;
+        arena.extend_from_slice(bytes);
+        map.insert(checksum, (offset, length));
+        offset
+    } else {
+        pad_to_alignment(arena, align);
+        let offset = arena.len() as u64;
+        arena.extend_from_slice(bytes);
+        offset
     }
 }
 
