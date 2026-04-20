@@ -115,6 +115,28 @@ rsmf extract  model.rsmf --tensor embedding.weight out.bin
 rsmf extract-asset model.rsmf --name tokenizer.json tokenizer.json
 ```
 
+### Rewrite: ship a smaller artifact by stripping dev-only variants / assets
+
+```sh
+# Drop the dev-time cpu_generic + wgpu variants before shipping.
+rsmf rewrite dev.rsmf prod.rsmf \
+             --strip-variants cpu_generic \
+             --strip-variants wgpu
+
+# Keep only canonical tensors — every packed variant goes away.
+rsmf rewrite dev.rsmf canonical_only.rsmf --keep-only-canonical
+
+# Drop bundled graph + a named asset + re-compress.
+rsmf rewrite dev.rsmf small.rsmf \
+             --strip-graphs \
+             --strip-asset config.json \
+             --compress-tensors --compress-assets
+```
+
+`rewrite` reads the source via the batch reader and writes through the
+batch writer, so every byte passes through RAM once. A streaming-rewrite
+mode that reuses `StreamingRsmfWriter` is a follow-up.
+
 ### Bundle weights, graph, and assets into one file
 
 ```sh
