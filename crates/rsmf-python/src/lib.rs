@@ -12,7 +12,9 @@ use pyo3::types::{PyBytes, PyDict, PyTuple};
 use std::collections::HashMap;
 
 use rsmf_core::manifest::GraphKind;
-use rsmf_core::{LogicalDtype, RsmfError as CoreError, RsmfFile as CoreFile};
+use rsmf_core::{
+    AdapterKind, AdapterRole, LogicalDtype, RsmfError as CoreError, RsmfFile as CoreFile,
+};
 
 /// A NumPy-compatible view over raw variant bytes.
 ///
@@ -310,6 +312,75 @@ impl RsmfFile {
             Ok(None)
         }
     }
+
+    /// Index LoRA / DoRA / IA³ adapter tensors from `adapter.*` metadata.
+    ///
+    /// Returns a dict shaped as:
+    ///
+    /// ```python
+    /// {
+    ///   "base_model_name": str | None,
+    ///   "base_model_sha256": str | None,
+    ///   "adapters": [
+    ///     {
+    ///       "name": str, "kind": str,
+    ///       "rank": int | None, "alpha": float | None,
+    ///       "effective_scale": float | None,
+    ///       "entries": [
+    ///         {"tensor_name": str, "role": str, "target": str | None},
+    ///         ...
+    ///       ],
+    ///     },
+    ///     ...
+    ///   ],
+    /// }
+    /// ```
+    ///
+    /// Returns an empty `adapters` list (and `None` base-model fields) for
+    /// files that don't carry adapter annotations.
+    fn adapters<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let idx = self.inner.adapters().map_err(map_core_error)?;
+        let out = PyDict::new_bound(py);
+        out.set_item("base_model_name", idx.base_model_name.clone())?;
+        out.set_item("base_model_sha256", idx.base_model_sha256.clone())?;
+
+        let adapters_list: Vec<Bound<'py, PyDict>> = idx
+            .adapters
+            .iter()
+            .map(|a| {
+                let d = PyDict::new_bound(py);
+                d.set_item("name", &a.name)?;
+                d.set_item("kind", adapter_kind_to_str(&a.kind))?;
+                d.set_item("rank", a.rank)?;
+                d.set_item("alpha", a.alpha)?;
+                d.set_item("effective_scale", a.effective_scale())?;
+
+                let entries: Vec<Bound<'py, PyDict>> = a
+                    .entries
+                    .iter()
+                    .map(|e| {
+                        let ed = PyDict::new_bound(py);
+                        ed.set_item("tensor_name", &e.tensor_name)?;
+                        ed.set_item("role", adapter_role_to_str(&e.role))?;
+                        ed.set_item("target", e.target.clone())?;
+                        Ok(ed)
+                    })
+                    .collect::<PyResult<_>>()?;
+                d.set_item("entries", entries)?;
+                Ok(d)
+            })
+            .collect::<PyResult<_>>()?;
+        out.set_item("adapters", adapters_list)?;
+        Ok(out)
+    }
+}
+
+fn adapter_kind_to_str(k: &AdapterKind) -> String {
+    k.as_str().to_string()
+}
+
+fn adapter_role_to_str(r: &AdapterRole) -> String {
+    r.as_str().to_string()
 }
 
 // Non-py-exposed helpers.

@@ -49,3 +49,30 @@ class VariantInfo(TypedDict):
     layout: str  # "row_major" | "blocked"
     length: int
     alignment: int
+
+
+class AdapterEntry(TypedDict):
+    """One tensor that participates in an adapter."""
+
+    tensor_name: str
+    role: str  # "lora_a" | "lora_b" | "magnitude" | "scale" | "base_weight" | other
+    target: str | None  # tensor in the base model this adapter modifies
+
+
+class Adapter(TypedDict):
+    """A single named adapter (LoRA / DoRA / IA³)."""
+
+    name: str
+    kind: str  # "lora" | "lora_plus" | "dora" | "ia3" | other
+    rank: int | None
+    alpha: float | None
+    effective_scale: float | None  # alpha / rank, if both are set
+    entries: list[AdapterEntry]
+
+
+class AdapterIndex(TypedDict):
+    """Return type of :meth:`rsmf.RsmfFile.adapters`."""
+
+    base_model_name: str | None
+    base_model_sha256: str | None
+    adapters: list[Adapter]

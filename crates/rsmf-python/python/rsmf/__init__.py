@@ -34,7 +34,7 @@ from ._rsmf import (
     RsmfVerificationError,
 )
 from ._rsmf import RsmfFile as _NativeRsmfFile
-from ._types import FileInfo, TensorInfo, VariantInfo
+from ._types import Adapter, AdapterEntry, AdapterIndex, FileInfo, TensorInfo, VariantInfo
 
 if TYPE_CHECKING:
     import numpy as np
@@ -50,6 +50,9 @@ __all__ = [
     "FileInfo",
     "TensorInfo",
     "VariantInfo",
+    "Adapter",
+    "AdapterEntry",
+    "AdapterIndex",
 ]
 
 __version__ = "0.1.0"
@@ -189,3 +192,15 @@ class RsmfFile:
         the named tensor.
         """
         return self._require_open().get_tensor_variant(name, variant_idx)
+
+    def adapters(self) -> AdapterIndex:
+        """Group adapter tensors (LoRA / DoRA / IA³) by ``adapter.name``.
+
+        Returns an index with ``base_model_name`` / ``base_model_sha256``
+        provenance (from manifest-level metadata) and a list of
+        :class:`Adapter` dicts, each carrying the kind, rank, alpha,
+        effective scale (α/r) and the participating tensors with roles
+        and targets. See ``docs/CONVENTIONS.md`` for the metadata
+        convention.
+        """
+        return self._require_open().adapters()  # type: ignore[return-value]
