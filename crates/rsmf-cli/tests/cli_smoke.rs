@@ -97,3 +97,121 @@ fn end_to_end_pack_inspect_verify_select_extract() {
         assert!((v - i as f32).abs() < f32::EPSILON);
     }
 }
+
+fn build_multi_tensor_fixture(dir: &std::path::Path) -> std::path::PathBuf {
+    // Two tensors with different shapes so the round-trip verifies
+    // alignment padding between tensors inside the canonical arena.
+    let w_a: Vec<u8> = (0..8u32).flat_map(|i| (i as f32).to_le_bytes()).collect();
+    let w_b: Vec<u8> = (100..106u32)
+        .flat_map(|i| (i as f32).to_le_bytes())
+        .collect();
+    let mut tensors: HashMap<String, TensorView> = HashMap::new();
+    tensors.insert(
+        "encoder.weight".into(),
+        TensorView::new(Dtype::F32, vec![2, 4], &w_a).unwrap(),
+    );
+    tensors.insert(
+        "encoder.bias".into(),
+        TensorView::new(Dtype::F32, vec![6], &w_b).unwrap(),
+    );
+    let bytes = safetensors::serialize(&tensors, &None).unwrap();
+    let path = dir.join("model_multi.safetensors");
+    std::fs::write(&path, bytes).unwrap();
+    path
+}
+
+#[test]
+fn stream_pack_roundtrips_multi_tensor_safetensors() {
+    let dir = tempdir().unwrap();
+    let st_path = build_multi_tensor_fixture(dir.path());
+    let rsmf_path = dir.path().join("model_stream.rsmf");
+
+    // --stream pack
+    let out = Command::new(rsmf_bin())
+        .args(["pack", "--stream", "--from-safetensors"])
+        .arg(&st_path)
+        .arg("--out")
+        .arg(&rsmf_path)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "stream pack failed: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("packed (stream)"),
+        "expected stream marker in stdout, got: {stdout}"
+    );
+
+    // verify --full confirms the on-disk layout is sound.
+    let out = Command::new(rsmf_bin())
+        .args(["verify", "--full"])
+        .arg(&rsmf_path)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "verify failed: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("structural: ok"));
+    assert!(stdout.contains("full checksum: ok"));
+
+    // inspect should report two tensors.
+    let out = Command::new(rsmf_bin())
+        .arg("inspect")
+        .arg(&rsmf_path)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "inspect failed: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("encoder.weight"));
+    assert!(stdout.contains("encoder.bias"));
+    assert!(stdout.contains("Tensors:  2"));
+
+    // extract one and verify bytes match the source.
+    let extract_path = dir.path().join("encoder_weight.bin");
+    let out = Command::new(rsmf_bin())
+        .args(["extract", "--tensor", "encoder.weight"])
+        .arg(&rsmf_path)
+        .arg(&extract_path)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "extract failed: {out:?}");
+    let extracted = std::fs::read(&extract_path).unwrap();
+    assert_eq!(extracted.len(), 8 * 4);
+    for i in 0..8 {
+        let off = i * 4;
+        let v = f32::from_le_bytes([
+            extracted[off],
+            extracted[off + 1],
+            extracted[off + 2],
+            extracted[off + 3],
+        ]);
+        assert!((v - i as f32).abs() < f32::EPSILON);
+    }
+}
+
+#[test]
+fn stream_pack_rejects_incompatible_flags() {
+    let dir = tempdir().unwrap();
+    let st_path = build_fixture(dir.path());
+    let rsmf_path = dir.path().join("model_stream_reject.rsmf");
+
+    // --stream + --quantize-q4_0 must fail loudly rather than silently
+    // drop the quantization.
+    let out = Command::new(rsmf_bin())
+        .args(["pack", "--stream", "--from-safetensors"])
+        .arg(&st_path)
+        .args(["--quantize-q4_0", "cpu_generic"])
+        .arg("--out")
+        .arg(&rsmf_path)
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "pack must reject --stream + --quantize-q4_0"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("--stream"),
+        "rejection should mention --stream in stderr: {stderr}"
+    );
+
+    assert!(!rsmf_path.exists(), "no output should have been written");
+}
