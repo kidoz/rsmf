@@ -109,6 +109,46 @@ impl<'a> TensorView<'a> {
                     return Ok(out);
                 }
 
+                if self.storage_dtype == StorageDtype::Fp8E5M2 {
+                    // OCP FP8 E5M2: 1 sign, 5 exp, 2 mantissa, bias 15.
+                    // IEEE-754-shaped: subnormals at exp==0, inf at
+                    // exp==31 mant==0, NaN at exp==31 mant!=0.
+                    // Max finite = 2^(30-15) * (1 + 3/4) = 57344.
+                    let mut out = Vec::with_capacity(self.bytes.len());
+                    for &b in self.bytes {
+                        let sign_bit = b & 0x80 != 0;
+                        let exp = ((b >> 2) & 0x1F) as i32;
+                        let mant = (b & 0x03) as f32;
+                        let sign_mul = if sign_bit { -1.0_f32 } else { 1.0 };
+                        let v = if exp == 0 {
+                            if mant == 0.0 {
+                                // ±0
+                                sign_mul * 0.0
+                            } else {
+                                // Subnormal: sign * 2^-14 * (m/4)
+                                sign_mul * 2.0_f32.powi(-14) * (mant / 4.0)
+                            }
+                        } else if exp == 31 {
+                            if mant == 0.0 {
+                                // ±infinity
+                                if sign_bit {
+                                    f32::NEG_INFINITY
+                                } else {
+                                    f32::INFINITY
+                                }
+                            } else {
+                                // NaN — sign of NaN isn't meaningful
+                                f32::NAN
+                            }
+                        } else {
+                            // Normal: sign * 2^(exp-15) * (1 + m/4)
+                            sign_mul * 2.0_f32.powi(exp - 15) * (1.0 + mant / 4.0)
+                        };
+                        out.push(v);
+                    }
+                    return Ok(out);
+                }
+
                 if self.descriptor.dtype != LogicalDtype::F32 {
                     return Err(RsmfError::unsupported(format!(
                         "decode_f32 on Raw variant requires logical dtype F32, got {:?}",
