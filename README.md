@@ -69,6 +69,21 @@ execution on pickle load is blocked by default. Override the interpreter
 with `RSMF_PYTHON_BIN=/path/to/python3`; set `RSMF_ALLOW_UNSAFE_PICKLE=1`
 only for checkpoints you trust that the safe loader rejects.
 
+### Stream multi-hundred-GB checkpoints without buffering
+
+```sh
+rsmf pack --stream --from-safetensors huge_model.safetensors --out huge_model.rsmf
+```
+
+`--stream` bypasses the buffered pack path and pipes tensor bytes
+directly to disk as each tensor is read. Peak RSS stays in the low-MB
+range regardless of source size, so a 70B-parameter (~140 GB) checkpoint
+packs on a laptop with tens of MB of free RAM. Currently compatible
+with `--from-safetensors` and `--from-npy`; not yet with `--quantize-*`,
+`--cast-f16`, `--compress-*`, `--graph`, or `--asset` (those require
+features the streaming writer MVP doesn't support yet — combining them
+errors loudly rather than silently dropping the flag).
+
 ### Add packed variants during pack
 
 ```sh
