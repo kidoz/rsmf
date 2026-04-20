@@ -1,11 +1,11 @@
 //! Streaming writer that materialises an RSMF file without buffering
-//! tensor bytes in memory.
+//! tensor, graph, or asset bytes in memory.
 //!
-//! Tensor payloads flow through the writer via a `Read` handle and land
-//! on disk immediately; only descriptors (small) accumulate. This makes
-//! packing multi-hundred-GB weight files tractable on machines with
-//! modest RAM — the batch [`crate::RsmfWriter`] still requires every
-//! tensor's canonical bytes to fit in memory simultaneously.
+//! Payloads flow through the writer via `Read` handles and land on disk
+//! immediately; only descriptors (small) accumulate. This makes packing
+//! multi-hundred-GB weight files tractable on machines with modest RAM —
+//! the batch [`crate::RsmfWriter`] still requires every payload to fit
+//! in memory simultaneously.
 //!
 //! # On-disk layout
 //!
@@ -14,35 +14,45 @@
 //! previously-written offsets):
 //!
 //! ```text
-//! [ Preamble (64 bytes)            ]  patched at finish()
-//! [ Section Table (N × 64 bytes)   ]  patched at finish()
-//! [ Canonical Arena (tensor bytes) ]  streamed
-//! [ Manifest                       ]  serialised last
+//! [ Preamble (64 bytes)                   ]  patched at finish()
+//! [ Section Table (up to 4 × 64 bytes)    ]  patched at finish()
+//! [ Canonical Arena (tensor bodies)       ]  streamed
+//! [ Graph   section (optional)            ]  streamed
+//! [ Assets  section (optional)            ]  streamed
+//! [ Manifest                              ]  serialised last
 //! ```
 //!
-//! The section table lists sections in ascending file-offset order, so
-//! for this layout it contains `[CanonicalArena, Manifest]`. The
+//! The section table lists sections in ascending file-offset order. The
 //! resulting file is fully valid per [`crate::RsmfFile::open`] and
 //! byte-level-equivalent in semantics, just not byte-identical to the
 //! batch writer's output (which puts `Manifest` first).
 //!
+//! # State machine
+//!
+//! Callers move through these section states in order:
+//!
+//! ```text
+//! Canonical ──(stream_canonical_tensor)──> Canonical
+//!            ──(stream_graph)──────────── > Graph
+//!            ──(stream_asset)──────────── > Asset
+//! Graph     ──(stream_graph)──────────── > Graph
+//!            ──(stream_asset)──────────── > Asset
+//! Asset     ──(stream_asset)──────────── > Asset
+//! Any other transition is rejected with a Structural error.
+//! ```
+//!
 //! # MVP scope (this crate version)
 //!
 //! Currently supported:
-//!
 //! - Multiple canonical tensors with raw row-major bodies.
-//! - Global manifest metadata via [`StreamingRsmfWriter::with_metadata`].
+//! - Multiple graphs (ONNX / ORT / Other).
+//! - Multiple named assets.
+//! - Global manifest metadata.
 //!
-//! Not yet supported (adding any of these returns `Unsupported`):
-//!
+//! Not yet supported:
 //! - Packed / quantized variants.
-//! - Compression (`compression` feature gate stays off in the writer).
-//! - Graph section.
-//! - Assets section.
-//! - Tensor-level metadata and variant-level metadata.
-//!
-//! These are all orthogonal features that can be added later without
-//! changing the file format or the read path.
+//! - Compression on any section (`zstd`).
+//! - Tensor-level, variant-level, graph-level, or asset-level metadata.
 
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -52,7 +62,7 @@ use blake3::Hasher;
 
 use crate::checksum::{CHECKSUM_LEN, PREAMBLE_CHECKSUM_LEN};
 use crate::error::{Result, RsmfError};
-use crate::manifest::{MANIFEST_VERSION, Manifest};
+use crate::manifest::{AssetDescriptor, GraphDescriptor, GraphKind, MANIFEST_VERSION, Manifest};
 use crate::preamble::{FORMAT_MAJOR, FORMAT_MINOR, MAGIC, PREAMBLE_LEN, Preamble};
 use crate::section::{SECTION_DESC_LEN, SectionDescriptor, SectionKind};
 use crate::tensor::descriptor::TensorDescriptor;
@@ -60,33 +70,74 @@ use crate::tensor::dtype::{LogicalDtype, StorageDtype};
 use crate::tensor::variant::{EncodingKind, LayoutTag, TargetTag, VariantDescriptor, VariantMeta};
 
 const CANONICAL_ARENA_ALIGN: u64 = 64;
+const GRAPH_SECTION_ALIGN: u64 = 8;
+const ASSETS_SECTION_ALIGN: u64 = 8;
 const MANIFEST_ALIGN: u64 = 8;
 const VARIANT_ALIGN: u32 = 64;
+const GRAPH_BODY_ALIGN: u64 = 8;
+const ASSET_BODY_ALIGN: u64 = 8;
 
-// Reserved slots in the section table. For this MVP we only ever emit
-// two (CanonicalArena + Manifest), but reserving a small fixed budget
-// lets future additions (Graph / Assets) land without re-jiggling the
-// on-disk offsets.
+/// Reserved slots in the section table: CanonicalArena, Graph, Assets,
+/// Manifest. Anything we don't actually emit stays zero-filled; the
+/// preamble's `section_tbl_count` tracks the true count.
 const MAX_SECTIONS: u16 = 4;
 
-/// RSMF writer that streams tensor bytes straight to disk.
-///
-/// Construction reserves space for the preamble and section table,
-/// then positions the cursor at the start of the canonical arena.
-/// Each [`StreamingRsmfWriter::stream_canonical_tensor`] call appends
-/// one tensor's bytes. [`StreamingRsmfWriter::finish`] serialises the
-/// manifest, patches the section table, patches the preamble, and
-/// returns ownership of the output path.
+/// The streaming writer cursor. Section writes are strictly ordered:
+/// canonical first, then graph, then assets, then manifest at finish.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Cursor {
+    Canonical,
+    Graph,
+    Asset,
+    Finished,
+}
+
+/// Partial section state kept while the cursor is inside one.
+struct SectionInProgress {
+    file_off: u64,
+    bytes_written: u64,
+    hasher: Hasher,
+}
+
+impl SectionInProgress {
+    fn new(file_off: u64) -> Self {
+        Self {
+            file_off,
+            bytes_written: 0,
+            hasher: Hasher::new(),
+        }
+    }
+
+    fn finalize(self) -> (u64, u64, [u8; CHECKSUM_LEN]) {
+        let mut cs = [0u8; CHECKSUM_LEN];
+        cs.copy_from_slice(&self.hasher.finalize().as_bytes()[..CHECKSUM_LEN]);
+        (self.file_off, self.bytes_written, cs)
+    }
+}
+
+/// Closed section summary stashed for the section-table patch at finish.
+struct ClosedSection {
+    kind: SectionKind,
+    align: u16,
+    file_off: u64,
+    length: u64,
+    checksum: [u8; CHECKSUM_LEN],
+}
+
+/// RSMF writer that streams payloads straight to disk.
 pub struct StreamingRsmfWriter {
     file: File,
     path: PathBuf,
+    cursor: Cursor,
     metadata: Vec<(String, String)>,
     tensor_descriptors: Vec<TensorDescriptor>,
     variant_descriptors: Vec<VariantDescriptor>,
+    graph_descriptors: Vec<GraphDescriptor>,
+    asset_descriptors: Vec<AssetDescriptor>,
     tensor_names: Vec<String>,
-    canonical_arena_file_off: u64,
-    canonical_arena_write_off: u64,
-    canonical_hasher: Hasher,
+    asset_names: Vec<String>,
+    active: Option<SectionInProgress>,
+    closed: Vec<ClosedSection>,
 }
 
 impl StreamingRsmfWriter {
@@ -105,20 +156,22 @@ impl StreamingRsmfWriter {
         let mut writer = Self {
             file,
             path,
+            cursor: Cursor::Canonical,
             metadata: Vec::new(),
             tensor_descriptors: Vec::new(),
             variant_descriptors: Vec::new(),
+            graph_descriptors: Vec::new(),
+            asset_descriptors: Vec::new(),
             tensor_names: Vec::new(),
-            canonical_arena_file_off,
-            canonical_arena_write_off: 0,
-            canonical_hasher: Hasher::new(),
+            asset_names: Vec::new(),
+            active: Some(SectionInProgress::new(canonical_arena_file_off)),
+            closed: Vec::new(),
         };
 
-        // Seek to the start of the canonical arena. The preamble and
-        // section-table slots stay as a zero-filled hole until finish()
-        // patches them. Any bytes between the table end and the arena
-        // start are explicit zeros so readers see a fully populated
-        // file on return.
+        // Preamble + section-table slots stay as a zero-filled hole
+        // until finish() patches them. Bytes between the table end and
+        // the arena start are explicit zeros so readers see a fully
+        // populated file on return.
         let pad_len = canonical_arena_file_off - table_end;
         writer.seek_to(table_end)?;
         if pad_len > 0 {
@@ -137,21 +190,22 @@ impl StreamingRsmfWriter {
 
     /// Stream one canonical tensor's bytes into the output file.
     ///
-    /// The reader is drained; callers that supply a fixed-length source
-    /// should make sure its `Read` impl returns `Ok(0)` at EOF. The
+    /// Must be called before any `stream_graph` or `stream_asset`. The
     /// tensor is aligned to [`VARIANT_ALIGN`] inside the arena, so
     /// several zero-filled bytes may be written before the first byte
     /// from `reader`.
-    ///
-    /// Returns `RsmfError::Structural` if a tensor with the same name
-    /// was already streamed, or if the reader yields an error.
     pub fn stream_canonical_tensor<R: Read>(
         &mut self,
         name: impl Into<String>,
         dtype: LogicalDtype,
         shape: Vec<u64>,
-        mut reader: R,
+        reader: R,
     ) -> Result<()> {
+        if self.cursor != Cursor::Canonical {
+            return Err(RsmfError::structural(
+                "streaming writer: tensors must be streamed before any graph or asset".to_string(),
+            ));
+        }
         let name: String = name.into();
         if self.tensor_names.iter().any(|n| n == &name) {
             return Err(RsmfError::structural(format!(
@@ -159,47 +213,18 @@ impl StreamingRsmfWriter {
             )));
         }
 
-        // Align the tensor start inside the arena.
-        let aligned_off = align_up(self.canonical_arena_write_off, u64::from(VARIANT_ALIGN));
-        if aligned_off > self.canonical_arena_write_off {
-            let pad_len = (aligned_off - self.canonical_arena_write_off) as usize;
-            let zeros = vec![0u8; pad_len];
-            self.write_all(&zeros)?;
-            self.canonical_hasher.update(&zeros);
-            self.canonical_arena_write_off = aligned_off;
-        }
+        // Current section is the canonical arena. Align and stream.
+        let (rel_off, variant_len, variant_checksum) =
+            self.append_body_to_active(u64::from(VARIANT_ALIGN), reader)?;
 
-        // Stream the reader into the file, updating both the section
-        // hash (covers the whole arena) and a per-variant hash.
-        let mut variant_hasher = Hasher::new();
-        let mut variant_len: u64 = 0;
-        let mut buf = [0u8; 65536];
-        loop {
-            let n = reader.read(&mut buf).map_err(|e| RsmfError::IoWithPath {
-                path: self.path.clone(),
-                source: e,
-            })?;
-            if n == 0 {
-                break;
-            }
-            self.write_all(&buf[..n])?;
-            self.canonical_hasher.update(&buf[..n]);
-            variant_hasher.update(&buf[..n]);
-            variant_len += n as u64;
-        }
-        self.canonical_arena_write_off += variant_len;
-
-        // Record descriptors.
         let variant_idx = self.variant_descriptors.len() as u32;
-        let mut variant_checksum = [0u8; CHECKSUM_LEN];
-        variant_checksum.copy_from_slice(&variant_hasher.finalize().as_bytes()[..CHECKSUM_LEN]);
         self.variant_descriptors.push(VariantDescriptor {
             target: TargetTag::Canonical,
             encoding: EncodingKind::Raw,
             storage_dtype: StorageDtype::Logical(dtype),
             layout: LayoutTag::RowMajor,
             alignment: VARIANT_ALIGN,
-            section_relative_offset: aligned_off,
+            section_relative_offset: rel_off,
             length: variant_len,
             checksum: variant_checksum,
             section_kind: SectionKind::CanonicalArena.to_raw() as u8,
@@ -219,6 +244,64 @@ impl StreamingRsmfWriter {
         Ok(())
     }
 
+    /// Stream one graph payload (ONNX, ORT, or Other) into the graph
+    /// section. Transitions the cursor into Graph state on first call;
+    /// rejected after any `stream_asset` has been made.
+    pub fn stream_graph<R: Read>(&mut self, kind: GraphKind, reader: R) -> Result<()> {
+        match self.cursor {
+            Cursor::Canonical => self.transition_to(Cursor::Graph)?,
+            Cursor::Graph => {}
+            Cursor::Asset | Cursor::Finished => {
+                return Err(RsmfError::structural(
+                    "streaming writer: graphs must be streamed before any asset".to_string(),
+                ));
+            }
+        }
+
+        let (rel_off, length, checksum) = self.append_body_to_active(GRAPH_BODY_ALIGN, reader)?;
+        self.graph_descriptors.push(GraphDescriptor {
+            kind,
+            alignment: GRAPH_BODY_ALIGN as u32,
+            offset: rel_off,
+            length,
+            checksum,
+            metadata: Vec::new(),
+        });
+        Ok(())
+    }
+
+    /// Stream one named asset into the assets section. Transitions the
+    /// cursor into Asset state on first call.
+    pub fn stream_asset<R: Read>(&mut self, name: impl Into<String>, reader: R) -> Result<()> {
+        match self.cursor {
+            Cursor::Canonical | Cursor::Graph => self.transition_to(Cursor::Asset)?,
+            Cursor::Asset => {}
+            Cursor::Finished => {
+                return Err(RsmfError::structural(
+                    "streaming writer: already finished".to_string(),
+                ));
+            }
+        }
+        let name: String = name.into();
+        if self.asset_names.iter().any(|n| n == &name) {
+            return Err(RsmfError::structural(format!(
+                "duplicate asset name {name}"
+            )));
+        }
+
+        let (rel_off, length, checksum) = self.append_body_to_active(ASSET_BODY_ALIGN, reader)?;
+        self.asset_descriptors.push(AssetDescriptor {
+            name: name.clone(),
+            alignment: ASSET_BODY_ALIGN as u32,
+            offset: rel_off,
+            length,
+            checksum,
+            metadata: Vec::new(),
+        });
+        self.asset_names.push(name);
+        Ok(())
+    }
+
     /// Serialise the manifest and patch the preamble + section table.
     /// Consumes the writer; the file is fully valid on return.
     pub fn finish(mut self) -> Result<()> {
@@ -228,30 +311,26 @@ impl StreamingRsmfWriter {
             ));
         }
 
-        let canonical_arena_len = self.canonical_arena_write_off;
-        let mut canonical_checksum = [0u8; CHECKSUM_LEN];
-        canonical_checksum
-            .copy_from_slice(&self.canonical_hasher.finalize().as_bytes()[..CHECKSUM_LEN]);
+        // Close whichever section is currently open.
+        self.close_active_section()?;
+        self.cursor = Cursor::Finished;
 
         // Align before the manifest body.
-        let canonical_end = self
-            .canonical_arena_file_off
-            .checked_add(canonical_arena_len)
-            .ok_or_else(|| RsmfError::structural("canonical arena end overflow".to_string()))?;
-        let manifest_file_off = align_up(canonical_end, MANIFEST_ALIGN);
-        if manifest_file_off > canonical_end {
-            let pad_len = (manifest_file_off - canonical_end) as usize;
+        let end_of_last_section = self.current_file_offset()?;
+        let manifest_file_off = align_up(end_of_last_section, MANIFEST_ALIGN);
+        if manifest_file_off > end_of_last_section {
+            let pad_len = (manifest_file_off - end_of_last_section) as usize;
             self.write_all(&vec![0u8; pad_len])?;
         }
 
-        // Encode the manifest from accumulated descriptors.
+        // Encode manifest.
         let manifest = Manifest {
             version: MANIFEST_VERSION,
             metadata: self.metadata.clone(),
             tensors: self.tensor_descriptors.clone(),
             variants: self.variant_descriptors.clone(),
-            graphs: Vec::new(),
-            assets: Vec::new(),
+            graphs: self.graph_descriptors.clone(),
+            assets: self.asset_descriptors.clone(),
         };
         let manifest_bytes = manifest.encode()?;
         let manifest_len = manifest_bytes.len() as u64;
@@ -261,42 +340,41 @@ impl StreamingRsmfWriter {
         manifest_checksum
             .copy_from_slice(&blake3::hash(&manifest_bytes).as_bytes()[..CHECKSUM_LEN]);
 
-        // Ordered by ascending file offset — the section-table
-        // validator requires it.
-        let sections = [
-            SectionDescriptor {
-                kind: SectionKind::CanonicalArena,
-                align: CANONICAL_ARENA_ALIGN as u16,
+        // Build the full section list. Order must be ascending by offset.
+        let mut sections: Vec<SectionDescriptor> = Vec::with_capacity(self.closed.len() + 1);
+        for c in &self.closed {
+            sections.push(SectionDescriptor {
+                kind: c.kind,
+                align: c.align,
                 flags: 0,
-                offset: self.canonical_arena_file_off,
-                length: canonical_arena_len,
-                checksum: canonical_checksum,
-            },
-            SectionDescriptor {
-                kind: SectionKind::Manifest,
-                align: MANIFEST_ALIGN as u16,
-                flags: 0,
-                offset: manifest_file_off,
-                length: manifest_len,
-                checksum: manifest_checksum,
-            },
-        ];
+                offset: c.file_off,
+                length: c.length,
+                checksum: c.checksum,
+            });
+        }
+        sections.push(SectionDescriptor {
+            kind: SectionKind::Manifest,
+            align: MANIFEST_ALIGN as u16,
+            flags: 0,
+            offset: manifest_file_off,
+            length: manifest_len,
+            checksum: manifest_checksum,
+        });
+        sections.sort_by_key(|s| s.offset);
+
         let used_sections = sections.len() as u16;
         assert!(used_sections <= MAX_SECTIONS);
 
-        // Patch section table: always at offset PREAMBLE_LEN.
+        // Patch the section table, then the preamble. Unused reserved
+        // slots in the table stay zero.
         self.seek_to(PREAMBLE_LEN)?;
         for s in &sections {
             self.write_all(&s.encode())?;
         }
-        // Remaining reserved slots stay zero (the file was already
-        // zero-padded during `new`, but re-write to be explicit in
-        // case the OS lost that state).
         for _ in used_sections..MAX_SECTIONS {
             self.write_all(&[0u8; SECTION_DESC_LEN as usize])?;
         }
 
-        // Patch preamble at offset 0.
         let preamble = Preamble {
             magic: MAGIC,
             major: FORMAT_MAJOR,
@@ -321,6 +399,140 @@ impl StreamingRsmfWriter {
             source: e,
         })?;
         Ok(())
+    }
+
+    // ---- internal helpers ----
+
+    /// Align inside the active section, stream the reader to disk, and
+    /// return `(relative_offset, length, body_checksum)` where:
+    /// - `relative_offset` is the start offset inside the section,
+    /// - `length` is the body length (excluding padding),
+    /// - `body_checksum` is BLAKE3 over the body bytes only (used as
+    ///   the per-variant / per-graph / per-asset checksum).
+    fn append_body_to_active<R: Read>(
+        &mut self,
+        body_align: u64,
+        mut reader: R,
+    ) -> Result<(u64, u64, [u8; CHECKSUM_LEN])> {
+        let active = self.active.as_mut().ok_or_else(|| {
+            RsmfError::structural("streaming writer: no active section".to_string())
+        })?;
+
+        // Align inside the section.
+        let aligned_off = align_up(active.bytes_written, body_align);
+        if aligned_off > active.bytes_written {
+            let pad_len = (aligned_off - active.bytes_written) as usize;
+            let zeros = vec![0u8; pad_len];
+            self.file
+                .write_all(&zeros)
+                .map_err(|e| RsmfError::IoWithPath {
+                    path: self.path.clone(),
+                    source: e,
+                })?;
+            active.hasher.update(&zeros);
+            active.bytes_written = aligned_off;
+        }
+
+        // Stream.
+        let mut body_hasher = Hasher::new();
+        let mut body_len: u64 = 0;
+        let mut buf = [0u8; 65536];
+        loop {
+            let n = reader.read(&mut buf).map_err(|e| RsmfError::IoWithPath {
+                path: self.path.clone(),
+                source: e,
+            })?;
+            if n == 0 {
+                break;
+            }
+            self.file
+                .write_all(&buf[..n])
+                .map_err(|e| RsmfError::IoWithPath {
+                    path: self.path.clone(),
+                    source: e,
+                })?;
+            active.hasher.update(&buf[..n]);
+            body_hasher.update(&buf[..n]);
+            body_len += n as u64;
+        }
+        active.bytes_written += body_len;
+
+        let mut body_checksum = [0u8; CHECKSUM_LEN];
+        body_checksum.copy_from_slice(&body_hasher.finalize().as_bytes()[..CHECKSUM_LEN]);
+        Ok((aligned_off, body_len, body_checksum))
+    }
+
+    /// Close the currently active section, recording it in `closed`.
+    fn close_active_section(&mut self) -> Result<()> {
+        let Some(active) = self.active.take() else {
+            return Ok(());
+        };
+        let kind = match self.cursor {
+            Cursor::Canonical => SectionKind::CanonicalArena,
+            Cursor::Graph => SectionKind::Graph,
+            Cursor::Asset => SectionKind::Assets,
+            Cursor::Finished => {
+                return Err(RsmfError::structural(
+                    "streaming writer: close called after finish".to_string(),
+                ));
+            }
+        };
+        let align: u16 = match kind {
+            SectionKind::CanonicalArena => CANONICAL_ARENA_ALIGN as u16,
+            SectionKind::Graph => GRAPH_SECTION_ALIGN as u16,
+            SectionKind::Assets => ASSETS_SECTION_ALIGN as u16,
+            _ => unreachable!("close called for non-arena/graph/asset section"),
+        };
+        // Graph / Asset sections disallow zero length per section-table
+        // validator; skip recording them if they're empty (the cursor
+        // transitioned into them but nothing was actually streamed).
+        if active.bytes_written == 0 && !matches!(kind, SectionKind::CanonicalArena) {
+            return Ok(());
+        }
+        let (file_off, length, checksum) = active.finalize();
+        self.closed.push(ClosedSection {
+            kind,
+            align,
+            file_off,
+            length,
+            checksum,
+        });
+        Ok(())
+    }
+
+    /// Move the cursor to `next`, closing the current section and
+    /// opening a fresh one at the appropriate alignment.
+    fn transition_to(&mut self, next: Cursor) -> Result<()> {
+        debug_assert!(next != self.cursor);
+        self.close_active_section()?;
+        let next_section_align = match next {
+            Cursor::Canonical => CANONICAL_ARENA_ALIGN,
+            Cursor::Graph => GRAPH_SECTION_ALIGN,
+            Cursor::Asset => ASSETS_SECTION_ALIGN,
+            Cursor::Finished => {
+                return Err(RsmfError::structural(
+                    "streaming writer: cannot transition to Finished directly".to_string(),
+                ));
+            }
+        };
+        let here = self.current_file_offset()?;
+        let aligned = align_up(here, next_section_align);
+        if aligned > here {
+            let pad_len = (aligned - here) as usize;
+            self.write_all(&vec![0u8; pad_len])?;
+        }
+        self.active = Some(SectionInProgress::new(aligned));
+        self.cursor = next;
+        Ok(())
+    }
+
+    fn current_file_offset(&mut self) -> Result<u64> {
+        self.file
+            .stream_position()
+            .map_err(|e| RsmfError::IoWithPath {
+                path: self.path.clone(),
+                source: e,
+            })
     }
 
     fn seek_to(&mut self, off: u64) -> Result<()> {
