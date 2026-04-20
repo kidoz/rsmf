@@ -69,6 +69,14 @@ pub struct Args {
     /// Compress the assets section with zstd.
     #[arg(long)]
     pub compress_assets: bool,
+    /// Stream tensor bodies from the source straight to disk without
+    /// buffering them in RAM. Unlocks packing of multi-hundred-GB
+    /// checkpoints. Currently compatible with `--from-safetensors` and
+    /// `--from-npy`; incompatible with `--quantize-*`, `--cast-f16`,
+    /// `--compress-*`, `--graph`, and `--asset` (the streaming writer
+    /// MVP only emits raw canonical tensors).
+    #[arg(long)]
+    pub stream: bool,
 }
 
 /// Execute `rsmf pack`.
@@ -79,6 +87,11 @@ pub fn run(args: Args) -> Result<(), CliError> {
     let has_quant_q3_k = args.quantize_q3_k.is_some();
     let has_quant_nf4 = args.quantize_nf4.is_some();
     let has_quant_fp8 = args.quantize_fp8.is_some();
+
+    // Fast path: --stream bypasses the in-memory RsmfWriter entirely.
+    if args.stream {
+        return run_streaming(&args);
+    }
 
     let f16_target = args
         .cast_f16
@@ -468,4 +481,150 @@ fn resolve_python_binary() -> Result<String, CliError> {
         }
     }
     Ok("python3".to_string())
+}
+
+/// Streaming pack path.
+///
+/// Memory profile: tensor bodies never land in the process heap — the
+/// safetensors path mmaps the source and hands each tensor's byte slice
+/// directly to `StreamingRsmfWriter`, which pipes it through to disk in
+/// 64 KiB chunks. Peak RSS stays in the low MB range regardless of source
+/// size.
+fn run_streaming(args: &Args) -> Result<(), CliError> {
+    // Every mode-altering flag the MVP streaming writer can't honour is
+    // rejected up-front with a clear message so users don't get a
+    // surprising "quantize flag ignored" effect.
+    if args.cast_f16.is_some()
+        || args.quantize_q8_0.is_some()
+        || args.quantize_q4_0.is_some()
+        || args.quantize_q3_k.is_some()
+        || args.quantize_nf4.is_some()
+        || args.quantize_fp8.is_some()
+    {
+        return Err(CliError::user(anyhow!(
+            "--stream does not yet support --quantize-* / --cast-f16; \
+             use the default (buffered) pack path for those variants"
+        )));
+    }
+    if args.compress_tensors || args.compress_graph || args.compress_assets {
+        return Err(CliError::user(anyhow!(
+            "--stream does not yet support --compress-* flags"
+        )));
+    }
+    if !args.graphs.is_empty() || !args.assets.is_empty() {
+        return Err(CliError::user(anyhow!(
+            "--stream does not yet support --graph / --asset; \
+             those will land in a follow-up"
+        )));
+    }
+    if args.from_gguf.is_some() {
+        return Err(CliError::user(anyhow!(
+            "--stream does not yet support --from-gguf"
+        )));
+    }
+    if args.from_torch.is_some() {
+        return Err(CliError::user(anyhow!(
+            "--stream does not support --from-torch \
+             (the torch subprocess already materialises a safetensors \
+             tempfile which fits in RAM)"
+        )));
+    }
+
+    if let Some(path) = args.from_safetensors.as_deref() {
+        return stream_from_safetensors(path, &args.out);
+    }
+    if let Some(path) = args.from_npy.as_deref() {
+        #[cfg(feature = "npy")]
+        {
+            return stream_from_npy(path, &args.out);
+        }
+        #[cfg(not(feature = "npy"))]
+        {
+            let _ = path;
+            return Err(CliError::user(anyhow!("NumPy support not enabled")));
+        }
+    }
+    Err(CliError::user(anyhow!(
+        "--stream requires one of --from-safetensors or --from-npy"
+    )))
+}
+
+/// Stream every tensor out of an mmap'd safetensors file into a fresh rsmf.
+fn stream_from_safetensors(src: &std::path::Path, out: &std::path::Path) -> Result<(), CliError> {
+    let file =
+        std::fs::File::open(src).map_err(|e| CliError::user(anyhow!("{}: {e}", src.display())))?;
+    // SAFETY: we treat the mmap as read-only; safetensors::deserialize
+    // borrows from this slice for the duration of `writer.finish()`. The
+    // mapping is dropped after `writer.finish()` completes.
+    let mmap = unsafe { memmap2::Mmap::map(&file) }
+        .map_err(|e| CliError::user(anyhow!("mmap {}: {e}", src.display())))?;
+
+    let st = safetensors::SafeTensors::deserialize(&mmap[..])
+        .map_err(|e| CliError::user(anyhow!("safetensors: {e}")))?;
+
+    let mut writer = rsmf_core::StreamingRsmfWriter::new(out)
+        .map_err(CliError::from)?
+        .with_metadata("source", "safetensors");
+
+    for name in st.names() {
+        let tv = st
+            .tensor(name)
+            .map_err(|e| CliError::user(anyhow!("tensor {}: {e}", name)))?;
+        let dtype = rsmf_core::safetensors_convert::map_dtype(tv.dtype())?;
+        let shape: Vec<u64> = tv.shape().iter().map(|&d| d as u64).collect();
+        writer
+            .stream_canonical_tensor(name.clone(), dtype, shape, tv.data())
+            .map_err(CliError::from)?;
+    }
+    writer.finish().map_err(CliError::from)?;
+    println!(
+        "packed (stream): wrote {} from {}",
+        out.display(),
+        src.display()
+    );
+    Ok(())
+}
+
+/// Stream a single-tensor `.npy` file into rsmf. The `ndarray_npy` crate
+/// currently materialises the array in memory (its API doesn't expose a
+/// streaming reader), so for NPY the "streaming" label refers to the
+/// output side — bytes hit disk as they're produced without being
+/// re-buffered through the batch `RsmfWriter`.
+#[cfg(feature = "npy")]
+fn stream_from_npy(src: &std::path::Path, out: &std::path::Path) -> Result<(), CliError> {
+    use std::io::Cursor;
+
+    let array: ndarray::ArrayD<f32> = ndarray_npy::read_npy(src)
+        .map_err(|e| CliError::user(anyhow!("read .npy {}: {e}", src.display())))?;
+    let shape: Vec<u64> = array.shape().iter().map(|&d| d as u64).collect();
+    let contiguous = array.as_standard_layout().to_owned();
+    let slice = contiguous
+        .as_slice()
+        .ok_or_else(|| CliError::user(anyhow!("npy array is not contiguous after layout fix")))?;
+    let bytes = bytemuck::cast_slice::<f32, u8>(slice);
+
+    let name = src
+        .file_stem()
+        .and_then(std::ffi::OsStr::to_str)
+        .unwrap_or("tensor")
+        .to_string();
+
+    let mut writer = rsmf_core::StreamingRsmfWriter::new(out)
+        .map_err(CliError::from)?
+        .with_metadata("source", "npy");
+    writer
+        .stream_canonical_tensor(
+            name,
+            rsmf_core::LogicalDtype::F32,
+            shape,
+            Cursor::new(bytes),
+        )
+        .map_err(CliError::from)?;
+    writer.finish().map_err(CliError::from)?;
+    println!(
+        "packed (stream): wrote {} from {}",
+        out.display(),
+        src.display()
+    );
+    Ok(())
 }

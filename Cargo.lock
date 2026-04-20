@@ -2389,6 +2389,7 @@ dependencies = [
  "clap",
  "hex",
  "hf-hub",
+ "memmap2",
  "ndarray 0.17.2",
  "ndarray-npy",
  "rsmf-core",
