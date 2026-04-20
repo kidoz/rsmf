@@ -157,6 +157,21 @@ impl VariantInput {
         }
     }
 
+    /// Build a packed f32→fp8_e5m2 variant. Caller must supply E5M2
+    /// bytes already quantized (see [`convert_f32_to_fp8_e5m2_bytes`]).
+    #[must_use]
+    pub fn packed_fp8_e5m2(target: TargetTag, bytes: Vec<u8>) -> Self {
+        Self {
+            target,
+            encoding: EncodingKind::Raw,
+            storage_dtype: Some(StorageDtype::Fp8E5M2),
+            layout: LayoutTag::RowMajor,
+            alignment: DEFAULT_PACKED_ALIGNMENT,
+            bytes,
+            meta: VariantMeta::default(),
+        }
+    }
+
     /// Build a packed f32→fp8_e4m3 variant.
     #[must_use]
     pub fn packed_fp8_e4m3(target: TargetTag, bytes: Vec<u8>) -> Self {
@@ -513,6 +528,114 @@ pub fn convert_f32_to_nf4_bytes(f32_bytes: &[u8]) -> Vec<u8> {
 
 /// Convert an f32 tensor's canonical bytes to FP8 E4M3 bytes.
 #[must_use]
+/// Convert an f32 tensor's canonical bytes to OCP FP8 E5M2 storage
+/// bytes (1 sign, 5 exponent, 2 mantissa, bias 15, IEEE-like).
+///
+/// - Finite values outside the E5M2 range saturate to the max finite
+///   magnitude (57344.0) — the "saturating-to-finite" overflow mode.
+/// - NaN maps to the canonical E5M2 NaN (`0x7F`).
+/// - ±∞ is preserved (`0x7C` / `0xFC`).
+/// - Denormalised f32 inputs that fall below E5M2's minimum subnormal
+///   (`2^-16`) round to zero with the sign preserved.
+///
+/// Rounding mode is round-to-nearest-even on the mantissa. The encoder
+/// is symmetric with the decoder in `view.rs`, so round-trip through
+/// the writer and `TensorView::decode_f32` reproduces the closest
+/// representable E5M2 value to the original f32.
+pub fn convert_f32_to_fp8_e5m2_bytes(f32_bytes: &[u8]) -> Vec<u8> {
+    assert!(
+        f32_bytes.len() % 4 == 0,
+        "f32 bytes length not a multiple of 4"
+    );
+    let count = f32_bytes.len() / 4;
+    let mut out = Vec::with_capacity(count);
+    for i in 0..count {
+        let val = f32::from_le_bytes([
+            f32_bytes[i * 4],
+            f32_bytes[i * 4 + 1],
+            f32_bytes[i * 4 + 2],
+            f32_bytes[i * 4 + 3],
+        ]);
+        out.push(encode_one_fp8_e5m2(val));
+    }
+    out
+}
+
+/// Encode a single `f32` into its E5M2 byte. See
+/// [`convert_f32_to_fp8_e5m2_bytes`] for semantics.
+fn encode_one_fp8_e5m2(val: f32) -> u8 {
+    let bits = val.to_bits();
+    let sign_bit: u8 = if (bits >> 31) != 0 { 0x80 } else { 0 };
+
+    if val.is_nan() {
+        // Canonical quiet NaN with a non-zero mantissa; sign carried through.
+        return sign_bit | 0x7F;
+    }
+    if val.is_infinite() {
+        return sign_bit | 0x7C;
+    }
+
+    let abs_val = val.abs();
+    if abs_val == 0.0 {
+        return sign_bit;
+    }
+
+    // E5M2 max finite value is 2^15 * (1 + 3/4) = 57344.
+    const MAX_FINITE: f32 = 57344.0;
+    if abs_val >= MAX_FINITE * 2.0 {
+        // Far past max finite → saturate to max finite.
+        return sign_bit | 0x7B;
+    }
+
+    let f32_exp = ((bits >> 23) & 0xFF) as i32 - 127;
+    let f32_mant = bits & 0x007F_FFFF;
+    let e5m2_exp = f32_exp + 15;
+
+    if e5m2_exp >= 31 {
+        // Overflow in the normal range → saturate to max finite.
+        return sign_bit | 0x7B;
+    }
+
+    if e5m2_exp <= 0 {
+        // Subnormal or underflow. E5M2 subnormal: value = ±2^-14 * m/4,
+        // m ∈ {1, 2, 3}. Convert via direct scaling + round-to-nearest.
+        let scaled = abs_val * 2.0_f32.powi(14) * 4.0;
+        let rounded = scaled.round();
+        if rounded <= 0.0 {
+            return sign_bit;
+        }
+        let m = rounded as u32;
+        if m >= 4 {
+            // Rounded up into the smallest normal: exp=1, mant=0.
+            return sign_bit | 0x04;
+        }
+        return sign_bit | (m as u8);
+    }
+
+    // Normal range. Round-to-nearest-even on the two-bit mantissa.
+    let shift = 23 - 2;
+    let remainder = f32_mant & ((1 << shift) - 1);
+    let half = 1u32 << (shift - 1);
+    let mut m = f32_mant >> shift;
+    // Round-to-nearest, ties-to-even.
+    if remainder > half || (remainder == half && (m & 1) == 1) {
+        m += 1;
+    }
+    let mut exp = e5m2_exp as u32;
+    if m == 4 {
+        // Mantissa overflowed → carry into the exponent.
+        m = 0;
+        exp += 1;
+        if exp >= 31 {
+            return sign_bit | 0x7B;
+        }
+    }
+    sign_bit | ((exp as u8) << 2) | (m as u8 & 0x03)
+}
+
+/// Convert an f32 tensor's canonical bytes to OCP FP8 E4M3 storage
+/// bytes (1 sign, 4 exponent, 3 mantissa, bias 7, no infinity).
+/// Saturates overflow to the E4M3 max finite magnitude (448.0).
 pub fn convert_f32_to_fp8_e4m3_bytes(f32_bytes: &[u8]) -> Vec<u8> {
     assert!(f32_bytes.len() % 4 == 0, "f32 bytes not multiple of 4");
     let count = f32_bytes.len() / 4;
@@ -712,6 +835,24 @@ impl RsmfWriter {
     }
 
     /// Append a tensor input and automatically generate an `FP8_E4M3` variant.
+    /// Append a tensor input and automatically generate an `Fp8E5M2`
+    /// packed variant for the given target (F32 tensors only; others
+    /// pass through unchanged).
+    #[must_use]
+    pub fn with_tensor_auto_fp8_e5m2(mut self, mut t: TensorInput, target: TargetTag) -> Self {
+        if t.dtype == LogicalDtype::F32 {
+            let q_bytes = convert_f32_to_fp8_e5m2_bytes(&t.canonical.bytes);
+            t.packed
+                .push(VariantInput::packed_fp8_e5m2(target, q_bytes));
+        }
+        self.tensors.push(t);
+        self
+    }
+
+    /// Append a tensor input and automatically generate an `Fp8E4M3`
+    /// packed variant for the given target (F32 tensors only; others
+    /// pass through unchanged).
+    #[must_use]
     pub fn with_tensor_auto_fp8_e4m3(mut self, mut t: TensorInput, target: TargetTag) -> Self {
         if t.dtype == LogicalDtype::F32 {
             let q_bytes = convert_f32_to_fp8_e4m3_bytes(&t.canonical.bytes);
