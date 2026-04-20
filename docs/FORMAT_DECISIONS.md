@@ -30,6 +30,36 @@ Graph and asset accessors return `bytes`. No attempt is made to parse ONNX or to
 
 PyO3 is pinned to `v0.22` with `abi3-py38`, producing a single wheel that loads on Python ≥ 3.8. Build via `maturin develop -m crates/rsmf-python/Cargo.toml`.
 
+## D9 — SectionKind custom range + flag bit 1
+
+Two format-level extensibility reservations that do not bump the
+version:
+
+- **`SectionKind::Custom(u16)`** maps any on-disk discriminant ≥ 128
+  to a Custom variant that readers MUST preserve on round-trip. Values
+  1–5 stay reserved for the standard's own sections; values 6–127 stay
+  rejected with a structural error until the standard promotes one.
+  Analogous to PNG's ancillary-chunk case-bit convention.
+- **`SECTION_FLAG_BIT_SHUFFLED = 0x2`** on `SectionDescriptor.flags`
+  explicitly records that the payload was passed through the
+  bit-shuffle pre-processor before any further encoding / compression.
+  The format has always done this inside compressed F32 sections; the
+  flag makes the contract visible so consumers that want the
+  un-shuffled bytes can opt out.
+
+Both changes are additive. Old readers reject any non-zero unknown
+reserved bit — so a new writer setting these bits on a file read by an
+old reader fails loudly rather than silently misinterpreting.
+
+## D10 — LayoutTag::TileInterleaved
+
+`LayoutTag::TileInterleaved = 2` reserves space for WMMA / tensor-core
+/ WGSL-fragment-friendly tile-packed layouts. Tile shape is carried in
+`VariantMeta::block_shape`. Decoders that can't handle the layout MUST
+return `RsmfError::Unsupported` rather than re-interpret the bytes as
+row-major; the zero-copy Python path already guards on `RowMajor` and
+is correct by construction.
+
 ## D8 — Source-format conversion priorities
 
 The `rsmf pack` and `rsmf import` CLIs ingest from a fixed priority-ordered
