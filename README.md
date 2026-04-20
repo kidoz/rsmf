@@ -78,13 +78,14 @@ rsmf pack --stream --from-safetensors huge_model.safetensors --out huge_model.rs
 `--stream` bypasses the buffered pack path and pipes tensor bytes
 directly to disk as each tensor is read. Peak RSS stays in the low-MB
 range regardless of source size, so a 70B-parameter (~140 GB) checkpoint
-packs on a laptop with tens of MB of free RAM. `--graph` and `--asset`
-are streamed too — a full model bundle (weights + ONNX graph + tokenizer
-+ configs) is packable in one pass without ever holding a section in
-memory. Currently compatible with `--from-safetensors` and `--from-npy`;
-not yet with `--quantize-*`, `--cast-f16`, or `--compress-*` (those
-combine with the streaming writer in a follow-up; today they error
-loudly rather than silently dropping the flag).
+packs on a laptop with tens of MB of free RAM. `--graph`, `--asset`,
+and `--compress-*` all work under `--stream` — a full model bundle
+(weights + ONNX graph + tokenizer + configs, optionally zstd-compressed)
+is packable in one pass without ever holding a section in memory.
+The streaming path skips the bit-shuffle pre-processor the batch writer
+uses, so compression ratios are slightly lower; in exchange, packing
+scales to arbitrary source size. Not yet compatible with `--quantize-*`
+or `--cast-f16`.
 
 ```sh
 rsmf pack --stream --from-safetensors model.safetensors \

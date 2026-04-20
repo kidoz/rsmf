@@ -245,6 +245,60 @@ fn stream_pack_bundles_graph_and_asset() {
 }
 
 #[test]
+fn stream_pack_with_compress_tensors_round_trips() {
+    let dir = tempdir().unwrap();
+    let st_path = build_multi_tensor_fixture(dir.path());
+    let rsmf_path = dir.path().join("model_stream_compressed.rsmf");
+
+    let out = Command::new(rsmf_bin())
+        .args([
+            "pack",
+            "--stream",
+            "--compress-tensors",
+            "--from-safetensors",
+        ])
+        .arg(&st_path)
+        .arg("--out")
+        .arg(&rsmf_path)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stream + compress-tensors pack failed: {out:?}"
+    );
+
+    let out = Command::new(rsmf_bin())
+        .args(["verify", "--full"])
+        .arg(&rsmf_path)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "verify failed: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("structural: ok"));
+    assert!(stdout.contains("full checksum: ok"));
+
+    let extract_path = dir.path().join("ecw.bin");
+    let out = Command::new(rsmf_bin())
+        .args(["extract", "--tensor", "encoder.weight"])
+        .arg(&rsmf_path)
+        .arg(&extract_path)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "extract failed: {out:?}");
+    let extracted = std::fs::read(&extract_path).unwrap();
+    for i in 0..8 {
+        let off = i * 4;
+        let v = f32::from_le_bytes([
+            extracted[off],
+            extracted[off + 1],
+            extracted[off + 2],
+            extracted[off + 3],
+        ]);
+        assert!((v - i as f32).abs() < f32::EPSILON);
+    }
+}
+
+#[test]
 fn stream_pack_rejects_incompatible_flags() {
     let dir = tempdir().unwrap();
     let st_path = build_fixture(dir.path());

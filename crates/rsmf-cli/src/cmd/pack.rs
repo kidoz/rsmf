@@ -72,9 +72,11 @@ pub struct Args {
     /// Stream tensor, graph, and asset bodies from the source straight
     /// to disk without buffering them in RAM. Unlocks packing of
     /// multi-hundred-GB checkpoints and full model bundles in one pass.
-    /// Currently compatible with `--from-safetensors` and `--from-npy`
-    /// plus `--graph` and `--asset`; not yet with `--quantize-*`,
-    /// `--cast-f16`, or `--compress-*` (those land in a follow-up).
+    /// Currently compatible with `--from-safetensors`, `--from-npy`,
+    /// `--graph`, `--asset`, and `--compress-*` (zstd only — the
+    /// streaming path does not apply the bit-shuffle pre-processor the
+    /// batch writer uses, so compression ratios are slightly lower).
+    /// Not yet compatible with `--quantize-*` and `--cast-f16`.
     #[arg(long)]
     pub stream: bool,
 }
@@ -506,11 +508,6 @@ fn run_streaming(args: &Args) -> Result<(), CliError> {
              use the default (buffered) pack path for those variants"
         )));
     }
-    if args.compress_tensors || args.compress_graph || args.compress_assets {
-        return Err(CliError::user(anyhow!(
-            "--stream does not yet support --compress-* flags"
-        )));
-    }
     if args.from_gguf.is_some() {
         return Err(CliError::user(anyhow!(
             "--stream does not yet support --from-gguf"
@@ -524,17 +521,44 @@ fn run_streaming(args: &Args) -> Result<(), CliError> {
         )));
     }
 
+    // Zstd level 3 matches the batch writer's default.
+    let comp_level: i32 = 3;
+    let canonical_compression = args.compress_tensors.then_some(comp_level);
+    let graph_compression = args.compress_graph.then_some(comp_level);
+    let assets_compression = args.compress_assets.then_some(comp_level);
+
     if let Some(path) = args.from_safetensors.as_deref() {
-        return stream_from_safetensors(path, &args.out, &args.graphs, &args.assets);
+        return stream_from_safetensors(
+            path,
+            &args.out,
+            &args.graphs,
+            &args.assets,
+            canonical_compression,
+            graph_compression,
+            assets_compression,
+        );
     }
     if let Some(path) = args.from_npy.as_deref() {
         #[cfg(feature = "npy")]
         {
-            return stream_from_npy(path, &args.out, &args.graphs, &args.assets);
+            return stream_from_npy(
+                path,
+                &args.out,
+                &args.graphs,
+                &args.assets,
+                canonical_compression,
+                graph_compression,
+                assets_compression,
+            );
         }
         #[cfg(not(feature = "npy"))]
         {
-            let _ = path;
+            let _ = (
+                path,
+                canonical_compression,
+                graph_compression,
+                assets_compression,
+            );
             return Err(CliError::user(anyhow!("NumPy support not enabled")));
         }
     }
@@ -579,11 +603,15 @@ fn append_graphs_and_assets(
 }
 
 /// Stream every tensor out of an mmap'd safetensors file into a fresh rsmf.
+#[allow(clippy::too_many_arguments)]
 fn stream_from_safetensors(
     src: &std::path::Path,
     out: &std::path::Path,
     graphs: &[std::path::PathBuf],
     assets: &[std::path::PathBuf],
+    canonical_compression: Option<i32>,
+    graph_compression: Option<i32>,
+    assets_compression: Option<i32>,
 ) -> Result<(), CliError> {
     let file =
         std::fs::File::open(src).map_err(|e| CliError::user(anyhow!("{}: {e}", src.display())))?;
@@ -599,6 +627,15 @@ fn stream_from_safetensors(
     let mut writer = rsmf_core::StreamingRsmfWriter::new(out)
         .map_err(CliError::from)?
         .with_metadata("source", "safetensors");
+    if let Some(level) = canonical_compression {
+        writer = writer.with_canonical_compression(level);
+    }
+    if let Some(level) = graph_compression {
+        writer = writer.with_graph_compression(level);
+    }
+    if let Some(level) = assets_compression {
+        writer = writer.with_assets_compression(level);
+    }
 
     for name in st.names() {
         let tv = st
@@ -626,11 +663,15 @@ fn stream_from_safetensors(
 /// output side — bytes hit disk as they're produced without being
 /// re-buffered through the batch `RsmfWriter`.
 #[cfg(feature = "npy")]
+#[allow(clippy::too_many_arguments)]
 fn stream_from_npy(
     src: &std::path::Path,
     out: &std::path::Path,
     graphs: &[std::path::PathBuf],
     assets: &[std::path::PathBuf],
+    canonical_compression: Option<i32>,
+    graph_compression: Option<i32>,
+    assets_compression: Option<i32>,
 ) -> Result<(), CliError> {
     use std::io::Cursor;
 
@@ -652,6 +693,15 @@ fn stream_from_npy(
     let mut writer = rsmf_core::StreamingRsmfWriter::new(out)
         .map_err(CliError::from)?
         .with_metadata("source", "npy");
+    if let Some(level) = canonical_compression {
+        writer = writer.with_canonical_compression(level);
+    }
+    if let Some(level) = graph_compression {
+        writer = writer.with_graph_compression(level);
+    }
+    if let Some(level) = assets_compression {
+        writer = writer.with_assets_compression(level);
+    }
     writer
         .stream_canonical_tensor(
             name,
