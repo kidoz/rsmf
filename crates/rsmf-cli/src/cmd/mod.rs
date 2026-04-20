@@ -8,6 +8,7 @@ pub mod extract_asset;
 pub mod import;
 pub mod inspect;
 pub mod pack;
+pub mod rewrite;
 pub mod select;
 pub mod verify;
 
@@ -37,6 +38,10 @@ pub enum Command {
     ExtractAsset(extract_asset::Args),
     /// Print the variant selection plan for a given execution mode.
     Select(select::Args),
+    /// Copy an RSMF file while stripping variants, graphs, assets, or
+    /// metadata. Useful for shipping a smaller production artifact from
+    /// a dev-time bundle.
+    Rewrite(rewrite::Args),
 }
 
 impl Command {
@@ -50,6 +55,7 @@ impl Command {
             Self::Extract(args) => extract::run(args),
             Self::ExtractAsset(args) => extract_asset::run(args),
             Self::Select(args) => select::run(args),
+            Self::Rewrite(args) => rewrite::run(args),
         }
     }
 }
