@@ -597,8 +597,8 @@ impl RsmfFile {
 
     fn variant_section(&self, v: &VariantDescriptor) -> Result<&SectionDescriptor> {
         let section_idx = match v.section_kind {
-            k if k == SectionKind::CanonicalArena as u8 => self.canonical_section_idx,
-            k if k == SectionKind::PackedArena as u8 => {
+            k if k == SectionKind::CanonicalArena.to_raw() as u8 => self.canonical_section_idx,
+            k if k == SectionKind::PackedArena.to_raw() as u8 => {
                 let i = v.section_index as usize;
                 *self.packed_section_indices.get(i).ok_or_else(|| {
                     RsmfError::structural(format!(
@@ -687,11 +687,11 @@ fn validate_manifest(
     }
     for (i, v) in manifest.variants.iter().enumerate() {
         let section_idx = match v.section_kind {
-            k if k == SectionKind::CanonicalArena as u8 => sections
+            k if k == SectionKind::CanonicalArena.to_raw() as u8 => sections
                 .iter()
                 .position(|s| s.kind == SectionKind::CanonicalArena)
                 .unwrap(),
-            k if k == SectionKind::PackedArena as u8 => {
+            k if k == SectionKind::PackedArena.to_raw() as u8 => {
                 let idx = v.section_index as usize;
                 *packed_section_indices.get(idx).ok_or_else(|| {
                     RsmfError::structural(format!(

@@ -897,7 +897,7 @@ impl RsmfWriter {
                 section_relative_offset: layout.offset,
                 length: layout.length,
                 checksum: layout.checksum,
-                section_kind: SectionKind::CanonicalArena as u8,
+                section_kind: SectionKind::CanonicalArena.to_raw() as u8,
                 section_index: 0,
                 meta: t.canonical.meta.clone(),
             };
@@ -921,7 +921,7 @@ impl RsmfWriter {
                     section_relative_offset: layout.offset,
                     length: layout.length,
                     checksum: layout.checksum,
-                    section_kind: SectionKind::PackedArena as u8,
+                    section_kind: SectionKind::PackedArena.to_raw() as u8,
                     section_index,
                     meta: p.meta.clone(),
                 };

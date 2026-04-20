@@ -172,6 +172,10 @@ impl EncodingKind {
 }
 
 /// Storage layout tag.
+///
+/// Discriminants are stable u16 wire values. New layouts are appended;
+/// consumers that don't understand a layout must fall through to a
+/// copy / dequant path rather than misinterpret the bytes as row-major.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u16)]
 pub enum LayoutTag {
@@ -179,6 +183,12 @@ pub enum LayoutTag {
     RowMajor = 0,
     /// Blocked layout; the block shape is carried in [`VariantMeta::block_shape`].
     Blocked = 1,
+    /// Tile-interleaved layout used by WMMA / tensor-core / WGSL
+    /// fragments. Tile shape is carried in [`VariantMeta::block_shape`]
+    /// (e.g. `[16, 16]`). Decoders that can't handle the layout MUST
+    /// surface `RsmfError::Unsupported` rather than re-interpret the
+    /// bytes as row-major.
+    TileInterleaved = 2,
 }
 
 impl LayoutTag {
@@ -187,6 +197,7 @@ impl LayoutTag {
         Ok(match raw {
             0 => Self::RowMajor,
             1 => Self::Blocked,
+            2 => Self::TileInterleaved,
             other => {
                 return Err(RsmfError::structural(format!("unknown layout tag {other}")));
             }
@@ -199,6 +210,7 @@ impl LayoutTag {
         match self {
             Self::RowMajor => "row_major",
             Self::Blocked => "blocked",
+            Self::TileInterleaved => "tile_interleaved",
         }
     }
 }
@@ -273,7 +285,7 @@ impl VariantDescriptor {
             section_relative_offset,
             length,
             checksum,
-            section_kind: crate::section::SectionKind::CanonicalArena as u8,
+            section_kind: crate::section::SectionKind::CanonicalArena.to_raw() as u8,
             section_index: 0,
             meta: VariantMeta::default(),
         }

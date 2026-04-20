@@ -298,7 +298,7 @@ mod tests {
             section_relative_offset: 0,
             length: 16,
             checksum: [0u8; CHECKSUM_LEN],
-            section_kind: SectionKind::CanonicalArena as u8,
+            section_kind: SectionKind::CanonicalArena.to_raw() as u8,
             section_index: 0,
             meta: VariantMeta::default(),
         }
