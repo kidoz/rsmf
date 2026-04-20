@@ -7,6 +7,7 @@
 
 use std::io::Cursor;
 
+use rsmf_core::manifest::GraphKind;
 use rsmf_core::{LogicalDtype, RsmfFile, StreamingRsmfWriter};
 use tempfile::tempdir;
 
@@ -106,6 +107,135 @@ fn finish_with_no_tensors_is_rejected() {
     let w = StreamingRsmfWriter::new(&path).expect("new");
     let err = w.finish().expect_err("finish must reject empty");
     assert!(matches!(err, rsmf_core::RsmfError::Structural(_)));
+}
+
+#[test]
+fn tensors_and_graph_and_assets_round_trip() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("bundle.rsmf");
+
+    let tensor_bytes = f32_bytes(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
+    let graph_bytes = b"ONNX\x00fake-graph-for-streaming-test".to_vec();
+    let asset_a = b"{\"vocab\":[\"<pad>\"]}".to_vec();
+    let asset_b = b"{\"rope_theta\":10000.0}".to_vec();
+
+    let mut w = StreamingRsmfWriter::new(&path)
+        .expect("new")
+        .with_metadata("source", "streaming_bundle");
+    w.stream_canonical_tensor(
+        "weights",
+        LogicalDtype::F32,
+        vec![2, 4],
+        Cursor::new(&tensor_bytes),
+    )
+    .expect("tensor");
+    w.stream_graph(GraphKind::Onnx, Cursor::new(&graph_bytes))
+        .expect("graph");
+    w.stream_asset("tokenizer.json", Cursor::new(&asset_a))
+        .expect("asset a");
+    w.stream_asset("config.json", Cursor::new(&asset_b))
+        .expect("asset b");
+    w.finish().expect("finish");
+
+    let file = RsmfFile::open(&path).expect("open");
+    let summary = file.inspect();
+    assert_eq!(summary.tensor_count, 1);
+    assert_eq!(summary.graph_kinds.len(), 1);
+    assert_eq!(summary.asset_count, 2);
+
+    let weights = file.tensor_view("weights").expect("weights");
+    assert_eq!(weights.bytes(), tensor_bytes.as_slice());
+
+    let payloads = file.graph_payloads();
+    assert_eq!(payloads.len(), 1);
+    assert_eq!(payloads[0].kind, GraphKind::Onnx);
+    assert_eq!(payloads[0].bytes, graph_bytes.as_slice());
+
+    let tok = file.asset("tokenizer.json").expect("tok");
+    assert_eq!(tok.bytes, asset_a.as_slice());
+    let cfg = file.asset("config.json").expect("cfg");
+    assert_eq!(cfg.bytes, asset_b.as_slice());
+
+    file.full_verify().expect("full_verify");
+}
+
+#[test]
+fn graph_after_asset_is_rejected() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("bad_order.rsmf");
+
+    let bytes = f32_bytes(&[1.0, 2.0]);
+    let mut w = StreamingRsmfWriter::new(&path).expect("new");
+    w.stream_canonical_tensor("a", LogicalDtype::F32, vec![2], Cursor::new(&bytes))
+        .expect("tensor");
+    w.stream_asset("cfg.json", Cursor::new(b"{}".to_vec()))
+        .expect("asset");
+    let err = w
+        .stream_graph(GraphKind::Onnx, Cursor::new(b"fake".to_vec()))
+        .expect_err("graph must be rejected after asset");
+    assert!(matches!(err, rsmf_core::RsmfError::Structural(_)));
+}
+
+#[test]
+fn tensor_after_graph_is_rejected() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("bad_tensor.rsmf");
+
+    let bytes = f32_bytes(&[1.0, 2.0]);
+    let mut w = StreamingRsmfWriter::new(&path).expect("new");
+    w.stream_canonical_tensor("a", LogicalDtype::F32, vec![2], Cursor::new(&bytes))
+        .expect("tensor");
+    w.stream_graph(GraphKind::Onnx, Cursor::new(b"fake".to_vec()))
+        .expect("graph");
+    let err = w
+        .stream_canonical_tensor("b", LogicalDtype::F32, vec![2], Cursor::new(&bytes))
+        .expect_err("tensor must be rejected after graph");
+    assert!(matches!(err, rsmf_core::RsmfError::Structural(_)));
+}
+
+#[test]
+fn multiple_graphs_round_trip() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("multi_graph.rsmf");
+
+    let tensor_bytes = f32_bytes(&[1.0, 2.0]);
+    let g1 = b"ONNX-first".to_vec();
+    let g2 = b"ORT-second".to_vec();
+
+    let mut w = StreamingRsmfWriter::new(&path).expect("new");
+    w.stream_canonical_tensor("x", LogicalDtype::F32, vec![2], Cursor::new(&tensor_bytes))
+        .expect("tensor");
+    w.stream_graph(GraphKind::Onnx, Cursor::new(&g1))
+        .expect("g1");
+    w.stream_graph(GraphKind::Ort, Cursor::new(&g2))
+        .expect("g2");
+    w.finish().expect("finish");
+
+    let file = RsmfFile::open(&path).expect("open");
+    let payloads = file.graph_payloads();
+    assert_eq!(payloads.len(), 2);
+    assert_eq!(payloads[0].kind, GraphKind::Onnx);
+    assert_eq!(payloads[0].bytes, g1.as_slice());
+    assert_eq!(payloads[1].kind, GraphKind::Ort);
+    assert_eq!(payloads[1].bytes, g2.as_slice());
+    file.full_verify().expect("full_verify");
+}
+
+#[test]
+fn duplicate_asset_name_is_rejected() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("dup_asset.rsmf");
+
+    let bytes = f32_bytes(&[1.0]);
+    let mut w = StreamingRsmfWriter::new(&path).expect("new");
+    w.stream_canonical_tensor("a", LogicalDtype::F32, vec![1], Cursor::new(&bytes))
+        .expect("tensor");
+    w.stream_asset("dup.json", Cursor::new(b"first".to_vec()))
+        .expect("asset a");
+    let err = w
+        .stream_asset("dup.json", Cursor::new(b"second".to_vec()))
+        .expect_err("dup asset name");
+    assert!(matches!(err, rsmf_core::RsmfError::Structural(ref m) if m.contains("duplicate")));
 }
 
 #[test]
