@@ -252,7 +252,7 @@ impl StreamingRsmfWriter {
     /// Stream one canonical tensor's bytes into the output file.
     ///
     /// Must be called before any `stream_graph` or `stream_asset`. The
-    /// tensor is aligned to [`VARIANT_ALIGN`] inside the arena, so
+    /// tensor is aligned to 64 bytes inside the arena, so
     /// several zero-filled bytes may be written before the first byte
     /// from `reader`.
     pub fn stream_canonical_tensor<R: Read>(
