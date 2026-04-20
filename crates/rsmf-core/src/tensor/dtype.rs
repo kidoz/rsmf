@@ -131,24 +131,23 @@ pub enum StorageDtype {
     Fp8E4M3 = 104,
     /// 4-bit K-quant (Q4K). llama.cpp super-block-with-sub-blocks
     /// format — 4 bits per weight at ~4.5 bpw including scales.
-    /// Discriminant reserved; decoder not yet implemented.
+    /// 144 bytes per 256-element super-block.
     Q4K = 105,
     /// 5-bit linear block quant (Q5_0). llama.cpp legacy variant.
     /// Discriminant reserved; decoder not yet implemented.
     Q5_0 = 106,
     /// 5-bit K-quant (Q5K). ~5.5 bpw.
-    /// Discriminant reserved; decoder not yet implemented.
+    /// 176 bytes per 256-element super-block.
     Q5K = 107,
     /// 6-bit K-quant (Q6K). ~6.5 bpw, near-lossless.
-    /// Discriminant reserved; decoder not yet implemented.
+    /// 210 bytes per 256-element super-block.
     Q6K = 108,
     /// 2-bit K-quant (Q2K). ~2.6 bpw, extreme compression.
-    /// Discriminant reserved; decoder not yet implemented.
+    /// 84 bytes per 256-element super-block.
     Q2K = 109,
     /// 8-bit float (E5M2). The other standard OCP FP8 format; used
     /// alongside Fp8E4M3 on H100/Blackwell inference for the layers
     /// that need larger dynamic range.
-    /// Discriminant reserved; decoder not yet implemented.
     Fp8E5M2 = 110,
 }
 

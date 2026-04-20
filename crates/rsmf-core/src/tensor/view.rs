@@ -280,6 +280,10 @@ impl<'a> TensorView<'a> {
                         }
                         Ok(out)
                     }
+                    StorageDtype::Q4K => crate::tensor::dequantize::dequantize_q4_k(self.bytes),
+                    StorageDtype::Q5K => crate::tensor::dequantize::dequantize_q5_k(self.bytes),
+                    StorageDtype::Q6K => crate::tensor::dequantize::dequantize_q6_k(self.bytes),
+                    StorageDtype::Q2K => crate::tensor::dequantize::dequantize_q2_k(self.bytes),
                     _ => Err(RsmfError::unsupported(
                         "Storage dtype not supported".to_string(),
                     )),
