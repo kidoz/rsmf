@@ -61,6 +61,13 @@ pub struct Args {
     /// Re-compress the assets section in the output with zstd.
     #[arg(long)]
     pub compress_assets: bool,
+    /// Dedup identical canonical and packed byte spans in the output.
+    /// Two tensors whose bytes hash to the same BLAKE3-128 digest (e.g.
+    /// tied embeddings, repeated bias vectors) share a single arena span
+    /// instead of being written twice. Per-variant checksums and the
+    /// full-verify pass remain correct — the reader is dedup-oblivious.
+    #[arg(long)]
+    pub dedup: bool,
 }
 
 /// Execute `rsmf rewrite`.
@@ -98,6 +105,10 @@ pub fn run(args: Args) -> Result<(), CliError> {
         writer = writer
             .with_canonical_compression(3)
             .with_packed_compression(3);
+    }
+
+    if args.dedup {
+        writer = writer.with_dedup(true);
     }
 
     // Tensors: copy canonical, filter packed variants.

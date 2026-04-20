@@ -434,6 +434,78 @@ fn rewrite_keep_only_canonical_removes_all_packed() {
 }
 
 #[test]
+fn rewrite_dedup_shrinks_file_with_tied_tensors() {
+    // Safetensors fixture with two tensors that share the exact same byte
+    // payload (the tied-embeddings case). After `rsmf rewrite --dedup` the
+    // output should be smaller than a plain rewrite and still verify.
+    let dir = tempdir().unwrap();
+    let shared: Vec<u8> = (0..64u32).flat_map(|i| (i as f32).to_le_bytes()).collect();
+    let st_path = dir.path().join("tied.safetensors");
+    {
+        let mut tensors: HashMap<String, TensorView> = HashMap::new();
+        tensors.insert(
+            "embed".into(),
+            TensorView::new(Dtype::F32, vec![8, 8], &shared).unwrap(),
+        );
+        tensors.insert(
+            "lm_head".into(),
+            TensorView::new(Dtype::F32, vec![8, 8], &shared).unwrap(),
+        );
+        let bytes = safetensors::serialize(&tensors, &None).unwrap();
+        std::fs::write(&st_path, bytes).unwrap();
+    }
+
+    let src_rsmf = dir.path().join("tied.rsmf");
+    let plain_out = dir.path().join("plain.rsmf");
+    let dedup_out = dir.path().join("dedup.rsmf");
+
+    let out = Command::new(rsmf_bin())
+        .args(["pack", "--from-safetensors"])
+        .arg(&st_path)
+        .arg("--out")
+        .arg(&src_rsmf)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "pack failed: {out:?}");
+
+    // Rewrite without dedup.
+    let out = Command::new(rsmf_bin())
+        .args(["rewrite"])
+        .arg(&src_rsmf)
+        .arg(&plain_out)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "plain rewrite failed: {out:?}");
+
+    // Rewrite with dedup.
+    let out = Command::new(rsmf_bin())
+        .args(["rewrite"])
+        .arg(&src_rsmf)
+        .arg(&dedup_out)
+        .arg("--dedup")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "dedup rewrite failed: {out:?}");
+
+    let plain_len = std::fs::metadata(&plain_out).unwrap().len();
+    let dedup_len = std::fs::metadata(&dedup_out).unwrap().len();
+    assert!(
+        dedup_len < plain_len,
+        "dedup should shrink the file: dedup={dedup_len} plain={plain_len}"
+    );
+
+    // Dedup output must still pass full verification.
+    let out = Command::new(rsmf_bin())
+        .args(["verify", "--full"])
+        .arg(&dedup_out)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "verify failed: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("full checksum: ok"));
+}
+
+#[test]
 fn rewrite_rejects_same_input_and_output() {
     let dir = tempdir().unwrap();
     let st_path = build_fixture(dir.path());
