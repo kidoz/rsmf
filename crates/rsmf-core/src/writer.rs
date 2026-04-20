@@ -1036,11 +1036,7 @@ impl RsmfWriter {
         section_table.push(SectionDescriptor {
             kind: SectionKind::CanonicalArena,
             align: self.canonical_section_alignment,
-            flags: if self.canonical_compress.is_some() {
-                crate::section::SECTION_FLAG_COMPRESSED
-            } else {
-                0
-            },
+            flags: compressed_section_flags(self.canonical_compress.is_some()),
             offset: canonical_off,
             length: canonical_len,
             checksum: canonical_checksum,
@@ -1050,11 +1046,7 @@ impl RsmfWriter {
             section_table.push(SectionDescriptor {
                 kind: SectionKind::PackedArena,
                 align: self.packed_section_alignment,
-                flags: if self.packed_compress.is_some() {
-                    crate::section::SECTION_FLAG_COMPRESSED
-                } else {
-                    0
-                },
+                flags: compressed_section_flags(self.packed_compress.is_some()),
                 offset: off,
                 length: len,
                 checksum,
@@ -1064,11 +1056,7 @@ impl RsmfWriter {
             section_table.push(SectionDescriptor {
                 kind: SectionKind::Graph,
                 align: 8,
-                flags: if graph_compress.is_some() {
-                    crate::section::SECTION_FLAG_COMPRESSED
-                } else {
-                    0
-                },
+                flags: compressed_section_flags(graph_compress.is_some()),
                 offset: graph_off,
                 length: graph_len,
                 checksum: graph_checksum,
@@ -1078,11 +1066,7 @@ impl RsmfWriter {
             section_table.push(SectionDescriptor {
                 kind: SectionKind::Assets,
                 align: 8,
-                flags: if assets_compress.is_some() {
-                    crate::section::SECTION_FLAG_COMPRESSED
-                } else {
-                    0
-                },
+                flags: compressed_section_flags(assets_compress.is_some()),
                 offset: assets_off,
                 length: assets_len,
                 checksum: assets_checksum,
@@ -1206,6 +1190,20 @@ fn align_up_u64(value: u64, align: u64) -> u64 {
         return value;
     }
     (value + (align - 1)) & !(align - 1)
+}
+
+/// Section-table flags for an arena that may or may not be compressed.
+/// When the batch writer compresses, it also bit-shuffles, so both flags
+/// are set together; the reader honors `SECTION_FLAG_BIT_SHUFFLED` to
+/// decide whether to un-shuffle after zstd-decode. Keeping the two bits
+/// coupled here means compressed sections the batch writer emits are
+/// byte-identical to the pre-flag behaviour.
+fn compressed_section_flags(compressed: bool) -> u32 {
+    if compressed {
+        crate::section::SECTION_FLAG_COMPRESSED | crate::section::SECTION_FLAG_BIT_SHUFFLED
+    } else {
+        0
+    }
 }
 
 fn maybe_compress(bytes: &[u8], level: Option<i32>) -> Result<Vec<u8>> {

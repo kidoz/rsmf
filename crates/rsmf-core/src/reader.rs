@@ -590,7 +590,7 @@ impl RsmfFile {
         let _span =
             info_span!("decompress_section", kind = ?section.kind, size = section.length).entered();
 
-        let decompressed = decompress_zstd(raw)?;
+        let decompressed = decompress_zstd(raw, section.is_bit_shuffled())?;
         let _ = cache.set(decompressed);
         Ok(cache.get().expect("just set"))
     }
@@ -655,16 +655,27 @@ fn validate_section_table(sections: &[SectionDescriptor], file_len: u64) -> Resu
     Ok(())
 }
 
-fn decompress_zstd(compressed: &[u8]) -> Result<Vec<u8>> {
+fn decompress_zstd(compressed: &[u8], bit_shuffled: bool) -> Result<Vec<u8>> {
     #[cfg(feature = "compression")]
     {
         let decompressed = zstd::decode_all(std::io::Cursor::new(compressed))
             .map_err(|e| RsmfError::structural(format!("zstd decompression failed: {e}")))?;
-        Ok(crate::bit_shuffle::unshuffle(&decompressed, 4))
+        // Bit-shuffling was originally implicit on every compressed section
+        // (always applied at element size 4). The `SECTION_FLAG_BIT_SHUFFLED`
+        // flag now records it explicitly. The batch writer sets the flag
+        // whenever it compresses (it always bit-shuffles), so existing
+        // test fixtures and migration scenarios round-trip unchanged. The
+        // streaming writer compresses without bit-shuffling and leaves the
+        // flag clear so the reader skips the un-shuffle step here.
+        if bit_shuffled {
+            Ok(crate::bit_shuffle::unshuffle(&decompressed, 4))
+        } else {
+            Ok(decompressed)
+        }
     }
     #[cfg(not(feature = "compression"))]
     {
-        let _ = compressed;
+        let _ = (compressed, bit_shuffled);
         Err(RsmfError::unsupported(
             "compression not enabled".to_string(),
         ))
