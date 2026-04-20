@@ -205,8 +205,7 @@ pub fn dequantize_q2_k(bytes: &[u8]) -> Result<Vec<f32>> {
                 let dl2 = d * (sc & 0xF) as f32;
                 let ml2 = min * (sc >> 4) as f32;
                 for l in 0..16 {
-                    y[j * 32 + 16 + l] =
-                        dl2 * ((q[q_off + l + 16] >> shift) & 3) as i8 as f32 - ml2;
+                    y[j * 32 + 16 + l] = dl2 * ((q[q_off + l + 16] >> shift) & 3) as i8 as f32 - ml2;
                 }
 
                 shift += 2;
@@ -214,6 +213,43 @@ pub fn dequantize_q2_k(bytes: &[u8]) -> Result<Vec<f32>> {
             out.extend_from_slice(&y);
             q_off += 32;
         }
+    }
+    Ok(out)
+}
+
+/// Dequantize Q5_0 block to f32.
+pub fn dequantize_q5_0(bytes: &[u8]) -> Result<Vec<f32>> {
+    const QK5_0: usize = 32;
+    const BLOCK_BYTES: usize = 22;
+    if bytes.len() % BLOCK_BYTES != 0 {
+        return Err(RsmfError::structural(format!(
+            "Q5_0 length {} is not a multiple of {}",
+            bytes.len(),
+            BLOCK_BYTES
+        )));
+    }
+    let nb = bytes.len() / BLOCK_BYTES;
+    let mut out = Vec::with_capacity(nb * QK5_0);
+
+    for b in 0..nb {
+        let off = b * BLOCK_BYTES;
+        let d = f16::from_le_bytes([bytes[off], bytes[off + 1]]).to_f32();
+        let qh_bytes: [u8; 4] = bytes[off + 2..off + 6].try_into().unwrap();
+        let qh = u32::from_le_bytes(qh_bytes);
+        let qs = &bytes[off + 6..off + 22];
+
+        let mut y = [0.0f32; 32];
+        for j in 0..16 {
+            let xh_0 = (((qh >> j) << 4) & 0x10) as u8;
+            let xh_1 = ((qh >> (j + 12)) & 0x10) as u8;
+
+            let x0 = ((qs[j] & 0x0F) | xh_0) as i8 as f32 - 16.0;
+            let x1 = ((qs[j] >> 4) | xh_1) as i8 as f32 - 16.0;
+
+            y[j] = x0 * d;
+            y[j + 16] = x1 * d;
+        }
+        out.extend_from_slice(&y);
     }
     Ok(out)
 }

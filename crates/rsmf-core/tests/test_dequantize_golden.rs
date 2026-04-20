@@ -1,5 +1,5 @@
 use rsmf_core::tensor::dequantize::{
-    dequantize_q2_k, dequantize_q4_k, dequantize_q5_k, dequantize_q6_k,
+    dequantize_q2_k, dequantize_q4_k, dequantize_q5_0, dequantize_q5_k, dequantize_q6_k,
 };
 
 fn assert_f32_equality(actual: &[f32], expected: &[f32]) {
@@ -81,5 +81,19 @@ fn test_q2_k_golden() {
         .collect();
 
     let actual_f32 = dequantize_q2_k(raw).unwrap();
+    assert_f32_equality(&actual_f32, &expected_f32);
+}
+
+#[test]
+fn test_q5_0_golden() {
+    let raw = include_bytes!("../../../tmp/golden/golden_q5_0.raw");
+    let f32_bytes = include_bytes!("../../../tmp/golden/golden_q5_0.f32");
+
+    let expected_f32: Vec<f32> = f32_bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+
+    let actual_f32 = dequantize_q5_0(raw).unwrap();
     assert_f32_equality(&actual_f32, &expected_f32);
 }

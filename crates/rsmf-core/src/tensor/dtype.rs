@@ -107,12 +107,6 @@ impl LogicalDtype {
 /// increasing indices. Old readers reject unknown discriminants with a
 /// structural error (non-silent), so new entries are format-compatible
 /// per the v1 evolution rules.
-///
-/// Not all reserved discriminants have a full decoder yet — unimplemented
-/// ones surface as `RsmfError::Unsupported` from
-/// [`crate::TensorView::decode_f32`]. Writers that emit them are
-/// documenting the format's forward direction; decoders can land later
-/// without a format-level change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u16)]
 pub enum StorageDtype {
@@ -134,7 +128,6 @@ pub enum StorageDtype {
     /// 144 bytes per 256-element super-block.
     Q4K = 105,
     /// 5-bit linear block quant (Q5_0). llama.cpp legacy variant.
-    /// Discriminant reserved; decoder not yet implemented.
     Q5_0 = 106,
     /// 5-bit K-quant (Q5K). ~5.5 bpw.
     /// 176 bytes per 256-element super-block.
