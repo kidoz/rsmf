@@ -494,9 +494,9 @@ pub fn convert_f32_to_nf4_bytes(f32_bytes: &[u8]) -> Vec<u8> {
                     .iter()
                     .enumerate()
                     .min_by(|(_, a), (_, b)| {
-                        (val - *a).abs().partial_cmp(&(val - *b).abs()).unwrap()
+                        (val - *a).abs().partial_cmp(&(val - *b).abs()).unwrap_or(std::cmp::Ordering::Equal)
                     })
-                    .unwrap()
+                    .unwrap_or((7, &0.0))
                     .0 as u8
             } else {
                 7
@@ -513,9 +513,9 @@ pub fn convert_f32_to_nf4_bytes(f32_bytes: &[u8]) -> Vec<u8> {
                     .iter()
                     .enumerate()
                     .min_by(|(_, a), (_, b)| {
-                        (val - *a).abs().partial_cmp(&(val - *b).abs()).unwrap()
+                        (val - *a).abs().partial_cmp(&(val - *b).abs()).unwrap_or(std::cmp::Ordering::Equal)
                     })
-                    .unwrap()
+                    .unwrap_or((7, &0.0))
                     .0 as u8
             } else {
                 7
