@@ -446,6 +446,7 @@ enum DecodedBuf {
     U32(Vec<u32>),
     U16(Vec<u16>),
     U8(Vec<u8>),
+    Bool(Vec<bool>),
 }
 
 /// Zero-copy-eligible dtype metadata.
@@ -539,9 +540,10 @@ fn decode_view_to_pyarray<'py>(
         LogicalDtype::U32 => view.to_vec::<u32>().map(DecodedBuf::U32),
         LogicalDtype::U16 => view.to_vec::<u16>().map(DecodedBuf::U16),
         LogicalDtype::U8 => view.to_vec::<u8>().map(DecodedBuf::U8),
-        other => Err(rsmf_core::RsmfError::unsupported(format!(
-            "dtype {other:?} not yet supported by rsmf-python"
-        ))),
+        LogicalDtype::Bool => view
+            .to_vec::<u8>()
+            .map(|v| v.into_iter().map(|b| b != 0).collect::<Vec<bool>>())
+            .map(DecodedBuf::Bool),
     });
 
     let decoded = buf.map_err(map_core_error)?;
@@ -556,6 +558,7 @@ fn decode_view_to_pyarray<'py>(
         DecodedBuf::U32(v) => Ok(v.into_pyarray_bound(py).reshape(shape)?.into_any()),
         DecodedBuf::U16(v) => Ok(v.into_pyarray_bound(py).reshape(shape)?.into_any()),
         DecodedBuf::U8(v) => Ok(v.into_pyarray_bound(py).reshape(shape)?.into_any()),
+        DecodedBuf::Bool(v) => Ok(v.into_pyarray_bound(py).reshape(shape)?.into_any()),
     }
 }
 

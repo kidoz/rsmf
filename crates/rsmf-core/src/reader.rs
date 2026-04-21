@@ -710,7 +710,11 @@ pub(crate) fn validate_manifest(
             k if k == SectionKind::CanonicalArena.to_raw() as u8 => sections
                 .iter()
                 .position(|s| s.kind == SectionKind::CanonicalArena)
-                .unwrap(),
+                .ok_or_else(|| {
+                    RsmfError::structural(format!(
+                        "variant[{i}] references missing canonical arena"
+                    ))
+                })?,
             k if k == SectionKind::PackedArena.to_raw() as u8 => {
                 let idx = v.section_index as usize;
                 *packed_section_indices.get(idx).ok_or_else(|| {
