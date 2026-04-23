@@ -82,6 +82,10 @@ impl<'a> TensorView<'a> {
     /// Decode the variant's bytes into `Vec<f32>`, handling encoding
     /// transparently. Optimized with SIMD where possible.
     pub fn decode_f32(&self) -> Result<Vec<f32>> {
+        // OPTIMIZE: Falling back to raw core::arch::x86_64 (AVX-512) or ARM NEON/SVE 
+        // intrinsics for heavy dequantization loops (e.g., INT8 to F32) can yield 
+        // significant speedups over generic f32x8 wide vectors. This aligns with 
+        // the CpuAvx512 and CpuNeon tags already present in the Manifest.
         #[cfg(feature = "tracing")]
         let _span = info_span!(
             "TensorView::decode_f32",
