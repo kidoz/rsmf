@@ -94,8 +94,15 @@ impl<'a> TensorView<'a> {
         match self.encoding {
             EncodingKind::Raw => {
                 if self.storage_dtype == StorageDtype::Fp8E4M3 {
+                    // OCP FP8 E4M3: 1 sign, 4 exp, 3 mantissa, bias 7.
+                    // No infinity. NaN is the S.1111.111 sentinel (0x7F / 0xFF).
+                    // Max finite = S.1111.110 = ±448.
                     let mut out = Vec::with_capacity(self.bytes.len());
                     for &b in self.bytes {
+                        if b & 0x7F == 0x7F {
+                            out.push(f32::NAN);
+                            continue;
+                        }
                         let sign = if b & 0x80 != 0 { -1.0 } else { 1.0 };
                         let exp = ((b >> 3) & 0x0F) as i32;
                         let mant = (b & 0x07) as f32;
