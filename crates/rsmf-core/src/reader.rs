@@ -519,6 +519,46 @@ impl RsmfFile {
         })
     }
 
+    /// Run the full checksum-verification pass using a specific thread pool.
+    ///
+    /// This allows controlling the parallelism used for hashing to prevent
+    /// monopolizing the CPU when embedded in a larger application.
+    #[cfg(feature = "parallel")]
+    pub fn full_verify_with_pool(&self, pool: &rayon::ThreadPool) -> Result<()> {
+        #[cfg(feature = "tracing")]
+        let _span = info_span!("full_verify_with_pool").entered();
+
+        pool.install(|| {
+            use rayon::prelude::*;
+
+            let section_err = self.sections.par_iter().enumerate().find_map_any(|(i, s)| {
+                let bytes = &self.master_mmap[s.offset as usize..(s.offset + s.length) as usize];
+                if digest_128(bytes) != s.checksum {
+                    Some(RsmfError::ChecksumMismatch {
+                        kind: format!("section[{i}] {}", s.kind.name()),
+                    })
+                } else {
+                    None
+                }
+            });
+            if let Some(e) = section_err {
+                return Err(e);
+            }
+
+            self.manifest.variants.par_iter().try_for_each(|v| {
+                let bytes = self.variant_bytes(v)?;
+                if digest_128(bytes) != v.checksum {
+                    return Err(RsmfError::ChecksumMismatch {
+                        kind: format!("variant target={}", v.target.name()),
+                    });
+                }
+                Ok(())
+            })
+        })?;
+
+        self.verify_graphs_and_assets()
+    }
+
     /// Run the full checksum-verification pass.
     ///
     /// With the `parallel` cargo feature enabled the section and variant
@@ -588,6 +628,10 @@ impl RsmfFile {
 
         // Graphs and assets stay sequential: typically <5 items per
         // file, so the rayon dispatch overhead would dominate.
+        self.verify_graphs_and_assets()
+    }
+
+    fn verify_graphs_and_assets(&self) -> Result<()> {
         let payloads = self.graph_payloads();
         for (i, g) in self.manifest.graphs.iter().enumerate() {
             if let Some(payload) = payloads.get(i) {
