@@ -18,7 +18,7 @@ pub mod device;
 pub mod upload;
 
 pub use device::{DeviceHandle, detect_capabilities, request_device};
-pub use upload::{UploadError, upload_canonical_tensor};
+pub use upload::{UploadError, upload_canonical_tensor_async};
 
 /// Common backend error type.
 #[derive(Debug, thiserror::Error)]
