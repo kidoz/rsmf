@@ -494,7 +494,10 @@ pub fn convert_f32_to_nf4_bytes(f32_bytes: &[u8]) -> Vec<u8> {
                     .iter()
                     .enumerate()
                     .min_by(|(_, a), (_, b)| {
-                        (val - *a).abs().partial_cmp(&(val - *b).abs()).unwrap_or(std::cmp::Ordering::Equal)
+                        (val - *a)
+                            .abs()
+                            .partial_cmp(&(val - *b).abs())
+                            .unwrap_or(std::cmp::Ordering::Equal)
                     })
                     .unwrap_or((7, &0.0))
                     .0 as u8
@@ -513,7 +516,10 @@ pub fn convert_f32_to_nf4_bytes(f32_bytes: &[u8]) -> Vec<u8> {
                     .iter()
                     .enumerate()
                     .min_by(|(_, a), (_, b)| {
-                        (val - *a).abs().partial_cmp(&(val - *b).abs()).unwrap_or(std::cmp::Ordering::Equal)
+                        (val - *a)
+                            .abs()
+                            .partial_cmp(&(val - *b).abs())
+                            .unwrap_or(std::cmp::Ordering::Equal)
                     })
                     .unwrap_or((7, &0.0))
                     .0 as u8
@@ -991,9 +997,13 @@ impl RsmfWriter {
                     None
                 };
                 let offset = append_variant_bytes(arena, dedup, &p.bytes, align, checksum);
-                let storage_dtype = p
-                    .storage_dtype
-                    .expect("packed variant must set storage_dtype");
+                let storage_dtype = p.storage_dtype.ok_or_else(|| {
+                    RsmfError::structural(format!(
+                        "packed variant for tensor {:?} target {:?} must set storage_dtype",
+                        t.name,
+                        p.target.name()
+                    ))
+                })?;
                 per_tensor.push(PackedLayout {
                     offset,
                     length,
