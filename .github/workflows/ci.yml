@@ -39,15 +39,48 @@ jobs:
       - run: cargo fmt --all -- --check
 
   clippy:
-    name: Clippy
+    name: Clippy (${{ matrix.label }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Default workspace build — the gate users hit when they clone
+          # the repo. Covers rsmf-core (safetensors+gguf+npy),
+          # rsmf-cli, and rsmf-bench.
+          - label: default
+            flags: "--workspace --all-targets"
+          # Minimal rsmf-core: no converters, no compression, no
+          # parallel verify, no tracing. Catches feature-gated code
+          # that only compiles when a feature is on.
+          - label: core-no-default-features
+            flags: "-p rsmf-core --all-targets --no-default-features"
+          # Every optional rsmf-core feature pulled in at once, so the
+          # cross-product of cfg gates is linted.
+          - label: core-all-features
+            flags: "-p rsmf-core --all-targets --all-features"
+          # Individual optional features — catches interactions the
+          # "all-features" build hides (e.g. a cfg that is exclusive of
+          # another).
+          - label: core-compression
+            flags: "-p rsmf-core --all-targets --no-default-features --features compression"
+          - label: core-parallel
+            flags: "-p rsmf-core --all-targets --no-default-features --features parallel"
+          - label: core-tracing
+            flags: "-p rsmf-core --all-targets --no-default-features --features tracing"
+          # GPU / runtime crates are excluded from default-members; lint
+          # them explicitly so new warnings can't slip in.
+          - label: wgpu
+            flags: "-p rsmf-wgpu --all-targets"
+          - label: bench-wgpu
+            flags: "-p rsmf-bench --all-targets --features wgpu"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo clippy ${{ matrix.flags }} -- -D warnings
 
   python-tests:
     name: Python bindings (pytest)

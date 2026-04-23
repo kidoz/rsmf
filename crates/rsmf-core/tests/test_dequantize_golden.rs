@@ -10,11 +10,7 @@ fn assert_f32_equality(actual: &[f32], expected: &[f32]) {
         let a_bits = a.to_bits();
         let e_bits = e.to_bits();
 
-        let diff = if a_bits > e_bits {
-            a_bits - e_bits
-        } else {
-            e_bits - a_bits
-        };
+        let diff = a_bits.abs_diff(e_bits);
 
         if diff > 1 {
             if a.is_nan() && e.is_nan() {

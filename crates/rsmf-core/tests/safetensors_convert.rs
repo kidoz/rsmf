@@ -1,6 +1,8 @@
 //! Test requirement #9: safetensors → RSMF conversion preserves names,
 //! shapes, dtypes, and bytes.
 
+#![cfg(feature = "safetensors")]
+
 use std::collections::HashMap;
 use std::io::Write;
 
