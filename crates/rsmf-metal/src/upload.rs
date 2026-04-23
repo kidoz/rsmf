@@ -22,13 +22,23 @@ pub fn upload_canonical_tensor(handle: &DeviceHandle, bytes: &[u8]) -> Result<Bu
         return Err(UploadError::Empty);
     }
 
+    let has_unified = handle.device.has_unified_memory();
+    let options = if has_unified {
+        MTLResourceOptions::StorageModeShared
+    } else {
+        MTLResourceOptions::StorageModeManaged
+    };
+
     // Create a new buffer and initialize it with the slice data.
-    // StorageModeShared is generally appropriate for unified memory architectures.
     let buffer = handle.device.new_buffer_with_data(
         bytes.as_ptr() as *const _,
         bytes.len() as u64,
-        MTLResourceOptions::StorageModeShared,
+        options,
     );
+
+    if !has_unified {
+        buffer.did_modify_range(metal::NSRange::new(0, bytes.len() as u64));
+    }
 
     Ok(buffer)
 }
