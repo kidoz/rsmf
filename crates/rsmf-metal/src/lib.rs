@@ -1,6 +1,13 @@
 //! # rsmf-metal
 //!
-//! Metal materialization path for RSMF tensors.
+//! Synchronous host→GPU upload helper for RSMF tensors on Apple Metal.
+//!
+//! This crate allocates a single `MTLBuffer` with `StorageModeShared`
+//! and copies canonical tensor bytes into it. It is **not** a zero-copy
+//! path, does not chunk the transfer, and does not materialise
+//! Metal-specific packed layouts ([`rsmf_core::TargetTag::Metal`]) —
+//! those remain future work. Callers that need chunked, staging-buffer
+//! uploads on portable GPU hardware should use `rsmf-wgpu` instead.
 
 #![warn(missing_docs)]
 #![warn(clippy::all)]

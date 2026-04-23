@@ -6,17 +6,23 @@
 rsmf-core  (library)           ← format, reader, writer, validator, selection
    │
    ├── rsmf-cli   (bin)         ← `rsmf` command-line interface
-   ├── rsmf-wgpu  (library)     ← portable WGPU upload path (excluded from default-members)
-   ├── rsmf-cuda  (library)     ← native CUDA zero-copy path (excluded from default-members)
-   ├── rsmf-metal (library)     ← native Metal zero-copy path (excluded from default-members)
+   ├── rsmf-wgpu  (library)     ← portable WGPU chunked-staging upload path (excluded from default-members)
+   ├── rsmf-cuda  (library)     ← synchronous CUDA host→device upload helper (excluded from default-members)
+   ├── rsmf-metal (library)     ← synchronous Metal host→GPU upload helper (excluded from default-members)
    ├── rsmf-runtime (library)   ← high-level inference engine (ONNX Runtime / ort)
    ├── rsmf-python (library)    ← PyO3 bindings for Python / NumPy
    └── rsmf-bench (library+bench) ← criterion benchmarks
 ```
 
-- `rsmf-core` has zero GPU dependencies. It handles the core format, zero-copy mmap reader, writer, and quantization logic.
+- `rsmf-core` has zero GPU dependencies. It handles the core format, mmap reader, writer, and quantization logic.
 - `rsmf-cli` provides the `rsmf` binary with `pack`, `import` (from HF), `inspect`, and `verify` commands.
-- `rsmf-wgpu`, `rsmf-cuda`, and `rsmf-metal` provide materialization paths for different GPU backends. They are excluded from `default-members` for fast, dependency-free core builds.
+- `rsmf-wgpu` performs chunked, alignment-aware staging uploads through
+  `wgpu::Queue::write_buffer`. `rsmf-cuda` and `rsmf-metal` are deliberately
+  thin: they wrap a single blocking host→device byte copy
+  (`cudarc::htod_sync_copy`, `MTLBuffer::new_buffer_with_data`) and do **not**
+  perform zero-copy, streaming, or backend-specific layout translation. All
+  three are excluded from `default-members` for fast, dependency-free core
+  builds. Real vendor zero-copy paths remain future work.
 - `rsmf-runtime` integrates the `ort` v2 crate to run inference on embedded graphs using memory-mapped tensors.
 - `rsmf-python` enables high-performance access to RSMF models from Python. See the "Python surface" section below.
 
