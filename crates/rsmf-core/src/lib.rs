@@ -26,6 +26,10 @@ pub mod tensor;
 pub mod validator;
 pub mod writer;
 
+/// Asynchronous streaming reads
+#[cfg(feature = "async_io")]
+pub mod async_reader;
+
 #[cfg(feature = "safetensors")]
 pub mod safetensors_convert;
 
