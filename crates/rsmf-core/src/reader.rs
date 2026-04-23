@@ -388,6 +388,17 @@ impl RsmfFile {
     }
 
     /// Return the raw bytes of any variant.
+    ///
+    /// When the owning tensor's `shard_id` is non-zero, the bytes are
+    /// resolved out of the attached shard file (see [`Self::with_shard`]).
+    /// Shards are raw **arena byte buffers**: the variant lives at
+    /// `v.section_relative_offset..v.section_relative_offset + v.length`,
+    /// not at the absolute section offset recorded in the master. The
+    /// master's arena section still carries a descriptor (so the
+    /// manifest round-trips and structural validation passes), but the
+    /// bytes at that position are placeholder and will not be consulted
+    /// once a shard is attached. Compressed shard arenas are not
+    /// supported in v1 — the shard file must hold raw bytes.
     pub fn variant_bytes(&self, v: &VariantDescriptor) -> Result<&[u8]> {
         let section = self.variant_section(v)?;
 
@@ -400,14 +411,35 @@ impl RsmfFile {
         let t_idx = self.variant_to_tensor[v_idx];
         let shard_id = self.manifest.tensors[t_idx].shard_id;
 
-        let mmap = if shard_id == 0 {
-            &self.master_mmap
-        } else {
-            self.shard_mmaps
+        if shard_id != 0 {
+            // Shard path. The shard file is a raw arena buffer — we index
+            // directly by `v.section_relative_offset` without adding the
+            // master's section offset, which is meaningless here.
+            let shard = self
+                .shard_mmaps
                 .get(&shard_id)
-                .ok_or_else(|| RsmfError::unsupported(format!("shard {shard_id} not loaded")))?
-        };
+                .ok_or_else(|| RsmfError::unsupported(format!("shard {shard_id} not loaded")))?;
+            if section.is_compressed() {
+                return Err(RsmfError::unsupported(format!(
+                    "shard {shard_id} references a compressed arena section; \
+                     compressed shard arenas are reserved for a future format version"
+                )));
+            }
+            let start = v.section_relative_offset;
+            let end = start.checked_add(v.length).ok_or_else(|| {
+                RsmfError::structural("variant length overflow in shard".to_string())
+            })?;
+            if end > shard.len() as u64 {
+                return Err(RsmfError::structural(format!(
+                    "variant extends past shard {shard_id}: needs {end} bytes, shard has {}",
+                    shard.len()
+                )));
+            }
+            return Ok(&shard[start as usize..end as usize]);
+        }
 
+        // Master path.
+        let mmap = &self.master_mmap;
         if section.is_compressed() {
             let cache = if section.kind == SectionKind::CanonicalArena {
                 &self.decompressed_canonical_arena
