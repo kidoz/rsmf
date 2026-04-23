@@ -31,9 +31,9 @@ Format version **1.0**. Full specification in [`docs/SPEC.md`](docs/SPEC.md); ar
 | `rsmf-core` | library — format, reader, writer, validator, selection | yes |
 | `rsmf-cli` | `rsmf` command-line binary | yes |
 | `rsmf-bench` | criterion benchmarks | yes |
-| `rsmf-wgpu` | portable WGPU upload path | no |
-| `rsmf-cuda` | native CUDA zero-copy path | no |
-| `rsmf-metal` | native Metal zero-copy path | no |
+| `rsmf-wgpu` | portable WGPU chunked-staging upload path | no |
+| `rsmf-cuda` | synchronous CUDA host→device upload helper | no |
+| `rsmf-metal` | synchronous Metal host→GPU upload helper | no |
 | `rsmf-runtime` | ONNX Runtime inference engine | no |
 | `rsmf-python` | PyO3 bindings | no |
 
@@ -62,6 +62,16 @@ rsmf pack --from-gguf        model.gguf        --out model.rsmf
 rsmf pack --from-npy         embeddings.npy    --out embeddings.rsmf
 rsmf pack --from-torch       checkpoint.pt     --out model.rsmf
 ```
+
+`--from-gguf` imports GGUF tensors byte-for-byte: raw dtypes
+(`F32/F16/BF16/F64/I8/I16/I32/I64`) are stored with matching
+`LogicalDtype`, and the standard quantised formats
+(`Q4_0`, `Q5_0`, `Q8_0`, `Q2_K`, `Q3_K`, `Q4_K`, `Q5_K`, `Q6_K`) are
+stored as canonical `BlockQuantized` variants with their original
+bytes and dequantised to `float32` on demand via `get_tensor()`.
+The legacy (`Q4_1`, `Q5_1`, `Q8_1`) and IQ* quantisations have no RSMF
+decoder yet and fail pack with a typed error rather than being
+silently dropped.
 
 `--from-torch` shells out to `python3` with `torch` and `safetensors`
 installed; it uses `torch.load(..., weights_only=True)` so arbitrary-code
