@@ -205,7 +205,8 @@ pub fn dequantize_q2_k(bytes: &[u8]) -> Result<Vec<f32>> {
                 let dl2 = d * (sc & 0xF) as f32;
                 let ml2 = min * (sc >> 4) as f32;
                 for l in 0..16 {
-                    y[j * 32 + 16 + l] = dl2 * ((q[q_off + l + 16] >> shift) & 3) as i8 as f32 - ml2;
+                    y[j * 32 + 16 + l] =
+                        dl2 * ((q[q_off + l + 16] >> shift) & 3) as i8 as f32 - ml2;
                 }
 
                 shift += 2;
