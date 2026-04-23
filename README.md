@@ -41,7 +41,18 @@ GPU / runtime / Python crates are excluded from `default-members` so `cargo buil
 
 ## Quick start (Rust)
 
-Build and test the default workspace (no GPU, no Python):
+Build and test the default members (no GPU, no runtime, no Python). These
+are the three crates listed under `default-members` in the root
+`Cargo.toml` — `rsmf-core`, `rsmf-cli`, and `rsmf-bench`:
+
+```sh
+cargo build
+cargo test
+```
+
+To exercise the full workspace including the GPU / runtime / Python
+crates (each of which pulls in its own SDK — `wgpu`, `cudarc`, `metal`,
+`ort`, `pyo3`), run:
 
 ```sh
 cargo build --workspace
