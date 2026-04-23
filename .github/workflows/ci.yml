@@ -117,3 +117,52 @@ jobs:
         env:
           RSMF_BIN: ${{ github.workspace }}/target/release/rsmf
         run: pytest crates/rsmf-python/tests/ -v
+
+  cargo-package:
+    name: cargo package (release dry run)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # `cargo package` refuses to run when the working tree carries
+      # untracked / uncommitted files the crate would ship. Running it in
+      # CI on every PR catches the "forgot to commit a new test file"
+      # class of blockers the local checklist missed in the past.
+      # rsmf-core is the only publishable crate today; rsmf-cli's path+
+      # version dep on rsmf-core cannot be verified until rsmf-core is
+      # live on crates.io, so we only gate the library crate here.
+      - name: Verify rsmf-core packages cleanly for crates.io
+        run: cargo package -p rsmf-core --no-verify
+
+  wheel-build:
+    name: maturin wheel (PyPI dry run)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install maturin
+        run: |
+          python -m pip install --upgrade pip
+          pip install 'maturin>=1.5,<2.0'
+      - name: Build release wheel
+        working-directory: crates/rsmf-python
+        run: maturin build --release
+      # Fail the job if the wheel leaked any bytecode cache or stray
+      # pre-built extensions from the source tree. The pyproject exclude
+      # rules enforce this, but the CI guard keeps the rule honest.
+      - name: Inspect wheel contents for forbidden artefacts
+        run: |
+          set -euo pipefail
+          whl=$(ls target/wheels/*.whl | head -n1)
+          echo "Inspecting $whl"
+          contents=$(unzip -l "$whl")
+          echo "$contents"
+          if echo "$contents" | grep -E '(__pycache__|\.pyc$|\.pyo$)'; then
+            echo "::error::wheel contains forbidden bytecode / cache artefacts"
+            exit 1
+          fi
