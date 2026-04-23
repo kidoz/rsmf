@@ -66,3 +66,14 @@ features = ["pyo3/extension-module"]
 # Wheel is abi3-py38 under the hood (pyo3 feature pin in workspace
 # Cargo.toml), so a single wheel works on every Python >= 3.11 declared
 # above. Lowering the minimum advertised version is a later decision.
+# Keep editor / test byte-code caches and any stray pre-built extensions
+# out of the wheel: maturin sweeps `python-source` verbatim by default,
+# so leftover `__pycache__` from `maturin develop` / `pytest` runs ends
+# up shipped unless explicitly filtered out here.
+exclude = [
+    { path = "python/**/__pycache__", format = ["sdist", "wheel"] },
+    { path = "python/**/*.py[cod]", format = ["sdist", "wheel"] },
+    { path = "python/**/*.abi3.so", format = ["sdist", "wheel"] },
+    { path = "python/**/*.so", format = ["sdist", "wheel"] },
+    { path = "python/**/*.pyd", format = ["sdist", "wheel"] },
+]
