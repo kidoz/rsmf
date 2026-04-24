@@ -42,7 +42,7 @@ impl<R: AsyncRead + AsyncSeek + Unpin> AsyncRsmfFile<R> {
             .section_tbl_count
             .checked_mul(SECTION_DESC_LEN)
             .ok_or_else(|| RsmfError::structural("section table length overflow"))?;
-        
+
         let mut table_bytes = vec![0u8; table_len as usize];
         reader
             .seek(std::io::SeekFrom::Start(preamble.section_tbl_off))

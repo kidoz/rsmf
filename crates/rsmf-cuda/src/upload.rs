@@ -29,7 +29,7 @@ pub fn upload_canonical_tensor_async(
     if bytes.is_empty() {
         return Err(UploadError::Empty);
     }
-    
+
     // Copy to an owned Vec so it can be safely referenced during async transfer
     let host_vec = bytes.to_vec();
 
