@@ -10,8 +10,10 @@ description = "Metal upload path for RSMF — direct zero-copy GPU materializati
 
 [dependencies]
 rsmf-core.workspace = true
-metal.workspace = true
-objc.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 bytemuck.workspace = true
+
+[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
+metal.workspace = true
+objc.workspace = true
