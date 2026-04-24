@@ -82,6 +82,19 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy ${{ matrix.flags }} -- -D warnings
 
+  metal-macos:
+    name: Metal backend (macOS)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check -p rsmf-metal
+      - run: cargo test -p rsmf-metal
+      - run: cargo clippy -p rsmf-metal --all-targets -- -D warnings
+
   python-tests:
     name: Python bindings (pytest)
     runs-on: ubuntu-latest
