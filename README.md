@@ -155,8 +155,9 @@ rsmf rewrite dev.rsmf small.rsmf \
 ```
 
 `rewrite` reads the source via the batch reader and writes through the
-batch writer, so every byte passes through RAM once. A streaming-rewrite
-mode that reuses `StreamingRsmfWriter` is a follow-up.
+batch writer by default, so every byte passes through RAM once.
+Use `--stream` to copy tensors, graphs, and assets directly to disk
+without buffering them in RAM (implies `--keep-only-canonical`).
 
 ### Bundle weights, graph, and assets into one file
 

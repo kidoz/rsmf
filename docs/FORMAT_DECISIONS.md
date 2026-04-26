@@ -69,18 +69,22 @@ tensor/graph/asset model.
 
 - **Currently shipped:** safetensors (`--from-safetensors`, used also by
   `rsmf import` on HuggingFace Hub), GGUF (`--from-gguf`), NumPy
-  (`--from-npy`), PyTorch checkpoints (`--from-torch`).
+  (`--from-npy`), PyTorch checkpoints (`--from-torch`), and ONNX
+  (`--from-onnx`).
 - **PyTorch `.pt` / `.pth` / `.bin`** uses a `python3` subprocess that
   calls `torch.load(..., weights_only=True)` and
   `safetensors.torch.save_file` into a temp file, then delegates to the
   existing safetensors pipeline. The safe loader blocks arbitrary code
   execution; `RSMF_ALLOW_UNSAFE_PICKLE=1` opts back in for trusted files
   the safe loader refuses. Pure-Rust pickle parsing is a follow-up.
+- **ONNX `.onnx`** uses a `python3` subprocess with the `onnx` package to extract
+  initializers (tensors) from the graph and save them to a safetensors
+  temp file, which is then ingested.
 - **HuggingFace imports** auto-bundle `config.json`, `generation_config.json`,
   `tokenizer.json`, `tokenizer_config.json`, `special_tokens_map.json`,
   `vocab.json`, `merges.txt`, `added_tokens.json`, `preprocessor_config.json`,
   and `chat_template.json` as rsmf assets when the remote repo carries them.
-- **Next up**, in order: ONNX with initializer extraction, `--from-tflite`,
+- **Next up**, in order: `--from-tflite`,
   `--from-h5`, and export paths (`rsmf export safetensors` / `gguf` / `onnx`).
   Tier-C formats (TensorRT engines, Qualcomm SNPE, NCNN, MNN, GGML legacy)
   are explicitly out of scope because their bytes are hardware- or
