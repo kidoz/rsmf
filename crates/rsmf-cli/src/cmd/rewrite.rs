@@ -68,6 +68,12 @@ pub struct Args {
     /// full-verify pass remain correct — the reader is dedup-oblivious.
     #[arg(long)]
     pub dedup: bool,
+    /// Stream tensor, graph, and asset bodies directly from the source file
+    /// to the destination without buffering them in RAM. Because the
+    /// streaming writer does not yet support packed variants, this implies
+    /// `--keep-only-canonical`.
+    #[arg(long)]
+    pub stream: bool,
 }
 
 /// Execute `rsmf rewrite`.
@@ -76,6 +82,10 @@ pub fn run(args: Args) -> Result<(), CliError> {
         return Err(CliError::user(anyhow!(
             "rewrite output must differ from input"
         )));
+    }
+
+    if args.stream {
+        return run_streaming(args);
     }
 
     let strip_tags: Vec<TargetTag> = args
@@ -239,5 +249,84 @@ pub fn run(args: Args) -> Result<(), CliError> {
         summary_total_variants - summary_dropped_variants,
         kept_assets,
     );
+    Ok(())
+}
+
+fn run_streaming(args: Args) -> Result<(), CliError> {
+    if args.dedup {
+        return Err(CliError::user(anyhow!(
+            "--stream does not support --dedup"
+        )));
+    }
+    if args.strip_metadata_prefix.is_some() {
+        return Err(CliError::user(anyhow!(
+            "--stream does not support --strip-metadata-prefix yet"
+        )));
+    }
+
+    let strip_assets: HashSet<&str> = args.strip_assets.iter().map(String::as_str).collect();
+    let strip_all_assets = strip_assets.contains("*");
+
+    let src = RsmfFile::open(&args.input)?;
+    let mut writer = rsmf_core::StreamingRsmfWriter::new(&args.output)?;
+
+    for (k, v) in &src.manifest().metadata {
+        writer = writer.with_metadata(k.clone(), v.clone());
+    }
+
+    if args.compress_tensors {
+        writer = writer.with_canonical_compression(3);
+    }
+    if args.compress_graph {
+        writer = writer.with_graph_compression(3);
+    }
+    if args.compress_assets {
+        writer = writer.with_assets_compression(3);
+    }
+
+    let tensor_names: Vec<String> = src.manifest().tensors.iter().map(|t| t.name.clone()).collect();
+    for name in &tensor_names {
+        let tensor = src.manifest().tensors.iter().find(|t| &t.name == name).unwrap();
+        let view = src.tensor_view(name).map_err(|e| CliError::user(anyhow!("{name}: {e}")))?;
+        let mut cursor = std::io::Cursor::new(view.bytes());
+        writer.stream_canonical_tensor(
+            name.clone(),
+            tensor.dtype,
+            tensor.shape.clone(),
+            &mut cursor,
+        )?;
+    }
+
+    if !args.strip_graphs {
+        let payloads = src.graph_payloads();
+        for p in payloads {
+            let mut cursor = std::io::Cursor::new(&p.bytes);
+            writer.stream_graph(p.kind, &mut cursor)?;
+        }
+    }
+
+    let mut kept_assets = 0usize;
+    if !strip_all_assets {
+        for ad in &src.manifest().assets {
+            if strip_assets.contains(ad.name.as_str()) {
+                continue;
+            }
+            let asset = src.asset(&ad.name).unwrap();
+            let mut cursor = std::io::Cursor::new(&asset.bytes);
+            writer.stream_asset(ad.name.clone(), &mut cursor)?;
+            kept_assets += 1;
+        }
+    }
+
+    writer.finish()?;
+
+    println!(
+        "rewrote (stream): {} -> {} (tensors={}, packed_variants=stripped, assets kept={})",
+        args.input.display(),
+        args.output.display(),
+        tensor_names.len(),
+        kept_assets,
+    );
+
     Ok(())
 }
