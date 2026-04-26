@@ -27,7 +27,7 @@ impl<R: AsyncRead + AsyncSeek + Unpin> AsyncRsmfFile<R> {
         reader
             .read_exact(&mut preamble_bytes)
             .await
-            .map_err(|e| RsmfError::Io(e))?;
+            .map_err(RsmfError::Io)?;
 
         let preamble = Preamble::decode(&preamble_bytes)?;
 
@@ -47,11 +47,11 @@ impl<R: AsyncRead + AsyncSeek + Unpin> AsyncRsmfFile<R> {
         reader
             .seek(std::io::SeekFrom::Start(preamble.section_tbl_off))
             .await
-            .map_err(|e| RsmfError::Io(e))?;
+            .map_err(RsmfError::Io)?;
         reader
             .read_exact(&mut table_bytes)
             .await
-            .map_err(|e| RsmfError::Io(e))?;
+            .map_err(RsmfError::Io)?;
 
         let mut sections = Vec::with_capacity(preamble.section_tbl_count as usize);
         for i in 0..preamble.section_tbl_count {
@@ -73,11 +73,11 @@ impl<R: AsyncRead + AsyncSeek + Unpin> AsyncRsmfFile<R> {
         reader
             .seek(std::io::SeekFrom::Start(manifest_section.offset))
             .await
-            .map_err(|e| RsmfError::Io(e))?;
+            .map_err(RsmfError::Io)?;
         reader
             .read_exact(&mut manifest_bytes)
             .await
-            .map_err(|e| RsmfError::Io(e))?;
+            .map_err(RsmfError::Io)?;
 
         let manifest = Manifest::decode(&manifest_bytes)?;
 
