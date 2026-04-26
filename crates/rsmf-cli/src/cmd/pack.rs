@@ -28,6 +28,10 @@ pub struct Args {
     /// safe loader rejects it.
     #[arg(long = "from-torch", value_name = "PATH")]
     pub from_torch: Option<PathBuf>,
+    /// Input ONNX file. Extracts initializers as tensors. Requires `python3`
+    /// with `onnx` and `safetensors` installed on PATH.
+    #[arg(long = "from-onnx", value_name = "PATH")]
+    pub from_onnx: Option<PathBuf>,
     /// Output RSMF file.
     #[arg(long = "out", value_name = "PATH")]
     pub out: PathBuf,
@@ -132,6 +136,7 @@ pub fn run(args: Args) -> Result<(), CliError> {
     // held in a guard local so it lives until this function returns and is
     // unlinked automatically on drop.
     let _torch_tmp_guard;
+    let _onnx_tmp_guard;
     let effective_from_safetensors: Option<PathBuf> = if let Some(pt_path) = args.from_torch {
         let tmp = tempfile::Builder::new()
             .prefix("rsmf-torch-")
@@ -141,6 +146,16 @@ pub fn run(args: Args) -> Result<(), CliError> {
         convert_torch_to_safetensors(&pt_path, tmp.path())?;
         let path = tmp.path().to_path_buf();
         _torch_tmp_guard = tmp;
+        Some(path)
+    } else if let Some(onnx_path) = args.from_onnx {
+        let tmp = tempfile::Builder::new()
+            .prefix("rsmf-onnx-")
+            .suffix(".safetensors")
+            .tempfile()
+            .map_err(|e| CliError::user(anyhow!("tempfile: {e}")))?;
+        convert_onnx_to_safetensors(&onnx_path, tmp.path())?;
+        let path = tmp.path().to_path_buf();
+        _onnx_tmp_guard = tmp;
         Some(path)
     } else {
         args.from_safetensors
@@ -474,6 +489,85 @@ fn convert_torch_to_safetensors(
     Ok(())
 }
 
+/// Python one-liner that extracts initializers from an ONNX model
+/// and saves them to a safetensors file.
+const ONNX_TO_SAFETENSORS_SCRIPT: &str = r#"
+import sys
+
+try:
+    import onnx
+    from onnx import numpy_helper
+except ImportError:
+    raise SystemExit("rsmf --from-onnx requires Python with `onnx` installed")
+try:
+    from safetensors.numpy import save_file
+except ImportError:
+    raise SystemExit("rsmf --from-onnx requires `safetensors` installed")
+
+onnx_path, out_path = sys.argv[1], sys.argv[2]
+try:
+    model = onnx.load(onnx_path, load_external_data=True)
+except Exception as err:
+    raise SystemExit(f"failed to load ONNX model: {err}")
+
+tensors = {}
+for init in model.graph.initializer:
+    try:
+        arr = numpy_helper.to_array(init)
+        tensors[init.name] = arr
+    except Exception as err:
+        sys.stderr.write(f"[rsmf] warning: failed to convert initializer {init.name}: {err}\n")
+
+if not tensors:
+    raise SystemExit("rsmf found no initializers in the ONNX model")
+
+save_file(tensors, out_path)
+sys.stderr.write(f"[rsmf] extracted {len(tensors)} initializers via python subprocess\n")
+"#;
+
+/// Convert an ONNX model at `onnx_path` into a safetensors file at
+/// `out_path` by shelling out to `python3`.
+fn convert_onnx_to_safetensors(
+    onnx_path: &std::path::Path,
+    out_path: &std::path::Path,
+) -> Result<(), CliError> {
+    if !onnx_path.exists() {
+        return Err(CliError::user(anyhow!(
+            "onnx input not found: {}",
+            onnx_path.display()
+        )));
+    }
+
+    let python = resolve_python_binary()?;
+    let status = std::process::Command::new(&python)
+        .arg("-c")
+        .arg(ONNX_TO_SAFETENSORS_SCRIPT)
+        .arg(onnx_path)
+        .arg(out_path)
+        .status()
+        .map_err(|e| {
+            CliError::user(anyhow!(
+                "failed to invoke {}: {e}. Install python3 with `onnx` and `safetensors` to use --from-onnx.",
+                python
+            ))
+        })?;
+
+    if !status.success() {
+        return Err(CliError::user(anyhow!(
+            "python onnx→safetensors conversion failed (exit code {:?})",
+            status.code()
+        )));
+    }
+
+    if !out_path.exists() || std::fs::metadata(out_path).map(|m| m.len()).unwrap_or(0) == 0 {
+        return Err(CliError::user(anyhow!(
+            "onnx→safetensors produced no output at {}",
+            out_path.display()
+        )));
+    }
+    Ok(())
+}
+
 /// Resolve the Python executable. Honours `RSMF_PYTHON_BIN` for
 /// environments that need a specific venv interpreter.
 fn resolve_python_binary() -> Result<String, CliError> {
@@ -517,6 +611,13 @@ fn run_streaming(args: &Args) -> Result<(), CliError> {
         return Err(CliError::user(anyhow!(
             "--stream does not support --from-torch \
              (the torch subprocess already materialises a safetensors \
+             tempfile which fits in RAM)"
+        )));
+    }
+    if args.from_onnx.is_some() {
+        return Err(CliError::user(anyhow!(
+            "--stream does not support --from-onnx \
+             (the onnx subprocess already materialises a safetensors \
              tempfile which fits in RAM)"
         )));
     }
