@@ -254,9 +254,7 @@ pub fn run(args: Args) -> Result<(), CliError> {
 
 fn run_streaming(args: Args) -> Result<(), CliError> {
     if args.dedup {
-        return Err(CliError::user(anyhow!(
-            "--stream does not support --dedup"
-        )));
+        return Err(CliError::user(anyhow!("--stream does not support --dedup")));
     }
     if args.strip_metadata_prefix.is_some() {
         return Err(CliError::user(anyhow!(
@@ -284,10 +282,22 @@ fn run_streaming(args: Args) -> Result<(), CliError> {
         writer = writer.with_assets_compression(3);
     }
 
-    let tensor_names: Vec<String> = src.manifest().tensors.iter().map(|t| t.name.clone()).collect();
+    let tensor_names: Vec<String> = src
+        .manifest()
+        .tensors
+        .iter()
+        .map(|t| t.name.clone())
+        .collect();
     for name in &tensor_names {
-        let tensor = src.manifest().tensors.iter().find(|t| &t.name == name).unwrap();
-        let view = src.tensor_view(name).map_err(|e| CliError::user(anyhow!("{name}: {e}")))?;
+        let tensor = src
+            .manifest()
+            .tensors
+            .iter()
+            .find(|t| &t.name == name)
+            .unwrap();
+        let view = src
+            .tensor_view(name)
+            .map_err(|e| CliError::user(anyhow!("{name}: {e}")))?;
         let mut cursor = std::io::Cursor::new(view.bytes());
         writer.stream_canonical_tensor(
             name.clone(),
