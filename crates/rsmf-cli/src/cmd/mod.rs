@@ -3,6 +3,7 @@
 use clap::Subcommand;
 
 pub mod error;
+pub mod export;
 pub mod extract;
 pub mod extract_asset;
 pub mod import;
@@ -31,6 +32,8 @@ pub enum Command {
     Verify(verify::Args),
     /// Pack tensors from a source format (currently safetensors, GGUF, NPY) into RSMF.
     Pack(pack::Args),
+    /// Export tensors from RSMF into another model container format.
+    Export(export::Args),
     /// Extract a single tensor's canonical bytes to a file.
     Extract(extract::Args),
     /// Extract a named asset to a file.
@@ -52,6 +55,7 @@ impl Command {
             Self::Inspect(args) => inspect::run(args),
             Self::Verify(args) => verify::run(args),
             Self::Pack(args) => pack::run(args),
+            Self::Export(args) => export::run(args),
             Self::Extract(args) => extract::run(args),
             Self::ExtractAsset(args) => extract_asset::run(args),
             Self::Select(args) => select::run(args),

@@ -98,6 +98,120 @@ fn end_to_end_pack_inspect_verify_select_extract() {
     }
 }
 
+#[test]
+fn export_safetensors_round_trips_raw_canonical_tensors() {
+    let dir = tempdir().unwrap();
+    let st_path = build_fixture(dir.path());
+    let rsmf_path = dir.path().join("model.rsmf");
+    let exported_path = dir.path().join("exported.safetensors");
+
+    let out = Command::new(rsmf_bin())
+        .args(["pack", "--from-safetensors"])
+        .arg(&st_path)
+        .arg("--out")
+        .arg(&rsmf_path)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "pack failed: {out:?}");
+
+    let out = Command::new(rsmf_bin())
+        .args(["export", "safetensors"])
+        .arg(&rsmf_path)
+        .arg(&exported_path)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "export failed: {out:?}");
+
+    let bytes = std::fs::read(&exported_path).unwrap();
+    let st = safetensors::tensor::SafeTensors::deserialize(&bytes).unwrap();
+    let tensor = st.tensor("weight").unwrap();
+    assert_eq!(tensor.dtype(), Dtype::F32);
+    assert_eq!(tensor.shape(), &[3, 4]);
+    assert_eq!(tensor.data().len(), 12 * 4);
+}
+
+#[test]
+fn export_safetensors_decodes_quantized_f32_when_requested() {
+    let dir = tempdir().unwrap();
+    let st_path = build_fixture(dir.path());
+    let rsmf_path = dir.path().join("model_q4.rsmf");
+    let exported_path = dir.path().join("exported_q4.safetensors");
+
+    let out = Command::new(rsmf_bin())
+        .args(["pack", "--from-safetensors"])
+        .arg(&st_path)
+        .args(["--quantize-q4_0", "cpu_generic"])
+        .arg("--out")
+        .arg(&rsmf_path)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "pack failed: {out:?}");
+
+    let out = Command::new(rsmf_bin())
+        .args(["export", "safetensors", "--target", "cpu_generic"])
+        .arg(&rsmf_path)
+        .arg(&exported_path)
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "export without --decode-f32 unexpectedly succeeded"
+    );
+
+    let out = Command::new(rsmf_bin())
+        .args([
+            "export",
+            "safetensors",
+            "--target",
+            "cpu_generic",
+            "--decode-f32",
+        ])
+        .arg(&rsmf_path)
+        .arg(&exported_path)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "export failed: {out:?}");
+
+    let bytes = std::fs::read(&exported_path).unwrap();
+    let st = safetensors::tensor::SafeTensors::deserialize(&bytes).unwrap();
+    let tensor = st.tensor("weight").unwrap();
+    assert_eq!(tensor.dtype(), Dtype::F32);
+    assert_eq!(tensor.shape(), &[3, 4]);
+    assert_eq!(tensor.data().len(), 12 * 4);
+}
+
+#[test]
+fn export_onnx_round_trips_embedded_graph_bytes() {
+    let dir = tempdir().unwrap();
+    let st_path = build_fixture(dir.path());
+    let graph_path = dir.path().join("model.onnx");
+    let graph_bytes = b"synthetic-onnx-graph-bytes";
+    std::fs::write(&graph_path, graph_bytes).unwrap();
+    let rsmf_path = dir.path().join("bundle.rsmf");
+    let exported_path = dir.path().join("exported.onnx");
+
+    let out = Command::new(rsmf_bin())
+        .args(["pack", "--from-safetensors"])
+        .arg(&st_path)
+        .arg("--graph")
+        .arg(&graph_path)
+        .arg("--out")
+        .arg(&rsmf_path)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "pack failed: {out:?}");
+
+    let out = Command::new(rsmf_bin())
+        .args(["export", "onnx"])
+        .arg(&rsmf_path)
+        .arg(&exported_path)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "export onnx failed: {out:?}");
+
+    assert_eq!(std::fs::read(&exported_path).unwrap(), graph_bytes);
+}
+
 fn build_multi_tensor_fixture(dir: &std::path::Path) -> std::path::PathBuf {
     // Two tensors with different shapes so the round-trip verifies
     // alignment padding between tensors inside the canonical arena.
