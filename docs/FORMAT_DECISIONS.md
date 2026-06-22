@@ -84,8 +84,14 @@ tensor/graph/asset model.
   `tokenizer.json`, `tokenizer_config.json`, `special_tokens_map.json`,
   `vocab.json`, `merges.txt`, `added_tokens.json`, `preprocessor_config.json`,
   and `chat_template.json` as rsmf assets when the remote repo carries them.
+- **Currently shipped export paths:** `rsmf export safetensors` for canonical
+  tensor export, plus `--target <tag>` for exporting a packed variant; and
+  `rsmf export onnx` for byte-exact export of an embedded ONNX graph payload.
+  Raw row-major tensors are exported byte-for-byte; packed, quantized, cast,
+  and FP8 logical-F32 tensors require `--decode-f32` and are materialized as
+  raw F32 safetensors tensors.
 - **Next up**, in order: `--from-tflite`,
-  `--from-h5`, and export paths (`rsmf export safetensors` / `gguf` / `onnx`).
+  `--from-h5`, and `rsmf export gguf`.
   Tier-C formats (TensorRT engines, Qualcomm SNPE, NCNN, MNN, GGML legacy)
   are explicitly out of scope because their bytes are hardware- or
   driver-bound and cannot be portably re-emitted.

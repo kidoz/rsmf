@@ -134,7 +134,14 @@ rsmf verify   model.rsmf --full
 rsmf select   model.rsmf --mode cpu
 rsmf extract  model.rsmf --tensor embedding.weight out.bin
 rsmf extract-asset model.rsmf --name tokenizer.json tokenizer.json
+rsmf export safetensors model.rsmf model.safetensors
+rsmf export onnx bundle.rsmf graph.onnx
 ```
+
+Use `--target <tag>` to export a packed variant instead of the canonical
+variant, and `--decode-f32` when that variant is stored in a packed /
+quantized representation. Raw row-major tensors export byte-for-byte; decoded
+tensors are materialized as F32 safetensors payloads.
 
 ### Rewrite: ship a smaller artifact by stripping dev-only variants / assets
 
