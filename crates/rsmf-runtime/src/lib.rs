@@ -592,6 +592,7 @@ fn ort_error(stage: &'static str, error: impl std::fmt::Display) -> RuntimeError
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rsmf_core::GraphInput;
     use rsmf_core::LogicalDtype;
     use rsmf_core::writer::{RsmfWriter, TensorInput, VariantInput};
     use tempfile::tempdir;
@@ -651,5 +652,163 @@ mod tests {
                 graph_count: 0
             }
         ));
+    }
+
+    #[test]
+    fn runs_embedded_onnx_add_graph_from_rsmf() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("add.onnx.rsmf");
+        RsmfWriter::new()
+            .with_tensor(TensorInput {
+                name: "fixture.weight".to_string(),
+                dtype: LogicalDtype::F32,
+                shape: vec![1],
+                shard_id: 0,
+                metadata: Vec::new(),
+                canonical: VariantInput::canonical_raw(0.0f32.to_le_bytes().to_vec()),
+                packed: Vec::new(),
+            })
+            .with_graph(GraphInput::onnx(tiny_add_onnx_model()))
+            .write_to_path(&path)
+            .unwrap();
+
+        let engine = Engine::new(RsmfFile::open(path).unwrap()).unwrap();
+        let handle = engine.session_handle(0, SessionOptions::default()).unwrap();
+        let input_names = handle
+            .inputs()
+            .iter()
+            .map(|input| input.name.as_str())
+            .collect::<Vec<_>>();
+        let output_names = handle
+            .outputs()
+            .iter()
+            .map(|output| output.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(input_names, vec!["x", "y"]);
+        assert_eq!(output_names, vec!["z"]);
+
+        let outputs = engine
+            .run_f32(
+                0,
+                HashMap::from([
+                    (
+                        "x".to_string(),
+                        ArrayD::from_shape_vec(vec![2], vec![1.5, -2.0]).unwrap(),
+                    ),
+                    (
+                        "y".to_string(),
+                        ArrayD::from_shape_vec(vec![2], vec![2.5, 3.0]).unwrap(),
+                    ),
+                ]),
+            )
+            .unwrap();
+
+        let z = outputs.get("z").unwrap();
+        assert_eq!(z.shape(), &[2]);
+        assert_eq!(z.iter().copied().collect::<Vec<_>>(), vec![4.0, 1.0]);
+    }
+
+    fn tiny_add_onnx_model() -> Vec<u8> {
+        let mut model = Vec::new();
+        push_i64(&mut model, 1, 7);
+        push_string(&mut model, 2, "rsmf-runtime-test");
+        push_message(&mut model, 7, tiny_add_graph());
+        push_message(&mut model, 8, opset_import("", 13));
+        model
+    }
+
+    fn tiny_add_graph() -> Vec<u8> {
+        let mut graph = Vec::new();
+        push_message(&mut graph, 1, add_node());
+        push_string(&mut graph, 2, "rsmf_add_graph");
+        push_message(&mut graph, 11, value_info("x", &[2]));
+        push_message(&mut graph, 11, value_info("y", &[2]));
+        push_message(&mut graph, 12, value_info("z", &[2]));
+        graph
+    }
+
+    fn add_node() -> Vec<u8> {
+        let mut node = Vec::new();
+        push_string(&mut node, 1, "x");
+        push_string(&mut node, 1, "y");
+        push_string(&mut node, 2, "z");
+        push_string(&mut node, 3, "add");
+        push_string(&mut node, 4, "Add");
+        node
+    }
+
+    fn value_info(name: &str, shape: &[i64]) -> Vec<u8> {
+        let mut value = Vec::new();
+        push_string(&mut value, 1, name);
+        push_message(&mut value, 2, type_proto_f32(shape));
+        value
+    }
+
+    fn type_proto_f32(shape: &[i64]) -> Vec<u8> {
+        let mut tensor = Vec::new();
+        push_i32(&mut tensor, 1, 1);
+        push_message(&mut tensor, 2, tensor_shape(shape));
+
+        let mut type_proto = Vec::new();
+        push_message(&mut type_proto, 1, tensor);
+        type_proto
+    }
+
+    fn tensor_shape(shape: &[i64]) -> Vec<u8> {
+        let mut tensor_shape = Vec::new();
+        for &dim in shape {
+            let mut dimension = Vec::new();
+            push_i64(&mut dimension, 1, dim);
+            push_message(&mut tensor_shape, 1, dimension);
+        }
+        tensor_shape
+    }
+
+    fn opset_import(domain: &str, version: i64) -> Vec<u8> {
+        let mut opset = Vec::new();
+        if !domain.is_empty() {
+            push_string(&mut opset, 1, domain);
+        }
+        push_i64(&mut opset, 2, version);
+        opset
+    }
+
+    fn push_i32(out: &mut Vec<u8>, field: u32, value: i32) {
+        push_varint_field(out, field, value as u64);
+    }
+
+    fn push_i64(out: &mut Vec<u8>, field: u32, value: i64) {
+        push_varint_field(out, field, value as u64);
+    }
+
+    fn push_string(out: &mut Vec<u8>, field: u32, value: &str) {
+        push_bytes(out, field, value.as_bytes());
+    }
+
+    fn push_message(out: &mut Vec<u8>, field: u32, message: Vec<u8>) {
+        push_bytes(out, field, &message);
+    }
+
+    fn push_bytes(out: &mut Vec<u8>, field: u32, bytes: &[u8]) {
+        push_tag(out, field, 2);
+        push_varint(out, bytes.len() as u64);
+        out.extend_from_slice(bytes);
+    }
+
+    fn push_varint_field(out: &mut Vec<u8>, field: u32, value: u64) {
+        push_tag(out, field, 0);
+        push_varint(out, value);
+    }
+
+    fn push_tag(out: &mut Vec<u8>, field: u32, wire_type: u64) {
+        push_varint(out, ((field as u64) << 3) | wire_type);
+    }
+
+    fn push_varint(out: &mut Vec<u8>, mut value: u64) {
+        while value >= 0x80 {
+            out.push((value as u8) | 0x80);
+            value >>= 7;
+        }
+        out.push(value as u8);
     }
 }
