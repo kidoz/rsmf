@@ -10,6 +10,9 @@ use std::process::Command;
 use safetensors::tensor::{Dtype, TensorView};
 use tempfile::tempdir;
 
+use rsmf_core::LogicalDtype;
+use rsmf_core::writer::{RsmfWriter, TensorInput, VariantInput};
+
 fn rsmf_bin() -> &'static str {
     env!("CARGO_BIN_EXE_rsmf")
 }
@@ -25,6 +28,10 @@ fn build_fixture(dir: &std::path::Path) -> std::path::PathBuf {
     let path = dir.join("model.safetensors");
     std::fs::write(&path, bytes).unwrap();
     path
+}
+
+fn f32_bytes(n: usize, fill: f32) -> Vec<u8> {
+    (0..n).flat_map(|_| fill.to_le_bytes()).collect()
 }
 
 #[test]
@@ -96,6 +103,54 @@ fn end_to_end_pack_inspect_verify_select_extract() {
         ]);
         assert!((v - i as f32).abs() < f32::EPSILON);
     }
+}
+
+#[test]
+fn inspect_moe_prints_expert_grouping() {
+    let dir = tempdir().unwrap();
+    let rsmf_path = dir.path().join("moe.rsmf");
+
+    RsmfWriter::new()
+        .with_metadata("moe.n_experts", "4")
+        .with_metadata("moe.top_k", "2")
+        .with_metadata("model.arch", "toy-moe")
+        .with_tensor(TensorInput {
+            shard_id: 0,
+            name: "layers.0.experts.3.up".into(),
+            dtype: LogicalDtype::F32,
+            shape: vec![2, 2],
+            metadata: vec![
+                ("moe.layer".into(), "0".into()),
+                ("moe.expert".into(), "3".into()),
+                ("moe.role".into(), "up".into()),
+            ],
+            canonical: VariantInput::canonical_raw(f32_bytes(4, 1.0)),
+            packed: vec![],
+        })
+        .write_to_path(&rsmf_path)
+        .unwrap();
+
+    let out = Command::new(rsmf_bin())
+        .arg("inspect")
+        .arg("--moe")
+        .arg(&rsmf_path)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "inspect --moe failed: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("MoE:"), "inspect stdout: {stdout}");
+    assert!(
+        stdout.contains("n_experts=4 top_k=2"),
+        "inspect stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("layer=0 expert=3 shared=false role=up"),
+        "inspect stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("layers.0.experts.3.up"),
+        "inspect stdout: {stdout}"
+    );
 }
 
 #[test]

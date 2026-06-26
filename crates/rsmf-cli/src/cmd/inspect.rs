@@ -11,6 +11,9 @@ use super::CliError;
 pub struct Args {
     /// Path to the RSMF file.
     pub file: PathBuf,
+    /// Include Mixture-of-Experts grouping from `moe.*` metadata.
+    #[arg(long)]
+    pub moe: bool,
 }
 
 /// Execute `rsmf inspect`.
@@ -96,6 +99,36 @@ pub fn run(args: Args) -> Result<(), CliError> {
         }
     }
 
+    if args.moe {
+        let moe = file.moe_experts()?;
+        println!();
+        println!("MoE:");
+        println!(
+            "  n_experts={} top_k={} n_shared={} model_arch={}",
+            display_opt_u32(moe.n_experts),
+            display_opt_u32(moe.top_k),
+            display_opt_u32(moe.n_shared),
+            moe.model_arch.as_deref().unwrap_or("(none)")
+        );
+        if moe.groups.is_empty() {
+            println!("  groups: (none)");
+        } else {
+            println!("  groups:");
+            for group in &moe.groups {
+                let expert = group
+                    .expert_id
+                    .map_or_else(|| String::from("none"), |id| id.to_string());
+                println!(
+                    "    layer={layer} expert={expert} shared={shared} role={role} tensors={tensors}",
+                    layer = group.layer,
+                    shared = group.shared,
+                    role = group.role.as_str(),
+                    tensors = group.tensor_names.join(","),
+                );
+            }
+        }
+    }
+
     if !manifest.assets.is_empty() {
         println!();
         println!("Assets:");
@@ -105,4 +138,8 @@ pub fn run(args: Args) -> Result<(), CliError> {
     }
 
     Ok(())
+}
+
+fn display_opt_u32(value: Option<u32>) -> String {
+    value.map_or_else(|| String::from("(none)"), |v| v.to_string())
 }
