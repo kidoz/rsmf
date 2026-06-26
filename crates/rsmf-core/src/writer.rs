@@ -12,8 +12,11 @@ use std::path::{Path, PathBuf};
 use crate::checksum::{CHECKSUM_LEN, digest_128};
 use crate::error::{Result, RsmfError};
 use crate::manifest::{AssetDescriptor, GraphDescriptor, GraphKind, MANIFEST_VERSION, Manifest};
+use crate::placement::{PLACEMENT_SECTION_KIND, PlacementManifest};
 use crate::preamble::{FORMAT_MAJOR, FORMAT_MINOR, MAGIC, PREAMBLE_LEN, Preamble};
-use crate::section::{SECTION_DESC_LEN, SectionDescriptor, SectionKind};
+use crate::section::{
+    CUSTOM_SECTION_RANGE_START, SECTION_DESC_LEN, SectionDescriptor, SectionKind,
+};
 use crate::tensor::descriptor::TensorDescriptor;
 use crate::tensor::dtype::{LogicalDtype, StorageDtype};
 use crate::tensor::variant::{EncodingKind, LayoutTag, TargetTag, VariantDescriptor, VariantMeta};
@@ -270,6 +273,36 @@ pub struct AssetInput {
     pub metadata: Vec<(String, String)>,
     /// If `Some(level)`, the assets section will be zstd-compressed.
     pub compress: Option<i32>,
+}
+
+/// Input for an opaque custom section.
+#[derive(Debug, Clone)]
+pub struct CustomSectionInput {
+    /// Custom section kind. Must be in the ancillary range (`>= 128`).
+    pub kind: u16,
+    /// Section alignment. Must be a power of two.
+    pub alignment: u16,
+    /// Section payload bytes.
+    pub bytes: Vec<u8>,
+}
+
+impl CustomSectionInput {
+    /// Build a custom section input.
+    #[must_use]
+    pub fn new(kind: u16, bytes: Vec<u8>) -> Self {
+        Self {
+            kind,
+            alignment: 8,
+            bytes,
+        }
+    }
+
+    /// Override the section alignment.
+    #[must_use]
+    pub fn with_alignment(mut self, alignment: u16) -> Self {
+        self.alignment = alignment;
+        self
+    }
 }
 
 impl AssetInput {
@@ -748,6 +781,7 @@ pub struct RsmfWriter {
     tensors: Vec<TensorInput>,
     graphs: Vec<GraphInput>,
     assets: Vec<AssetInput>,
+    custom_sections: Vec<CustomSectionInput>,
     canonical_section_alignment: u16,
     packed_section_alignment: u16,
     canonical_compress: Option<i32>,
@@ -765,6 +799,7 @@ impl RsmfWriter {
             tensors: Vec::new(),
             graphs: Vec::new(),
             assets: Vec::new(),
+            custom_sections: Vec::new(),
             canonical_section_alignment: 64,
             packed_section_alignment: 64,
             canonical_compress: None,
@@ -886,6 +921,23 @@ impl RsmfWriter {
     pub fn with_asset(mut self, a: AssetInput) -> Self {
         self.assets.push(a);
         self
+    }
+
+    /// Append an opaque custom section.
+    ///
+    /// The section kind must be in the custom/ancillary range (`>= 128`).
+    #[must_use]
+    pub fn with_custom_section(mut self, section: CustomSectionInput) -> Self {
+        self.custom_sections.push(section);
+        self
+    }
+
+    /// Append a placement manifest custom section.
+    pub fn with_placement_manifest(mut self, placement: &PlacementManifest) -> Result<Self> {
+        let bytes = placement.encode()?;
+        self.custom_sections
+            .push(CustomSectionInput::new(PLACEMENT_SECTION_KIND, bytes));
+        Ok(self)
     }
 
     /// Enable zstd compression on the canonical arena.
@@ -1150,6 +1202,11 @@ impl RsmfWriter {
             graphs: graph_descriptors,
             assets: asset_descriptors,
         };
+        for custom in &self.custom_sections {
+            if custom.kind == PLACEMENT_SECTION_KIND {
+                PlacementManifest::decode(&custom.bytes)?.validate_against_manifest(&manifest)?;
+            }
+        }
         let manifest_bytes = manifest.encode()?;
 
         // 6. Compute section table.
@@ -1161,6 +1218,7 @@ impl RsmfWriter {
         if asset_section_bytes.is_some() {
             section_count += 1;
         }
+        section_count += self.custom_sections.len() as u64;
         let section_tbl_off = PREAMBLE_LEN;
         let section_tbl_len = section_count * SECTION_DESC_LEN;
 
@@ -1216,6 +1274,17 @@ impl RsmfWriter {
             cursor += assets_len;
         }
 
+        let mut custom_layouts: Vec<(u64, u64, [u8; CHECKSUM_LEN])> =
+            Vec::with_capacity(self.custom_sections.len());
+        for custom in &self.custom_sections {
+            cursor = align_up_u64(cursor, u64::from(custom.alignment));
+            let off = cursor;
+            let len = custom.bytes.len() as u64;
+            let checksum = digest_128(&custom.bytes);
+            custom_layouts.push((off, len, checksum));
+            cursor += len;
+        }
+
         let total_len = cursor;
 
         // 7. Build section table entries.
@@ -1267,6 +1336,17 @@ impl RsmfWriter {
                 checksum: assets_checksum,
             });
         }
+        for (i, custom) in self.custom_sections.iter().enumerate() {
+            let (off, len, checksum) = custom_layouts[i];
+            section_table.push(SectionDescriptor {
+                kind: SectionKind::Custom(custom.kind),
+                align: custom.alignment,
+                flags: 0,
+                offset: off,
+                length: len,
+                checksum,
+            });
+        }
 
         // 8. Preamble.
         let preamble = Preamble {
@@ -1305,6 +1385,11 @@ impl RsmfWriter {
         if let Some(a_bytes) = &asset_section_bytes {
             pad_to_file_offset(&mut out, assets_off)?;
             out.extend_from_slice(a_bytes);
+        }
+        for (i, custom) in self.custom_sections.iter().enumerate() {
+            let (off, _len, _checksum) = custom_layouts[i];
+            pad_to_file_offset(&mut out, off)?;
+            out.extend_from_slice(&custom.bytes);
         }
         debug_assert_eq!(out.len() as u64, total_len);
         Ok(out)
@@ -1350,6 +1435,35 @@ impl RsmfWriter {
                     )));
                 }
             }
+        }
+        let mut placement_sections = 0usize;
+        for custom in &self.custom_sections {
+            if custom.kind < CUSTOM_SECTION_RANGE_START {
+                return Err(RsmfError::structural(format!(
+                    "custom section kind {} is outside the custom range",
+                    custom.kind
+                )));
+            }
+            if custom.alignment == 0 || (custom.alignment & (custom.alignment - 1)) != 0 {
+                return Err(RsmfError::structural(format!(
+                    "custom section alignment {} is not a power of two",
+                    custom.alignment
+                )));
+            }
+            if custom.bytes.is_empty() {
+                return Err(RsmfError::structural(format!(
+                    "custom section kind {} has empty payload",
+                    custom.kind
+                )));
+            }
+            if custom.kind == PLACEMENT_SECTION_KIND {
+                placement_sections += 1;
+            }
+        }
+        if placement_sections > 1 {
+            return Err(RsmfError::structural(
+                "only one placement manifest section is allowed".to_string(),
+            ));
         }
         Ok(())
     }

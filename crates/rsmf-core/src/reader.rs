@@ -18,6 +18,7 @@ use tracing::{info, info_span};
 use crate::checksum::digest_128;
 use crate::error::{Result, RsmfError};
 use crate::manifest::{GraphKind, Manifest};
+use crate::placement::{PLACEMENT_SECTION_KIND, PlacementManifest};
 use crate::preamble::{PREAMBLE_LEN, Preamble};
 use crate::section::{SECTION_DESC_LEN, SectionDescriptor, SectionKind};
 use crate::selection::{Capabilities, ExecutionMode, TensorPlan, select_variants};
@@ -71,6 +72,17 @@ pub struct AssetRef<'a> {
     pub metadata: &'a [(String, String)],
 }
 
+/// Owned payload of an opaque custom section.
+#[derive(Debug, Clone)]
+pub struct CustomSectionPayload {
+    /// Custom section kind (`>= 128`).
+    pub kind: u16,
+    /// Section alignment from the section table.
+    pub alignment: u16,
+    /// Section payload bytes after any supported decompression.
+    pub bytes: Vec<u8>,
+}
+
 /// A validated, mmap-backed RSMF file.
 #[derive(Debug)]
 pub struct RsmfFile {
@@ -84,6 +96,7 @@ pub struct RsmfFile {
     packed_section_indices: Vec<usize>,
     graph_section_idx: Option<usize>,
     assets_section_idx: Option<usize>,
+    custom_section_indices: Vec<usize>,
     tensor_by_name: HashMap<String, usize>,
     asset_by_name: HashMap<String, usize>,
     variant_to_tensor: Vec<usize>,
@@ -95,6 +108,8 @@ pub struct RsmfFile {
     decompressed_graph: OnceLock<Vec<u8>>,
     /// Cached decompressed assets payload.
     decompressed_assets: OnceLock<Vec<u8>>,
+    /// Cached decompressed custom sections (by custom_section_indices index).
+    decompressed_custom_sections: Vec<OnceLock<Vec<u8>>>,
 }
 
 impl RsmfFile {
@@ -185,8 +200,14 @@ impl RsmfFile {
         packed_section_indices.sort_unstable();
         let graph_section_idx = sections.iter().position(|s| s.kind == SectionKind::Graph);
         let assets_section_idx = sections.iter().position(|s| s.kind == SectionKind::Assets);
+        let custom_section_indices: Vec<usize> = sections
+            .iter()
+            .enumerate()
+            .filter_map(|(i, s)| s.kind.is_custom().then_some(i))
+            .collect();
 
         validate_manifest(&manifest, &sections, &packed_section_indices)?;
+        validate_placement_sections(bytes, &sections, &custom_section_indices, &manifest)?;
 
         let tensor_by_name = manifest
             .tensors
@@ -227,6 +248,10 @@ impl RsmfFile {
         for _ in 0..packed_section_indices.len() {
             decompressed_packed_arenas.push(OnceLock::new());
         }
+        let mut decompressed_custom_sections = Vec::with_capacity(custom_section_indices.len());
+        for _ in 0..custom_section_indices.len() {
+            decompressed_custom_sections.push(OnceLock::new());
+        }
 
         #[cfg(feature = "tracing")]
         info!(
@@ -248,6 +273,7 @@ impl RsmfFile {
             packed_section_indices,
             graph_section_idx,
             assets_section_idx,
+            custom_section_indices,
             tensor_by_name,
             asset_by_name,
             variant_to_tensor,
@@ -255,6 +281,7 @@ impl RsmfFile {
             decompressed_packed_arenas,
             decompressed_graph: OnceLock::new(),
             decompressed_assets: OnceLock::new(),
+            decompressed_custom_sections,
         })
     }
 
@@ -282,6 +309,54 @@ impl RsmfFile {
     #[must_use]
     pub fn sections(&self) -> &[SectionDescriptor] {
         &self.sections
+    }
+
+    /// Return all opaque custom sections.
+    pub fn custom_sections(&self) -> Result<Vec<CustomSectionPayload>> {
+        let mut out = Vec::with_capacity(self.custom_section_indices.len());
+        for (custom_idx, &section_idx) in self.custom_section_indices.iter().enumerate() {
+            let section = &self.sections[section_idx];
+            let SectionKind::Custom(kind) = section.kind else {
+                continue;
+            };
+            let bytes = self.custom_section_bytes(custom_idx, section)?.to_vec();
+            out.push(CustomSectionPayload {
+                kind,
+                alignment: section.align,
+                bytes,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Decode the placement manifest custom section, if present.
+    ///
+    /// ```no_run
+    /// # use rsmf_core::RsmfFile;
+    /// let file = RsmfFile::open("model.rsmf")?;
+    /// if let Some(placement) = file.placement_manifest()? {
+    ///     println!("{} placement records", placement.placements.len());
+    /// }
+    /// # Ok::<(), rsmf_core::RsmfError>(())
+    /// ```
+    pub fn placement_manifest(&self) -> Result<Option<PlacementManifest>> {
+        let mut found = None;
+        for (custom_idx, &section_idx) in self.custom_section_indices.iter().enumerate() {
+            let section = &self.sections[section_idx];
+            if section.kind != SectionKind::Custom(PLACEMENT_SECTION_KIND) {
+                continue;
+            }
+            if found.is_some() {
+                return Err(RsmfError::structural(
+                    "multiple placement manifest sections".to_string(),
+                ));
+            }
+            let bytes = self.custom_section_bytes(custom_idx, section)?;
+            let placement = PlacementManifest::decode(bytes)?;
+            placement.validate_against_manifest(&self.manifest)?;
+            found = Some(placement);
+        }
+        Ok(found)
     }
 
     /// Return the parsed manifest.
@@ -698,6 +773,20 @@ impl RsmfFile {
         Ok(cache.get().expect("just set"))
     }
 
+    fn custom_section_bytes<'c>(
+        &'c self,
+        custom_idx: usize,
+        section: &SectionDescriptor,
+    ) -> Result<&'c [u8]> {
+        let cache = self
+            .decompressed_custom_sections
+            .get(custom_idx)
+            .ok_or_else(|| {
+                RsmfError::structural(format!("missing custom section cache {custom_idx}"))
+            })?;
+        self.section_bytes_decompressed(section, cache, &self.master_mmap)
+    }
+
     fn variant_section(&self, v: &VariantDescriptor) -> Result<&SectionDescriptor> {
         let section_idx = match v.section_kind {
             k if k == SectionKind::CanonicalArena.to_raw() as u8 => self.canonical_section_idx,
@@ -721,6 +810,37 @@ impl RsmfFile {
             ))
         })
     }
+}
+
+fn validate_placement_sections(
+    bytes: &[u8],
+    sections: &[SectionDescriptor],
+    custom_section_indices: &[usize],
+    manifest: &Manifest,
+) -> Result<()> {
+    let mut seen = false;
+    for &section_idx in custom_section_indices {
+        let section = &sections[section_idx];
+        if section.kind != SectionKind::Custom(PLACEMENT_SECTION_KIND) {
+            continue;
+        }
+        if seen {
+            return Err(RsmfError::structural(
+                "multiple placement manifest sections".to_string(),
+            ));
+        }
+        seen = true;
+        if section.is_compressed() {
+            return Err(RsmfError::unsupported(
+                "compressed placement manifests are not supported".to_string(),
+            ));
+        }
+        let start = section.offset as usize;
+        let end = (section.offset + section.length) as usize;
+        let placement = PlacementManifest::decode(&bytes[start..end])?;
+        placement.validate_against_manifest(manifest)?;
+    }
+    Ok(())
 }
 
 pub(crate) fn validate_section_table(sections: &[SectionDescriptor], file_len: u64) -> Result<()> {

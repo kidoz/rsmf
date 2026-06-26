@@ -18,6 +18,7 @@ pub mod error;
 pub mod lazy_reader;
 pub mod manifest;
 pub mod moe;
+pub mod placement;
 pub mod preamble;
 pub mod reader;
 pub mod section;
@@ -46,8 +47,12 @@ pub use adapter::{
 pub use error::{Result, RsmfError};
 pub use lazy_reader::{LazyRsmfFile, RangeReader, SliceRangeReader};
 pub use moe::{MoeEntry, MoeGroup, MoeIndex, MoeRole, moe_index_from_manifest};
+pub use placement::{
+    DeviceDescriptor, DeviceKind, MemoryTier, PLACEMENT_FLAG_COLD, PLACEMENT_FLAG_PIN,
+    PLACEMENT_SECTION_KIND, PLACEMENT_VERSION, PlacementManifest, PlacementRecord,
+};
 pub use preamble::{FORMAT_MAJOR, FORMAT_MINOR, MAGIC, Preamble};
-pub use reader::{AssetRef, GraphPayload, RsmfFile};
+pub use reader::{AssetRef, CustomSectionPayload, GraphPayload, RsmfFile};
 pub use section::{SectionDescriptor, SectionKind};
 pub use selection::{
     Capabilities, CpuFeatures, ExecutionMode, GpuBackend, SelectedVariant, TensorPlan,
@@ -61,5 +66,6 @@ pub use tensor::variant::{
 pub use tensor::view::TensorView;
 pub use validator::Validator;
 pub use writer::{
-    AssetInput, GraphInput, RsmfWriter, TensorInput, VariantInput, convert_f32_to_f16_bytes,
+    AssetInput, CustomSectionInput, GraphInput, RsmfWriter, TensorInput, VariantInput,
+    convert_f32_to_f16_bytes,
 };
