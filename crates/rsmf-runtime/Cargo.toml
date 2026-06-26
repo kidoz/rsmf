@@ -21,3 +21,6 @@ tracing = { workspace = true, optional = true }
 [features]
 default = ["tracing"]
 tracing = ["rsmf-core/tracing", "dep:tracing"]
+
+[dev-dependencies]
+tempfile.workspace = true

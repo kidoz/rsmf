@@ -1,112 +1,655 @@
-use ndarray::{ArrayD, ArrayViewD};
-use ort::session::Session;
-use rsmf_core::{LogicalDtype, Result, RsmfFile, TensorView};
+//! Production-oriented ONNX Runtime integration for RSMF graph payloads.
+//!
+//! `rsmf-runtime` keeps RSMF's storage/container boundary intact: graph bytes
+//! remain opaque ONNX / ORT payloads, while this crate owns session lifecycle,
+//! typed request values, runtime options, and session caching.
+
 use std::collections::HashMap;
+use std::fmt::Debug;
+use std::sync::{Arc, Mutex, MutexGuard};
+
+use ndarray::{ArrayD, ArrayViewD};
+use ort::ep::CPUExecutionProvider;
+use ort::session::builder::GraphOptimizationLevel as OrtGraphOptimizationLevel;
+use ort::session::{Session, SessionOutputs};
+use ort::value::{DynValue, Outlet, Tensor, TensorElementType};
+use rsmf_core::{LogicalDtype, RsmfError, RsmfFile, TensorView};
 
 #[cfg(feature = "tracing")]
 use tracing::info_span;
 
+/// Result alias for the runtime crate.
+pub type Result<T> = std::result::Result<T, RuntimeError>;
+
+/// Errors returned by the RSMF runtime layer.
+#[derive(Debug, thiserror::Error)]
+pub enum RuntimeError {
+    /// Error propagated from `rsmf-core`.
+    #[error(transparent)]
+    Core(#[from] RsmfError),
+    /// The requested graph payload is not present.
+    #[error("graph payload {graph_idx} not found; file has {graph_count} graph payloads")]
+    GraphNotFound {
+        /// Requested graph index.
+        graph_idx: usize,
+        /// Number of graph payloads available in the file.
+        graph_count: usize,
+    },
+    /// Error propagated from ONNX Runtime.
+    #[error("onnx runtime error during {stage}: {message}")]
+    Ort {
+        /// Runtime stage that failed.
+        stage: &'static str,
+        /// Original ORT error text.
+        message: String,
+    },
+    /// The runtime session cache was poisoned by a panic in another caller.
+    #[error("runtime session cache lock poisoned")]
+    CachePoisoned,
+    /// A cached runtime session lock was poisoned by a panic in another caller.
+    #[error("runtime session lock poisoned")]
+    SessionPoisoned,
+    /// The caller provided a tensor shape that cannot be represented safely.
+    #[error("invalid runtime tensor shape: {0}")]
+    Shape(String),
+    /// A runtime value has a dtype this milestone does not materialize.
+    #[error("unsupported runtime tensor dtype: {0}")]
+    UnsupportedDtype(String),
+}
+
+/// ONNX Runtime graph optimization level.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum GraphOptimizationLevel {
+    /// Disable all graph optimizations.
+    Disable,
+    /// Enable basic semantics-preserving optimizations.
+    Level1,
+    /// Enable extended graph optimizations.
+    Level2,
+    /// Enable layout optimizations.
+    Level3,
+    /// Enable all optimizations supported by the ORT build.
+    #[default]
+    All,
+}
+
+impl From<GraphOptimizationLevel> for OrtGraphOptimizationLevel {
+    fn from(value: GraphOptimizationLevel) -> Self {
+        match value {
+            GraphOptimizationLevel::Disable => Self::Disable,
+            GraphOptimizationLevel::Level1 => Self::Level1,
+            GraphOptimizationLevel::Level2 => Self::Level2,
+            GraphOptimizationLevel::Level3 => Self::Level3,
+            GraphOptimizationLevel::All => Self::All,
+        }
+    }
+}
+
+/// Execution provider selection for R1.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ExecutionProvider {
+    /// Portable CPU execution provider. This is always available in ORT.
+    Cpu {
+        /// Enable ORT's CPU memory arena.
+        arena: bool,
+    },
+}
+
+impl Default for ExecutionProvider {
+    fn default() -> Self {
+        Self::Cpu { arena: true }
+    }
+}
+
+/// Options used to create and cache an ONNX Runtime session.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SessionOptions {
+    /// Graph optimization level.
+    pub graph_optimization: GraphOptimizationLevel,
+    /// Optional number of intra-op threads.
+    pub intra_threads: Option<usize>,
+    /// Optional number of inter-op threads.
+    pub inter_threads: Option<usize>,
+    /// Enable ORT parallel graph execution.
+    pub parallel_execution: bool,
+    /// Enable ORT memory pattern optimization.
+    pub memory_pattern: bool,
+    /// Enable deterministic compute where ORT supports it.
+    pub deterministic_compute: bool,
+    /// Execution providers registered in priority order.
+    pub execution_providers: Vec<ExecutionProvider>,
+}
+
+impl Default for SessionOptions {
+    fn default() -> Self {
+        Self {
+            graph_optimization: GraphOptimizationLevel::All,
+            intra_threads: None,
+            inter_threads: None,
+            parallel_execution: false,
+            memory_pattern: true,
+            deterministic_compute: false,
+            execution_providers: vec![ExecutionProvider::default()],
+        }
+    }
+}
+
+/// Cache key for a runtime session.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SessionKey {
+    /// Graph payload index.
+    pub graph_idx: usize,
+    /// Session options used to build the ORT session.
+    pub options: SessionOptions,
+}
+
+impl SessionKey {
+    /// Build a cache key from a graph index and options.
+    #[must_use]
+    pub fn new(graph_idx: usize, options: SessionOptions) -> Self {
+        Self { graph_idx, options }
+    }
+}
+
+/// Metadata for one graph input or output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValueInfo {
+    /// Input/output name.
+    pub name: String,
+    /// Human-readable ORT value type.
+    pub value_type: String,
+}
+
+impl ValueInfo {
+    fn from_outlet(outlet: &Outlet) -> Self {
+        Self {
+            name: outlet.name().to_string(),
+            value_type: outlet.dtype().to_string(),
+        }
+    }
+}
+
+/// Owned tensor value accepted by and returned from `rsmf-runtime`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RuntimeTensor {
+    /// F32 tensor.
+    F32 { shape: Vec<usize>, data: Vec<f32> },
+    /// F64 tensor.
+    F64 { shape: Vec<usize>, data: Vec<f64> },
+    /// I64 tensor.
+    I64 { shape: Vec<usize>, data: Vec<i64> },
+    /// I32 tensor.
+    I32 { shape: Vec<usize>, data: Vec<i32> },
+    /// U8 tensor.
+    U8 { shape: Vec<usize>, data: Vec<u8> },
+    /// I8 tensor.
+    I8 { shape: Vec<usize>, data: Vec<i8> },
+    /// Boolean tensor.
+    Bool { shape: Vec<usize>, data: Vec<bool> },
+}
+
+impl RuntimeTensor {
+    fn into_ort_value(self) -> Result<DynValue> {
+        match self {
+            RuntimeTensor::F32 { shape, data } => tensor_from_vec(shape, data),
+            RuntimeTensor::F64 { shape, data } => tensor_from_vec(shape, data),
+            RuntimeTensor::I64 { shape, data } => tensor_from_vec(shape, data),
+            RuntimeTensor::I32 { shape, data } => tensor_from_vec(shape, data),
+            RuntimeTensor::U8 { shape, data } => tensor_from_vec(shape, data),
+            RuntimeTensor::I8 { shape, data } => tensor_from_vec(shape, data),
+            RuntimeTensor::Bool { shape, data } => tensor_from_vec(shape, data),
+        }
+    }
+}
+
+/// Named input tensor map.
+pub type RuntimeInputs = HashMap<String, RuntimeTensor>;
+
+/// Named output tensor map.
+pub type RuntimeOutputs = HashMap<String, RuntimeTensor>;
+
+/// Cached ORT session handle.
+#[derive(Clone, Debug)]
+pub struct SessionHandle {
+    key: SessionKey,
+    session: Arc<Mutex<Session>>,
+    inputs: Vec<ValueInfo>,
+    outputs: Vec<ValueInfo>,
+}
+
+impl SessionHandle {
+    /// Cache key used to create this session.
+    #[must_use]
+    pub fn key(&self) -> &SessionKey {
+        &self.key
+    }
+
+    /// Graph input metadata captured when the session was built.
+    #[must_use]
+    pub fn inputs(&self) -> &[ValueInfo] {
+        &self.inputs
+    }
+
+    /// Graph output metadata captured when the session was built.
+    #[must_use]
+    pub fn outputs(&self) -> &[ValueInfo] {
+        &self.outputs
+    }
+
+    /// Run this cached session with owned runtime tensors.
+    pub fn run(&self, inputs: RuntimeInputs) -> Result<RuntimeOutputs> {
+        let ort_inputs = inputs
+            .into_iter()
+            .map(|(name, tensor)| Ok((name, tensor.into_ort_value()?)))
+            .collect::<Result<Vec<_>>>()?;
+        let mut session = self.lock_session()?;
+        let outputs = session
+            .run(ort_inputs)
+            .map_err(|e| ort_error("session run", e))?;
+        materialize_outputs(outputs)
+    }
+
+    fn lock_session(&self) -> Result<MutexGuard<'_, Session>> {
+        self.session
+            .lock()
+            .map_err(|_| RuntimeError::SessionPoisoned)
+    }
+}
+
 /// High-level inference engine for RSMF files.
 pub struct Engine {
     file: RsmfFile,
+    cache: Mutex<HashMap<SessionKey, SessionHandle>>,
 }
 
 impl Engine {
-    /// Create a new Engine from an RSMF file.
+    /// Create a new engine from an opened RSMF file.
     pub fn new(file: RsmfFile) -> Result<Self> {
-        Ok(Self { file })
+        Ok(Self {
+            file,
+            cache: Mutex::new(HashMap::new()),
+        })
     }
 
     /// Return the underlying RSMF file.
+    #[must_use]
     pub fn file(&self) -> &RsmfFile {
         &self.file
     }
 
-    /// Create an ONNX Runtime session from the graph at the specified index.
+    /// Create a fresh default ONNX Runtime session for compatibility with the
+    /// original runtime API.
+    ///
+    /// Prefer [`Self::session_handle`] for production callers that want cached
+    /// sessions and metadata.
     pub fn session(&self, graph_idx: usize) -> Result<Session> {
         #[cfg(feature = "tracing")]
         let _span = info_span!("Engine::session", graph_idx).entered();
 
-        let payloads = self.file.graph_payloads();
-        let payload = payloads.get(graph_idx).ok_or_else(|| {
-            rsmf_core::error::RsmfError::not_found(format!("graph at index {}", graph_idx))
-        })?;
-
-        Session::builder()
-            .map_err(|e| {
-                rsmf_core::error::RsmfError::unsupported(format!("ort session builder failed: {e}"))
-            })?
-            .commit_from_memory(payload.bytes)
-            .map_err(|e| {
-                rsmf_core::error::RsmfError::unsupported(format!(
-                    "ort session creation failed: {e}"
-                ))
-            })
+        self.build_session(graph_idx, &SessionOptions::default())
     }
 
-    /// Run inference on a graph with flexible inputs.
-    pub fn run_session<'a>(
+    /// Return a cached session handle for `graph_idx` and `options`.
+    pub fn session_handle(
         &self,
-        session: &'a mut Session,
-        inputs: Vec<(&str, ort::value::Value)>,
-    ) -> Result<ort::session::SessionOutputs<'a>> {
+        graph_idx: usize,
+        options: SessionOptions,
+    ) -> Result<SessionHandle> {
         #[cfg(feature = "tracing")]
-        let _span = info_span!("Engine::run_session").entered();
+        let _span = info_span!("Engine::session_handle", graph_idx).entered();
 
-        session
-            .run(inputs)
-            .map_err(|e| rsmf_core::error::RsmfError::unsupported(format!("ort run failed: {e}")))
+        let key = SessionKey::new(graph_idx, options);
+        let mut cache = self.cache.lock().map_err(|_| RuntimeError::CachePoisoned)?;
+        if let Some(handle) = cache.get(&key) {
+            return Ok(handle.clone());
+        }
+
+        let session = self.build_session(key.graph_idx, &key.options)?;
+        let handle = SessionHandle {
+            inputs: session
+                .inputs()
+                .iter()
+                .map(ValueInfo::from_outlet)
+                .collect(),
+            outputs: session
+                .outputs()
+                .iter()
+                .map(ValueInfo::from_outlet)
+                .collect(),
+            session: Arc::new(Mutex::new(session)),
+            key: key.clone(),
+        };
+        cache.insert(key, handle.clone());
+        Ok(handle)
     }
 
-    /// Simple run helper for F32 models.
+    /// Run a graph using a cached session.
+    pub fn run(
+        &self,
+        graph_idx: usize,
+        options: SessionOptions,
+        inputs: RuntimeInputs,
+    ) -> Result<RuntimeOutputs> {
+        #[cfg(feature = "tracing")]
+        let _span = info_span!("Engine::run", graph_idx).entered();
+
+        self.session_handle(graph_idx, options)?.run(inputs)
+    }
+
+    /// Convenience helper for F32 models.
     pub fn run_f32(
         &self,
         graph_idx: usize,
         inputs: HashMap<String, ArrayD<f32>>,
     ) -> Result<HashMap<String, ArrayD<f32>>> {
-        let mut session = self.session(graph_idx)?;
+        let runtime_inputs = inputs
+            .into_iter()
+            .map(|(name, array)| {
+                let shape = array.shape().to_vec();
+                let data = array.iter().copied().collect();
+                (name, RuntimeTensor::F32 { shape, data })
+            })
+            .collect();
+        let outputs = self.run(graph_idx, SessionOptions::default(), runtime_inputs)?;
+        outputs
+            .into_iter()
+            .map(|(name, tensor)| match tensor {
+                RuntimeTensor::F32 { shape, data } => {
+                    let array = ArrayD::from_shape_vec(shape, data).map_err(|e| {
+                        RuntimeError::Shape(format!("F32 output {name} shape mismatch: {e}"))
+                    })?;
+                    Ok((name, array))
+                }
+                other => Err(RuntimeError::UnsupportedDtype(format!(
+                    "run_f32 expected F32 output, got {}",
+                    runtime_tensor_kind(&other)
+                ))),
+            })
+            .collect()
+    }
 
-        let mut ort_inputs = Vec::new();
-        for (name, array) in &inputs {
-            let val = ort::value::Value::from_array(array.clone()).map_err(|e| {
-                rsmf_core::error::RsmfError::unsupported(format!("ort value creation failed: {e}"))
-            })?;
-            ort_inputs.push((name.as_str(), val.into()));
+    fn build_session(&self, graph_idx: usize, options: &SessionOptions) -> Result<Session> {
+        let payloads = self.file.graph_payloads();
+        let payload = payloads.get(graph_idx).ok_or(RuntimeError::GraphNotFound {
+            graph_idx,
+            graph_count: payloads.len(),
+        })?;
+
+        let mut builder = Session::builder().map_err(|e| ort_error("session builder", e))?;
+        builder = builder
+            .with_optimization_level(options.graph_optimization.into())
+            .map_err(|e| ort_error("set graph optimization level", e))?;
+        builder = builder
+            .with_parallel_execution(options.parallel_execution)
+            .map_err(|e| ort_error("set execution mode", e))?;
+        builder = builder
+            .with_memory_pattern(options.memory_pattern)
+            .map_err(|e| ort_error("set memory pattern", e))?;
+        builder = builder
+            .with_deterministic_compute(options.deterministic_compute)
+            .map_err(|e| ort_error("set deterministic compute", e))?;
+
+        if let Some(threads) = options.intra_threads {
+            builder = builder
+                .with_intra_threads(threads)
+                .map_err(|e| ort_error("set intra-op threads", e))?;
+        }
+        if let Some(threads) = options.inter_threads {
+            builder = builder
+                .with_inter_threads(threads)
+                .map_err(|e| ort_error("set inter-op threads", e))?;
         }
 
-        let outputs = self.run_session(&mut session, ort_inputs)?;
-
-        let mut result = HashMap::new();
-        for (name, value) in outputs.iter() {
-            let (shape, data) = value.try_extract_tensor::<f32>().map_err(|e| {
-                rsmf_core::error::RsmfError::unsupported(format!("ort extract failed: {e}"))
-            })?;
-
-            let shape_vec: Vec<usize> = shape.iter().map(|&d| d as usize).collect();
-            let array = ArrayD::from_shape_vec(shape_vec, data.to_vec()).map_err(|e| {
-                rsmf_core::error::RsmfError::structural(format!("ort extract shape mismatch: {e}"))
-            })?;
-
-            result.insert(name.to_string(), array);
+        let execution_providers = options
+            .execution_providers
+            .iter()
+            .map(|provider| match provider {
+                ExecutionProvider::Cpu { arena } => CPUExecutionProvider::default()
+                    .with_arena_allocator(*arena)
+                    .build(),
+            })
+            .collect::<Vec<_>>();
+        if !execution_providers.is_empty() {
+            builder = builder
+                .with_execution_providers(execution_providers)
+                .map_err(|e| ort_error("register execution providers", e))?;
         }
 
-        Ok(result)
+        builder
+            .commit_from_memory(payload.bytes)
+            .map_err(|e| ort_error("session creation", e))
     }
 }
 
 /// Helper to convert an RSMF `TensorView` into an `ndarray::ArrayViewD`.
 pub fn tensor_view_to_ndarray<'a>(view: &'a TensorView<'a>) -> Result<ArrayViewD<'a, f32>> {
     if view.dtype() != LogicalDtype::F32 {
-        return Err(rsmf_core::error::RsmfError::unsupported(format!(
-            "Only F32 tensors supported for ndarray conversion, got {:?}",
+        return Err(RuntimeError::UnsupportedDtype(format!(
+            "only F32 tensors support zero-copy ndarray conversion, got {:?}",
             view.dtype()
         )));
     }
 
-    let shape: Vec<usize> = view.shape().iter().map(|&s| s as usize).collect();
+    let shape: Vec<usize> = view
+        .shape()
+        .iter()
+        .map(|&dim| {
+            usize::try_from(dim).map_err(|_| {
+                RuntimeError::Shape(format!("tensor dimension {dim} exceeds usize::MAX"))
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
     let data = view.as_slice::<f32>()?;
 
-    ArrayViewD::from_shape(shape, data).map_err(|e| {
-        rsmf_core::error::RsmfError::structural(format!("ndarray shape mismatch: {e}"))
+    ArrayViewD::from_shape(shape, data)
+        .map_err(|e| RuntimeError::Shape(format!("ndarray shape mismatch: {e}")))
+}
+
+fn tensor_from_vec<T>(shape: Vec<usize>, data: Vec<T>) -> Result<DynValue>
+where
+    T: ort::value::PrimitiveTensorElementType + Clone + Debug + 'static,
+{
+    let expected = shape.iter().try_fold(1usize, |acc, &dim| {
+        acc.checked_mul(dim)
+            .ok_or_else(|| RuntimeError::Shape("runtime tensor element count overflow".to_string()))
+    })?;
+    if expected != data.len() {
+        return Err(RuntimeError::Shape(format!(
+            "shape {:?} implies {expected} elements, got {}",
+            shape,
+            data.len()
+        )));
+    }
+    Tensor::<T>::from_array((shape, data.into_boxed_slice()))
+        .map(|value| value.into_dyn())
+        .map_err(|e| ort_error("tensor value creation", e))
+}
+
+fn materialize_outputs(outputs: SessionOutputs<'_>) -> Result<RuntimeOutputs> {
+    outputs
+        .into_iter()
+        .map(|(name, value)| {
+            let tensor = match value.dtype().tensor_type() {
+                Some(TensorElementType::Float32) => materialize_tensor_f32(&value)?,
+                Some(TensorElementType::Float64) => materialize_tensor_f64(&value)?,
+                Some(TensorElementType::Int64) => materialize_tensor_i64(&value)?,
+                Some(TensorElementType::Int32) => materialize_tensor_i32(&value)?,
+                Some(TensorElementType::Uint8) => materialize_tensor_u8(&value)?,
+                Some(TensorElementType::Int8) => materialize_tensor_i8(&value)?,
+                Some(TensorElementType::Bool) => materialize_tensor_bool(&value)?,
+                Some(other) => {
+                    return Err(RuntimeError::UnsupportedDtype(other.to_string()));
+                }
+                None => {
+                    return Err(RuntimeError::UnsupportedDtype(value.dtype().to_string()));
+                }
+            };
+            Ok((name.to_string(), tensor))
+        })
+        .collect()
+}
+
+fn shape_to_usize(shape: &[i64]) -> Result<Vec<usize>> {
+    shape
+        .iter()
+        .map(|&dim| {
+            usize::try_from(dim).map_err(|_| {
+                RuntimeError::Shape(format!("output dimension {dim} cannot convert to usize"))
+            })
+        })
+        .collect()
+}
+
+fn materialize_tensor_f32(value: &DynValue) -> Result<RuntimeTensor> {
+    let (shape, data) = value
+        .try_extract_tensor::<f32>()
+        .map_err(|e| ort_error("extract f32 tensor", e))?;
+    Ok(RuntimeTensor::F32 {
+        shape: shape_to_usize(shape)?,
+        data: data.to_vec(),
     })
+}
+
+fn materialize_tensor_f64(value: &DynValue) -> Result<RuntimeTensor> {
+    let (shape, data) = value
+        .try_extract_tensor::<f64>()
+        .map_err(|e| ort_error("extract f64 tensor", e))?;
+    Ok(RuntimeTensor::F64 {
+        shape: shape_to_usize(shape)?,
+        data: data.to_vec(),
+    })
+}
+
+fn materialize_tensor_i64(value: &DynValue) -> Result<RuntimeTensor> {
+    let (shape, data) = value
+        .try_extract_tensor::<i64>()
+        .map_err(|e| ort_error("extract i64 tensor", e))?;
+    Ok(RuntimeTensor::I64 {
+        shape: shape_to_usize(shape)?,
+        data: data.to_vec(),
+    })
+}
+
+fn materialize_tensor_i32(value: &DynValue) -> Result<RuntimeTensor> {
+    let (shape, data) = value
+        .try_extract_tensor::<i32>()
+        .map_err(|e| ort_error("extract i32 tensor", e))?;
+    Ok(RuntimeTensor::I32 {
+        shape: shape_to_usize(shape)?,
+        data: data.to_vec(),
+    })
+}
+
+fn materialize_tensor_u8(value: &DynValue) -> Result<RuntimeTensor> {
+    let (shape, data) = value
+        .try_extract_tensor::<u8>()
+        .map_err(|e| ort_error("extract u8 tensor", e))?;
+    Ok(RuntimeTensor::U8 {
+        shape: shape_to_usize(shape)?,
+        data: data.to_vec(),
+    })
+}
+
+fn materialize_tensor_i8(value: &DynValue) -> Result<RuntimeTensor> {
+    let (shape, data) = value
+        .try_extract_tensor::<i8>()
+        .map_err(|e| ort_error("extract i8 tensor", e))?;
+    Ok(RuntimeTensor::I8 {
+        shape: shape_to_usize(shape)?,
+        data: data.to_vec(),
+    })
+}
+
+fn materialize_tensor_bool(value: &DynValue) -> Result<RuntimeTensor> {
+    let (shape, data) = value
+        .try_extract_tensor::<bool>()
+        .map_err(|e| ort_error("extract bool tensor", e))?;
+    Ok(RuntimeTensor::Bool {
+        shape: shape_to_usize(shape)?,
+        data: data.to_vec(),
+    })
+}
+
+fn runtime_tensor_kind(tensor: &RuntimeTensor) -> &'static str {
+    match tensor {
+        RuntimeTensor::F32 { .. } => "F32",
+        RuntimeTensor::F64 { .. } => "F64",
+        RuntimeTensor::I64 { .. } => "I64",
+        RuntimeTensor::I32 { .. } => "I32",
+        RuntimeTensor::U8 { .. } => "U8",
+        RuntimeTensor::I8 { .. } => "I8",
+        RuntimeTensor::Bool { .. } => "Bool",
+    }
+}
+
+fn ort_error(stage: &'static str, error: impl std::fmt::Display) -> RuntimeError {
+    RuntimeError::Ort {
+        stage,
+        message: error.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rsmf_core::LogicalDtype;
+    use rsmf_core::writer::{RsmfWriter, TensorInput, VariantInput};
+    use tempfile::tempdir;
+
+    #[test]
+    fn session_options_participate_in_cache_key() {
+        let default_key = SessionKey::new(0, SessionOptions::default());
+        let tuned_key = SessionKey::new(
+            0,
+            SessionOptions {
+                intra_threads: Some(1),
+                ..SessionOptions::default()
+            },
+        );
+        assert_ne!(default_key, tuned_key);
+    }
+
+    #[test]
+    fn tensor_value_shape_mismatch_is_rejected() {
+        let err = RuntimeTensor::F32 {
+            shape: vec![2, 2],
+            data: vec![1.0, 2.0, 3.0],
+        }
+        .into_ort_value()
+        .unwrap_err();
+        assert!(
+            matches!(err, RuntimeError::Shape(message) if message.contains("implies 4 elements"))
+        );
+    }
+
+    #[test]
+    fn missing_graph_index_is_typed_error() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("no-graph.rsmf");
+        RsmfWriter::new()
+            .with_tensor(TensorInput {
+                name: "x".to_string(),
+                dtype: LogicalDtype::F32,
+                shape: vec![1],
+                shard_id: 0,
+                metadata: Vec::new(),
+                canonical: VariantInput::canonical_raw(1.0f32.to_le_bytes().to_vec()),
+                packed: Vec::new(),
+            })
+            .write_to_path(&path)
+            .unwrap();
+        let engine = Engine::new(RsmfFile::open(path).unwrap()).unwrap();
+
+        let err = engine
+            .session_handle(0, SessionOptions::default())
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            RuntimeError::GraphNotFound {
+                graph_idx: 0,
+                graph_count: 0
+            }
+        ));
+    }
 }
