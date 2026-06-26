@@ -429,6 +429,24 @@ normally. Readers that want grouped expert metadata can walk
 `docs/CONVENTIONS.md` → *Mixture-of-Experts* for the key list and validation
 rules.
 
+## 8.2 Tier / precision intent metadata
+
+Tier intent is represented as per-variant metadata, not as a new descriptor
+field. A packed variant may carry:
+
+- `tier.intent`: `vram`, `ram`, or `nvme`.
+- `tier.class`: optional non-empty label such as `hot`, `warm`, or `cold`.
+
+Readers MUST reject unknown `tier.intent` values and duplicate `tier.intent` or
+`tier.class` keys. Tier-unaware readers ignore these keys and continue to use
+the standard variant descriptors and arena bytes.
+
+Tier-aware selection is a filter layered over the existing backend/mode scoring:
+if a requested tier has at least one candidate for a tensor, the selector scores
+only those candidates; otherwise it falls back to the existing backend-only
+selection for that tensor. This preserves current behavior for files without
+tier metadata.
+
 ---
 
 ## 9. Writer paths and feature matrix

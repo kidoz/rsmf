@@ -132,6 +132,7 @@ rsmf pack --from-npy embeddings.npy \
 rsmf inspect  model.rsmf
 rsmf verify   model.rsmf --full
 rsmf select   model.rsmf --mode cpu
+rsmf select   model.rsmf --mode gpu --tier nvme --assume-wgpu
 rsmf extract  model.rsmf --tensor embedding.weight out.bin
 rsmf extract-asset model.rsmf --name tokenizer.json tokenizer.json
 rsmf export safetensors model.rsmf model.safetensors

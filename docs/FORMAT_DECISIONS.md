@@ -86,6 +86,19 @@ not understand it can preserve the custom payload and still read the model.
 The batch writer can emit it directly, and `rsmf placement set` can append or
 replace it without requiring external shard files.
 
+## D13 — Tier intent as per-variant metadata
+
+Tier / precision intent uses `VariantMeta.extra` keys instead of adding fields
+to `VariantDescriptor`: `tier.intent` names the residency tier (`vram`, `ram`,
+`nvme`) and `tier.class` carries an optional hot/warm/cold-style label. This
+keeps the binary layout unchanged and preserves v1 compatibility.
+
+The selector treats a requested tier as an additional preference layer over the
+existing backend/mode score. If matching tier-tagged variants exist for a
+tensor, the normal scorer runs over that subset; otherwise it falls back to the
+pre-existing backend-only behavior. Files without tier metadata therefore select
+exactly as before.
+
 ## D8 — Source-format conversion priorities
 
 The `rsmf pack` and `rsmf import` CLIs ingest from a fixed priority-ordered

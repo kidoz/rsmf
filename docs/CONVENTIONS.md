@@ -28,6 +28,7 @@ namespace are writer-specific and should be avoided in published files.
 | `weight.*` | Weight semantics | Per-tensor metadata |
 | `shape.*` | Logical-vs-physical shape info | Per-tensor metadata |
 | `variant.*` | Per-variant annotations | Per-variant metadata |
+| `tier.*` | Variant residency / access tier hints | Per-variant metadata |
 | `graph.*` | Graph-payload hints | Per-graph metadata |
 | `asset.*` | Asset-payload hints | Per-asset metadata |
 | `adapter.*` | LoRA / DoRA / IA³ adapter tensors | Manifest (global) + per-tensor metadata |
@@ -90,17 +91,27 @@ Keys can also appear on variant metadata when quantization is per-variant.
 
 ---
 
-## Variant-level (`variant.*`, `bench.*`)
+## Variant-level (`variant.*`, `tier.*`, `bench.*`)
 
 | Key | Value |
 |---|---|
 | `variant.created_with` | Specific tool + version that emitted this variant. |
 | `variant.calibration_error` | Decimal string. Scheme-specific metric (L2, KL, SNR). |
+| `tier.intent` | Intended residency tier for this variant: `vram`, `ram`, or `nvme`. Used by tier-aware variant selection. |
+| `tier.class` | Optional access/precision class label. Recommended values: `hot`, `warm`, `cold`; unknown non-empty strings are preserved. |
 | `bench.decode_ns_per_elem` | Measured decode speed. |
 | `bench.env` | Free-form hardware/software fingerprint. `M2-Max macOS-15 rustc-1.85 release`. |
 
 Per-variant `quant.*` keys may appear too (see above) when the variant
 is a new quantization rather than a raw reinterpretation.
+
+Tier-aware selection is conjunctive with backend scoring. When callers request
+`--tier nvme`, the selector first considers variants carrying
+`tier.intent=nvme`; among those, normal backend/mode scoring still decides the
+winner. If a tensor has no variant for the requested tier, selection falls back
+to the existing backend-only behavior for that tensor. Readers reject malformed
+`tier.intent` values and duplicate `tier.intent` / `tier.class` keys with a
+structural error.
 
 ---
 
