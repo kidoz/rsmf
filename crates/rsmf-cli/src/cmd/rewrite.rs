@@ -21,7 +21,8 @@ use std::path::PathBuf;
 use anyhow::anyhow;
 use rsmf_core::manifest::GraphKind;
 use rsmf_core::{
-    AssetInput, GraphInput, RsmfFile, RsmfWriter, TargetTag, TensorInput, VariantInput,
+    AssetInput, CustomSectionInput, GraphInput, RsmfFile, RsmfWriter, TargetTag, TensorInput,
+    VariantInput,
     writer::{DEFAULT_ASSETS_ALIGNMENT, DEFAULT_GRAPH_ALIGNMENT},
 };
 
@@ -238,6 +239,12 @@ pub fn run(args: Args) -> Result<(), CliError> {
         }
     }
 
+    for custom in src.custom_sections()? {
+        writer = writer.with_custom_section(
+            CustomSectionInput::new(custom.kind, custom.bytes).with_alignment(custom.alignment),
+        );
+    }
+
     writer.write_to_path(&args.output)?;
 
     println!(
@@ -266,6 +273,15 @@ fn run_streaming(args: Args) -> Result<(), CliError> {
     let strip_all_assets = strip_assets.contains("*");
 
     let src = RsmfFile::open(&args.input)?;
+    if src
+        .sections()
+        .iter()
+        .any(|section| section.kind.is_custom())
+    {
+        return Err(CliError::user(anyhow!(
+            "--stream does not support custom sections yet"
+        )));
+    }
     let mut writer = rsmf_core::StreamingRsmfWriter::new(&args.output)?;
 
     for (k, v) in &src.manifest().metadata {

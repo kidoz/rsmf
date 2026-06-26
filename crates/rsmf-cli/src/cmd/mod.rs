@@ -9,6 +9,7 @@ pub mod extract_asset;
 pub mod import;
 pub mod inspect;
 pub mod pack;
+pub mod placement;
 pub mod rewrite;
 pub mod select;
 pub mod verify;
@@ -32,6 +33,8 @@ pub enum Command {
     Verify(verify::Args),
     /// Pack tensors from a source format (currently safetensors, GGUF, NPY) into RSMF.
     Pack(pack::Args),
+    /// Inspect or set placement metadata.
+    Placement(placement::Args),
     /// Export tensors from RSMF into another model container format.
     Export(export::Args),
     /// Extract a single tensor's canonical bytes to a file.
@@ -55,6 +58,7 @@ impl Command {
             Self::Inspect(args) => inspect::run(args),
             Self::Verify(args) => verify::run(args),
             Self::Pack(args) => pack::run(args),
+            Self::Placement(args) => placement::run(args),
             Self::Export(args) => export::run(args),
             Self::Extract(args) => extract::run(args),
             Self::ExtractAsset(args) => extract_asset::run(args),
