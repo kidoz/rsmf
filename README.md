@@ -15,7 +15,7 @@ A Rust-native binary container for machine-learning model tensors with:
 - a portable WGPU upload path,
 - opaque ONNX / ORT graph payload (no new graph IR),
 - BLAKE3 integrity checks, quick or full,
-- a CLI for inspect / verify / pack / extract / select,
+- a CLI for inspect / verify / pack / extract / select / placement,
 - PyO3 bindings with NumPy-friendly tensor access (dequantizes Q4_0 / Q8_0 / NF4 / F16 / BF16 to `float32`).
 
 Format version **1.0**. Full specification in [`docs/SPEC.md`](docs/SPEC.md); architecture in
@@ -142,6 +142,36 @@ Use `--target <tag>` to export a packed variant instead of the canonical
 variant, and `--decode-f32` when that variant is stored in a packed /
 quantized representation. Raw row-major tensors export byte-for-byte; decoded
 tensors are materialized as F32 safetensors payloads.
+
+### Placement manifests
+
+Placement metadata is an optional `Custom(128)` section that tells runtimes
+where shard ids should live. Add or replace it from a TOML plan:
+
+```toml
+[[devices]]
+id = 0
+kind = "cuda"
+tier = "vram"
+capacity_bytes = 25769803776
+
+[[devices]]
+id = 1
+kind = "cpu"
+tier = "ram"
+
+[[placements]]
+shard_id = 0
+primary_device = 0
+prefetch_priority = 10
+flags = ["pin"]
+replicas = [1]
+```
+
+```sh
+rsmf placement set model.rsmf --plan placement.toml
+rsmf placement inspect model.rsmf
+```
 
 ### Rewrite: ship a smaller artifact by stripping dev-only variants / assets
 

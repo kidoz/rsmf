@@ -28,6 +28,8 @@ issue.
 +---------------------------------------------------+
 | 6  Asset section                       (optional) |
 +---------------------------------------------------+
+| 7  Custom ancillary sections           (optional) |
++---------------------------------------------------+
 ```
 
 The **batch writer** (`crate::RsmfWriter`) emits sections in the order
@@ -87,7 +89,7 @@ length zero are rejected.
 | `4`  | `Graph`          | At most one; opaque ONNX / ORT bytes. |
 | `5`  | `Assets`         | At most one; concatenated named assets. |
 | `6..127` | *reserved*   | Rejected with `Structural` until promoted. |
-| `>= 128` | `Custom(raw)` | Vendor / user-defined ancillary section; readers MUST preserve on round-trip but are not required to understand the bytes. Mirrors PNG's "ancillary chunk" convention. |
+| `>= 128` | `Custom(raw)` | Vendor / user-defined ancillary section; readers MUST preserve on round-trip but are not required to understand the bytes. Mirrors PNG's "ancillary chunk" convention. `128` is reserved by RSMF for `PlacementManifest` (§4.7). |
 
 ### 3.2 Section flag bits
 
@@ -235,6 +237,57 @@ Readers that do not support sharding MUST fail open with a typed error
 on any tensor whose `shard_id != 0` when the corresponding shard has
 not been attached, rather than silently falling back to the master's
 placeholder bytes.
+
+### 4.7 `PlacementManifest` custom section
+
+`SectionKind::Custom(128)` is the RSMF placement manifest section. It is
+optional and there MUST be at most one such section in a file. The payload is
+not compressed in v1; readers that see bit `0x1` set on this section MUST
+return `Unsupported`.
+
+The placement manifest describes where shard ids should be staged or kept by a
+runtime. It does not change tensor bytes or variant selection, and readers that
+do not understand it can still read the model data normally.
+
+Payload fields are little-endian and use the same `StringMap` encoding as the
+manifest section:
+
+| Field | Type | Description |
+|---|---|---|
+| `version` | `u32` | Placement payload version, currently `1`. |
+| `reserved` | `u32` | MUST be zero. |
+| `metadata` | `StringMap` | Free-form placement metadata. |
+| `device_count` | `u32` | Number of device descriptors. |
+| `devices` | repeated | `device_count` × `DeviceDescriptor`. |
+| `placement_count` | `u32` | Number of placement records. |
+| `placements` | repeated | `placement_count` × `PlacementRecord`. |
+
+`DeviceDescriptor`:
+
+| Field | Type | Description |
+|---|---|---|
+| `id` | `u32` | Device id referenced by placements; unique within the section. |
+| `kind` | `u8` | `0=cpu`, `1=cuda`, `2=rocm_hip`, `3=wgpu`, `4=metal`. |
+| `tier` | `u8` | `0=vram`, `1=ram`, `2=nvme`. |
+| `reserved` | `u16` | MUST be zero. |
+| `capacity_bytes` | `u64` | Capacity hint; `0` means unknown. |
+| `bandwidth_mbps` | `u64` | Bandwidth hint; `0` means unknown. |
+| `metadata` | `StringMap` | Free-form device metadata. |
+
+`PlacementRecord`:
+
+| Field | Type | Description |
+|---|---|---|
+| `shard_id` | `u64` | Tensor shard id this record applies to. `0` means the master file arena. Non-zero ids MUST appear on at least one tensor descriptor. |
+| `primary_device` | `u32` | Device id for the preferred placement target. |
+| `prefetch_priority` | `u16` | Runtime-defined priority; lower-level scheduling semantics are outside the format. |
+| `flags` | `u16` | `0x1=pin`, `0x2=cold`; unknown bits are rejected. |
+| `replica_count` | `u32` | Number of replica device ids. |
+| `replicas` | `u32[]` | Device ids for secondary placements. |
+
+Readers MUST reject duplicate device ids, unknown device/tier/flag values,
+missing primary or replica device ids, trailing payload bytes, and placement
+records for non-zero shard ids not referenced by any tensor.
 
 ---
 

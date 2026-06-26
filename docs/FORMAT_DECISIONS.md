@@ -72,6 +72,20 @@ The typed `RsmfFile::moe_experts()` accessor validates decimal fields and
 groups tensors by layer, expert id, shared flag, and role for runtimes that
 need expert routing metadata.
 
+## D12 — PlacementManifest as Custom(128)
+
+Shard/device placement is represented by an optional
+`SectionKind::Custom(128)` payload rather than a promoted standard section kind.
+The section carries a typed binary `PlacementManifest` with device descriptors,
+per-shard placement records, and small runtime hints such as pin/cold flags.
+
+This is intentionally additive: it does not change tensor bytes, manifest
+descriptors, variant selection, or the format version. Readers that understand
+the section validate it against `TensorDescriptor.shard_id`; readers that do
+not understand it can preserve the custom payload and still read the model.
+The batch writer can emit it directly, and `rsmf placement set` can append or
+replace it without requiring external shard files.
+
 ## D8 — Source-format conversion priorities
 
 The `rsmf pack` and `rsmf import` CLIs ingest from a fixed priority-ordered
