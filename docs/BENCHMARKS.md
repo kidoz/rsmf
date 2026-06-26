@@ -75,6 +75,21 @@ returns without failing the run.
 
 Source: `crates/rsmf-bench/benches/wgpu_upload.rs`.
 
+### `moe_dispatch`
+
+Measures host-side dispatch grouping:
+
+- builds a deterministic stream of 4096 token → expert assignments,
+- calls `rsmf_moe_runtime::batch_by_destination`,
+- reports throughput as tokens/second through Criterion's `Throughput::Elements`.
+
+This isolates the routing-to-batch step. End-to-end MoE layer timings are exposed
+per run through `MoeRunReport` (`gating_time`, `dispatch_time`, `compute_time`,
+`combine_time`, and `tokens_per_second()`), because those timings depend on the
+fixture's expert dimensions and whether shard bytes fault from storage.
+
+Source: `crates/rsmf-bench/benches/moe_dispatch.rs`.
+
 ## Methodology
 
 - **Cache effects:** the fixture is 1 MiB. On M-series Apple Silicon it
@@ -96,6 +111,8 @@ in this envelope:
 rsmf_open                 time:   [120 µs  125 µs  130 µs]
 rsmf_tensor_view_first_byte
                           time:   [ 45 ns   47 ns   49 ns]
+moe_dispatch/batch_by_destination
+                          thrpt:  [millions of tokens/s on laptop CPU]
 ```
 
 When filing performance regressions, include the CPU model, OS, `rustc
@@ -115,4 +132,3 @@ used `--save-baseline`).
   To exercise the multi-variant / compressed / sharded paths, pack a larger
   real model with the `rsmf` CLI and measure `RsmfFile::open` + `tensor_view`
   directly from your own harness.
-

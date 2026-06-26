@@ -16,6 +16,7 @@ anyhow.workspace = true
 [dev-dependencies]
 criterion.workspace = true
 tempfile.workspace = true
+rsmf-moe-runtime.workspace = true
 
 [features]
 default = []
@@ -46,3 +47,7 @@ harness = false
 name = "wgpu_upload"
 harness = false
 required-features = ["wgpu"]
+
+[[bench]]
+name = "moe_dispatch"
+harness = false
