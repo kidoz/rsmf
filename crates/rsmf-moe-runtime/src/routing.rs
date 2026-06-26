@@ -1,5 +1,7 @@
 //! Routing helpers for host-side MoE dispatch.
 
+use std::collections::HashMap;
+
 /// Tokens grouped by destination expert.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RoutingBatch {
@@ -16,10 +18,12 @@ pub struct RoutingBatch {
 #[must_use]
 pub fn batch_by_destination(assignments: &[u32]) -> Vec<RoutingBatch> {
     let mut out: Vec<RoutingBatch> = Vec::new();
+    let mut positions: HashMap<u32, usize> = HashMap::new();
     for (token_idx, &expert_id) in assignments.iter().enumerate() {
-        if let Some(batch) = out.iter_mut().find(|batch| batch.expert_id == expert_id) {
-            batch.token_indices.push(token_idx);
+        if let Some(&batch_idx) = positions.get(&expert_id) {
+            out[batch_idx].token_indices.push(token_idx);
         } else {
+            positions.insert(expert_id, out.len());
             out.push(RoutingBatch {
                 expert_id,
                 token_indices: vec![token_idx],
