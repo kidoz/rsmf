@@ -121,7 +121,12 @@ jobs:
 
       - name: Build and install the rsmf Python extension
         working-directory: crates/rsmf-python
-        run: maturin develop --release
+        # `maturin develop` requires an active virtualenv, which the runner
+        # does not provide. Build a wheel and install it into the toolcache
+        # interpreter that already has pytest/numpy, mirroring wheel-build.
+        run: |
+          maturin build --release --out dist
+          pip install --no-index --find-links dist rsmf
 
       - name: Build the rsmf CLI (needed by conftest fixtures)
         run: cargo build -p rsmf-cli --release
