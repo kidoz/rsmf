@@ -227,11 +227,31 @@ the variant bytes for that tensor:
   validation passes; the bytes at that position in the master are
   placeholder and will not be read once a shard is attached.
 
-v1 does **not** mandate or define a writer-side sharding API. Producers
-wanting sharded output must manually build the master's placeholder
-arena and emit each shard as a raw byte buffer. A first-class writer
-API and a reference packing scheme are explicitly deferred to a future
-format version.
+The reference writer API emits one master plus `N` raw shard files. Shard ids
+are assigned from `1..=N`; `0` remains reserved for master-resident tensors. For
+every tensor assigned to a non-zero shard id:
+
+- all of that tensor's variants are copied into the same raw shard buffer;
+- each variant's `section_relative_offset` is rewritten to the byte offset
+  inside that shard buffer, aligned to the variant's declared alignment;
+- each variant checksum is the BLAKE3-128 digest of the external shard bytes;
+- the master arena sections contain zero-filled placeholder bytes large enough
+  for structural validation, and section checksums cover those placeholder
+  bytes.
+
+Because shard reads use only `section_relative_offset`, the reference writer
+allocates offsets from one shard-local address space across canonical and packed
+variants. This prevents canonical and packed variants for the same tensor from
+colliding at offset `0` in the raw shard buffer. The `section_kind` and
+`section_index` fields remain meaningful for unsharded readers and structural
+validation, but sharded variant byte lookup is controlled by `shard_id` plus the
+variant's shard-local offset.
+
+The reference CLI exposes `rsmf shard <in.rsmf> --by {size,tier,expert}
+--shards N --out-dir DIR`. The `size` strategy greedily balances tensors by
+total variant bytes, `tier` groups tensors by the first `tier.intent` found on
+their variants, and `expert` groups tensors by `moe.layer`/`moe.expert`
+metadata. Full verification of a sharded master requires attaching every shard.
 
 Readers that do not support sharding MUST fail open with a typed error
 on any tensor whose `shard_id != 0` when the corresponding shard has
@@ -469,7 +489,7 @@ and the feature matrix is load-bearing for users deciding which to use.
 | zstd compression of arenas / graph / assets | yes (`compression` feature) | yes (`compression` feature) |
 | Bit-shuffle pre-processor for compressed f32 arenas (sets `SECTION_FLAG_BIT_SHUFFLED`) | yes | **no** — streaming path cannot bit-shuffle; flag is left clear and the reader skips the un-shuffle step |
 | Content-addressable dedup of identical variant bytes | yes (opt-in) | **no** |
-| Multi-file shard-aware output (`shard_id != 0`) | **no** in v1 | **no** in v1 |
+| Multi-file shard-aware output (`shard_id != 0`) | yes — via reference sharder | **no** in v1 |
 | Peak RSS independent of tensor size       | no — every payload must fit in memory | **yes** — payloads stream directly through `Read` handles |
 | On-disk section order                     | Manifest → Canonical → Packed → Graph → Assets | Canonical → Graph → Assets → Manifest |
 

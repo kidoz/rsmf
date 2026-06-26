@@ -99,6 +99,26 @@ tensor, the normal scorer runs over that subset; otherwise it falls back to the
 pre-existing backend-only behavior. Files without tier metadata therefore select
 exactly as before.
 
+## D14 — Reference writer-side sharding scheme
+
+Writer-side sharding is implemented as a reference repacker over the existing
+`TensorDescriptor.shard_id` semantics, not as a new wire format. The master file
+keeps structurally valid zero-filled tensor arenas, while variant descriptors for
+sharded tensors point at shard-local offsets and keep checksums of the external
+shard bytes. Full verification therefore requires attaching the shard files.
+
+The shard-local offset space is shared across all variants assigned to a shard,
+including canonical and packed variants. This avoids collisions that would occur
+if each arena independently started at offset zero while the reader indexes raw
+shard files by `section_relative_offset` alone. The existing `section_kind` and
+`section_index` fields are preserved for structural validation and unsharded
+fallback semantics.
+
+No format minor bump is required: this promotes the deferred writer API for the
+already-specified `shard_id != 0` path and preserves the existing reader
+contract. The reference CLI provides `--by size`, `--by tier`, and `--by expert`
+assignment strategies.
+
 ## D8 — Source-format conversion priorities
 
 The `rsmf pack` and `rsmf import` CLIs ingest from a fixed priority-ordered

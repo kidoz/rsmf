@@ -144,6 +144,20 @@ variant, and `--decode-f32` when that variant is stored in a packed /
 quantized representation. Raw row-major tensors export byte-for-byte; decoded
 tensors are materialized as F32 safetensors payloads.
 
+### Shard a packed model
+
+```sh
+rsmf shard model.rsmf --by size --shards 2 --out-dir ./sharded
+rsmf verify ./sharded/master.rsmf --full \
+            --shard 1=./sharded/shard-1.bin \
+            --shard 2=./sharded/shard-2.bin
+```
+
+`--by expert` groups tensors by `moe.layer` / `moe.expert`, `--by tier` groups
+by the first `tier.intent` found on a tensor's variants, and `--by size`
+greedily balances total variant bytes. The master keeps placeholder arena bytes;
+full checksum verification needs every shard attached.
+
 ### Placement manifests
 
 Placement metadata is an optional `Custom(128)` section that tells runtimes
