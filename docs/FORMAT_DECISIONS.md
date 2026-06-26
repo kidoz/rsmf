@@ -139,10 +139,11 @@ consumes existing `moe.*`, `prefetch.*`, `tier.*`, `shard_id`, and
 `PlacementManifest` data to validate the format slice end to end.
 
 The proof of concept runs host-side top-1 gating, batches tokens by destination
-expert, resolves expert shards through placement records, and compares against a
-single-device CPU reference. WGPU support is feature-gated and falls back to CPU
-when adapters are unavailable. No format version bump is required because the
-runtime adds no on-disk semantics.
+expert, resolves expert shards through placement records, runs expert matmuls on
+WGPU when the optional feature and an adapter are available, and compares
+against a single-device CPU reference. WGPU support falls back to CPU when
+adapters are unavailable. No format version bump is required because the runtime
+adds no on-disk semantics.
 
 ## D8 — Source-format conversion priorities
 

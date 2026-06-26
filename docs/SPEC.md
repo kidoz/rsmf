@@ -542,6 +542,8 @@ minimal one-layer MoE proof of concept:
 - token batching by `moe.expert`,
 - expert shard routing through `PlacementManifest`,
 - optional use of `prefetch.*` groups for report/planning metadata,
+- WGPU expert matmuls when the optional runtime feature and adapter are
+  available,
 - CPU reference execution for correctness.
 
 No activation payloads, network transport, graph IR, or runtime dispatch format

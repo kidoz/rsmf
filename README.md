@@ -208,8 +208,8 @@ cargo test -p rsmf-moe-runtime
 cargo test -p rsmf-moe-runtime --features wgpu
 ```
 
-The `wgpu` feature probes adapter availability and falls back cleanly to CPU
-when the requested placement cannot be backed by available adapters.
+The `wgpu` feature runs expert matmuls through WGPU when an adapter is
+available and falls back cleanly to CPU otherwise.
 
 ### Rewrite: ship a smaller artifact by stripping dev-only variants / assets
 

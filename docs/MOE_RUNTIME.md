@@ -19,13 +19,16 @@ For one MoE layer, the runtime:
 The reference path uses the same router and expert math without placement-based
 batching. Tests compare the two paths on a fixed 2-shard fixture.
 
-## GPU Fallback
+## WGPU Execution And Fallback
 
-The optional `wgpu` feature probes adapter availability. If the file's placement
-manifest requests WGPU devices but the build lacks the feature, or no adapter is
-available, the runtime reports `RuntimeBackend::CpuFallback` and continues on
-CPU. This keeps CI hardware-free while preserving the placement and routing
-contract that a future device kernel will consume.
+The optional `wgpu` feature runs expert `up` / `down` matmuls through a small
+WGPU compute shader when an adapter is available. A single physical adapter may
+back multiple logical WGPU placement devices in this PoC; the placement records
+are still used for routing and reporting.
+
+If the build lacks the feature, or no adapter is available, the runtime reports
+`RuntimeBackend::CpuFallback` and continues on CPU. This keeps CI hardware-free
+while preserving the placement and routing contract.
 
 ## Timing
 

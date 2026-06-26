@@ -27,9 +27,8 @@ rsmf-core  (library)           ← format, reader, writer, validator, selection
 - `rsmf-runtime` integrates the `ort` v2 crate to run inference on embedded graphs using memory-mapped tensors.
 - `rsmf-moe-runtime` is a proof-of-concept runtime for one MoE layer: host-side
   top-1 gating, token batching by destination expert, placement-aware expert
-  shard lookup, and a CPU reference path. Its optional `wgpu` feature currently
-  probes adapter availability and reports CPU fallback when the placement cannot
-  be satisfied.
+  shard lookup, WGPU expert matmuls when available, and a CPU reference path.
+  Its optional `wgpu` feature reports CPU fallback when no adapter is available.
 - `rsmf-python` enables high-performance access to RSMF models from Python. See the "Python surface" section below.
 
 ## Module map inside `rsmf-core`
