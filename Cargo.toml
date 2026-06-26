@@ -7,6 +7,7 @@ members = [
     "crates/rsmf-cuda",
     "crates/rsmf-metal",
     "crates/rsmf-bench",
+    "crates/rsmf-moe-runtime",
     "crates/rsmf-runtime",
     "crates/rsmf-python",
 ]
@@ -72,6 +73,7 @@ numpy = "0.22"
 # Internal crates.
 rsmf-core = { path = "crates/rsmf-core", version = "0.1.0" }
 rsmf-wgpu = { path = "crates/rsmf-wgpu", version = "0.1.0" }
+rsmf-moe-runtime = { path = "crates/rsmf-moe-runtime", version = "0.1.0" }
 rsmf-cuda = { path = "crates/rsmf-cuda", version = "0.1.0" }
 rsmf-metal = { path = "crates/rsmf-metal", version = "0.1.0" }
 

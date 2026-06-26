@@ -2399,6 +2399,7 @@ dependencies = [
  "criterion",
  "pollster",
  "rsmf-core",
+ "rsmf-moe-runtime",
  "rsmf-wgpu",
  "tempfile",
  "wgpu",
@@ -2468,6 +2469,16 @@ dependencies = [
  "metal",
  "objc",
  "rsmf-core",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "rsmf-moe-runtime"
+version = "0.1.0"
+dependencies = [
+ "rsmf-core",
+ "rsmf-wgpu",
+ "tempfile",
  "thiserror 2.0.18",
 ]
 
