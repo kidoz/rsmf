@@ -243,6 +243,10 @@ normally. The typed accessor returns `Structural` errors for malformed decimal
 fields or invalid `moe.shared` values because silently mis-grouping experts can
 route weights incorrectly.
 
+The experimental `rsmf-moe-runtime` crate consumes these annotations together
+with `PlacementManifest` and `prefetch.*` hints for its one-layer proof of
+concept. That runtime does not add new metadata keys.
+
 ---
 
 ## Vendor extensions (`x-*`, `vendor.<name>.*`)

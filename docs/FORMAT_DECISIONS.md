@@ -131,6 +131,19 @@ This keeps the format metadata-only. The reader exposes a typed
 not prefetch, evict, transport, or schedule anything by itself. Existing readers
 that ignore the keys continue to read variant bytes unchanged.
 
+## D16 — Minimal MoE runtime remains outside the file format
+
+The expert-parallel runtime is a separate, non-default crate
+(`rsmf-moe-runtime`) rather than a new section, graph IR, or manifest field. It
+consumes existing `moe.*`, `prefetch.*`, `tier.*`, `shard_id`, and
+`PlacementManifest` data to validate the format slice end to end.
+
+The proof of concept runs host-side top-1 gating, batches tokens by destination
+expert, resolves expert shards through placement records, and compares against a
+single-device CPU reference. WGPU support is feature-gated and falls back to CPU
+when adapters are unavailable. No format version bump is required because the
+runtime adds no on-disk semantics.
+
 ## D8 — Source-format conversion priorities
 
 The `rsmf pack` and `rsmf import` CLIs ingest from a fixed priority-ordered

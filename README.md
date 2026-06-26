@@ -34,6 +34,7 @@ Format version **1.0**. Full specification in [`docs/SPEC.md`](docs/SPEC.md); ar
 | `rsmf-wgpu` | portable WGPU chunked-staging upload path | no |
 | `rsmf-cuda` | synchronous CUDA host→device upload helper | no |
 | `rsmf-metal` | synchronous Metal host→GPU upload helper | no |
+| `rsmf-moe-runtime` | experimental placement-aware MoE runtime PoC | no |
 | `rsmf-runtime` | ONNX Runtime inference engine | no |
 | `rsmf-python` | PyO3 bindings | no |
 
@@ -193,6 +194,22 @@ replicas = [1]
 rsmf placement set model.rsmf --plan placement.toml
 rsmf placement inspect model.rsmf
 ```
+
+### Minimal MoE runtime PoC
+
+`rsmf-moe-runtime` is an experimental, non-default crate that validates the
+MoE/sharding/placement/prefetch slice end to end. It runs host-side top-1
+gating, batches tokens by destination expert, resolves each expert shard through
+`PlacementManifest`, and compares the batched path against a single-device CPU
+reference. Build it explicitly:
+
+```sh
+cargo test -p rsmf-moe-runtime
+cargo test -p rsmf-moe-runtime --features wgpu
+```
+
+The `wgpu` feature probes adapter availability and falls back cleanly to CPU
+when the requested placement cannot be backed by available adapters.
 
 ### Rewrite: ship a smaller artifact by stripping dev-only variants / assets
 
