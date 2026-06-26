@@ -31,6 +31,8 @@ namespace are writer-specific and should be avoided in published files.
 | `graph.*` | Graph-payload hints | Per-graph metadata |
 | `asset.*` | Asset-payload hints | Per-asset metadata |
 | `adapter.*` | LoRA / DoRA / IA³ adapter tensors | Manifest (global) + per-tensor metadata |
+| `moe.*` | Mixture-of-Experts layer / expert annotations | Manifest (global) + per-tensor metadata |
+| `model.*` | Model architecture hints not tied to a source format | Manifest metadata |
 | `bench.*` | Measured performance | Per-variant metadata |
 | `safetensors.*` | Verbatim safetensors metadata (import only) | Manifest metadata |
 | `x-*` / `vendor.<name>.*` | Vendor extensions | Any; collision-free namespace |
@@ -185,6 +187,39 @@ Shape convention for a LoRA adapter targeting a weight of shape
 
 For DoRA, a `magnitude` tensor of shape `[out_features]` is added.
 For IA³, a single `scale` tensor of shape `[out_features]` replaces the LoRA pair.
+
+---
+
+## Mixture-of-Experts (`moe.*`)
+
+MoE annotations are stored as **regular tensors** annotated with `moe.*`
+metadata. This identifies which tensors belong to routed experts, shared
+experts, or router/gating logic without adding a binary section or graph IR.
+Readers use `RsmfFile::moe_experts()` / `rsmf.RsmfFile.moe_experts()` to group
+annotated tensors by layer, expert id, shared flag, and role.
+
+### Manifest-level (global)
+
+| Key | Value |
+|---|---|
+| `moe.n_experts` | Decimal string: number of experts per MoE layer. |
+| `moe.top_k` | Decimal string: active experts selected per token. |
+| `moe.n_shared` | Decimal string: shared experts per layer, if any. |
+| `model.arch` | Architecture id, e.g. `mixtral`, `deepseek-v3`, `qwen3-moe`, or a vendor-specific id. |
+
+### Per-tensor
+
+| Key | Value |
+|---|---|
+| `moe.layer` | Decimal layer index. Required for tensors carrying any `moe.*` key. |
+| `moe.expert` | Decimal expert id within the layer. Absent means dense, router, or shared tensor. |
+| `moe.shared` | `1` if this tensor belongs to an always-active shared expert. Omit otherwise. |
+| `moe.role` | FFN/router role: `gate`, `up`, `down`, `router`, or a preserved unknown string. |
+
+Readers that do not understand MoE metadata ignore these keys and read tensors
+normally. The typed accessor returns `Structural` errors for malformed decimal
+fields or invalid `moe.shared` values because silently mis-grouping experts can
+route weights incorrectly.
 
 ---
 

@@ -362,6 +362,20 @@ See `docs/CONVENTIONS.md` → *Adapter-level* for the full key list
 `W + (α / r) · B · A` without parsing metadata strings can walk
 `RsmfFile::adapters()` / `rsmf.RsmfFile.adapters()`.
 
+## 8.1 Mixture-of-Experts metadata
+
+MoE expert identity is also represented as a **metadata convention**, not
+as a new binary layout. Tensors annotated with `moe.layer`, `moe.expert`,
+`moe.shared`, and `moe.role` remain ordinary tensor descriptors and payloads.
+File-level hints such as `moe.n_experts`, `moe.top_k`, `moe.n_shared`, and
+`model.arch` live in manifest metadata.
+
+Readers unaware of these keys ignore them and continue to read the file
+normally. Readers that want grouped expert metadata can walk
+`RsmfFile::moe_experts()` / `rsmf.RsmfFile.moe_experts()`. See
+`docs/CONVENTIONS.md` → *Mixture-of-Experts* for the key list and validation
+rules.
+
 ---
 
 ## 9. Writer paths and feature matrix

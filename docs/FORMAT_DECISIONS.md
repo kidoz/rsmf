@@ -60,6 +60,18 @@ return `RsmfError::Unsupported` rather than re-interpret the bytes as
 row-major; the zero-copy Python path already guards on `RowMajor` and
 is correct by construction.
 
+## D11 — MoE metadata convention
+
+Mixture-of-Experts identity is represented with `moe.*` metadata on regular
+tensors, plus manifest-level `moe.n_experts`, `moe.top_k`, `moe.n_shared`, and
+`model.arch` hints. This follows the adapter convention: no new section kind,
+no manifest version change, and no computation graph semantics. Existing v1
+readers preserve the keys and continue to read tensor bytes unchanged.
+
+The typed `RsmfFile::moe_experts()` accessor validates decimal fields and
+groups tensors by layer, expert id, shared flag, and role for runtimes that
+need expert routing metadata.
+
 ## D8 — Source-format conversion priorities
 
 The `rsmf pack` and `rsmf import` CLIs ingest from a fixed priority-ordered
