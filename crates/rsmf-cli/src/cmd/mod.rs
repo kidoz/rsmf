@@ -12,6 +12,7 @@ pub mod pack;
 pub mod placement;
 pub mod rewrite;
 pub mod select;
+pub mod shard;
 pub mod verify;
 
 use anyhow::anyhow;
@@ -44,6 +45,8 @@ pub enum Command {
     ExtractAsset(extract_asset::Args),
     /// Print the variant selection plan for a given execution mode.
     Select(select::Args),
+    /// Emit a sharded master and external shard files.
+    Shard(shard::Args),
     /// Copy an RSMF file while stripping variants, graphs, assets, or
     /// metadata. Useful for shipping a smaller production artifact from
     /// a dev-time bundle.
@@ -63,6 +66,7 @@ impl Command {
             Self::Extract(args) => extract::run(args),
             Self::ExtractAsset(args) => extract_asset::run(args),
             Self::Select(args) => select::run(args),
+            Self::Shard(args) => shard::run(args),
             Self::Rewrite(args) => rewrite::run(args),
         }
     }
