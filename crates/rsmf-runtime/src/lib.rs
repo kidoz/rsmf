@@ -13,7 +13,8 @@ use ort::ep::CPUExecutionProvider;
 use ort::session::builder::GraphOptimizationLevel as OrtGraphOptimizationLevel;
 use ort::session::{Session, SessionOutputs};
 use ort::value::{DynValue, Outlet, Tensor, TensorElementType};
-use rsmf_core::{LogicalDtype, RsmfError, RsmfFile, TensorView};
+use rsmf_core::tensor::variant::{EncodingKind, LayoutTag};
+use rsmf_core::{LogicalDtype, RsmfError, RsmfFile, StorageDtype, TensorView};
 
 #[cfg(feature = "tracing")]
 use tracing::info_span;
@@ -55,6 +56,24 @@ pub enum RuntimeError {
     /// A runtime value has a dtype this milestone does not materialize.
     #[error("unsupported runtime tensor dtype: {0}")]
     UnsupportedDtype(String),
+    /// A requested RSMF tensor initializer is not present in the file.
+    #[error("initializer {initializer_name} references missing RSMF tensor {tensor_name}")]
+    InitializerTensorNotFound {
+        /// ONNX initializer name.
+        initializer_name: String,
+        /// RSMF tensor name.
+        tensor_name: String,
+    },
+    /// A requested RSMF tensor initializer cannot be bound by this runtime.
+    #[error("initializer {initializer_name} cannot bind RSMF tensor {tensor_name}: {reason}")]
+    UnsupportedInitializer {
+        /// ONNX initializer name.
+        initializer_name: String,
+        /// RSMF tensor name.
+        tensor_name: String,
+        /// Reason the binding is unsupported.
+        reason: String,
+    },
 }
 
 /// ONNX Runtime graph optimization level.
@@ -101,6 +120,32 @@ impl Default for ExecutionProvider {
     }
 }
 
+/// Mapping from an ONNX initializer name to an RSMF tensor.
+///
+/// R2 binds canonical, row-major RSMF tensors as ORT external initializers at
+/// session build time. This keeps graph payloads from needing embedded weight
+/// bytes. The initial CPU implementation materializes the RSMF tensor into an
+/// ORT-owned value; true mmap/device zero-copy remains a later residency step.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct InitializerBinding {
+    /// Name of the initializer as referenced by the ONNX / ORT graph.
+    pub initializer_name: String,
+    /// Name of the tensor in the RSMF manifest.
+    pub tensor_name: String,
+}
+
+impl InitializerBinding {
+    /// Build an initializer binding from a graph initializer name and an RSMF
+    /// tensor name.
+    #[must_use]
+    pub fn new(initializer_name: impl Into<String>, tensor_name: impl Into<String>) -> Self {
+        Self {
+            initializer_name: initializer_name.into(),
+            tensor_name: tensor_name.into(),
+        }
+    }
+}
+
 /// Options used to create and cache an ONNX Runtime session.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SessionOptions {
@@ -118,6 +163,8 @@ pub struct SessionOptions {
     pub deterministic_compute: bool,
     /// Execution providers registered in priority order.
     pub execution_providers: Vec<ExecutionProvider>,
+    /// ONNX initializer names to bind from RSMF tensors.
+    pub initializers: Vec<InitializerBinding>,
 }
 
 impl Default for SessionOptions {
@@ -130,6 +177,7 @@ impl Default for SessionOptions {
             memory_pattern: true,
             deterministic_compute: false,
             execution_providers: vec![ExecutionProvider::default()],
+            initializers: Vec::new(),
         }
     }
 }
@@ -342,6 +390,16 @@ impl Engine {
         graph_idx: usize,
         inputs: HashMap<String, ArrayD<f32>>,
     ) -> Result<HashMap<String, ArrayD<f32>>> {
+        self.run_f32_with_options(graph_idx, SessionOptions::default(), inputs)
+    }
+
+    /// Convenience helper for F32 models with explicit session options.
+    pub fn run_f32_with_options(
+        &self,
+        graph_idx: usize,
+        options: SessionOptions,
+        inputs: HashMap<String, ArrayD<f32>>,
+    ) -> Result<HashMap<String, ArrayD<f32>>> {
         let runtime_inputs = inputs
             .into_iter()
             .map(|(name, array)| {
@@ -350,7 +408,7 @@ impl Engine {
                 (name, RuntimeTensor::F32 { shape, data })
             })
             .collect();
-        let outputs = self.run(graph_idx, SessionOptions::default(), runtime_inputs)?;
+        let outputs = self.run(graph_idx, options, runtime_inputs)?;
         outputs
             .into_iter()
             .map(|(name, tensor)| match tensor {
@@ -415,9 +473,45 @@ impl Engine {
                 .map_err(|e| ort_error("register execution providers", e))?;
         }
 
+        for binding in &options.initializers {
+            let initializer = self.initializer_value(binding)?;
+            builder = builder
+                .with_external_initializer(&binding.initializer_name, initializer)
+                .map_err(|e| ort_error("register external initializer", e))?;
+        }
+
         builder
             .commit_from_memory(payload.bytes)
             .map_err(|e| ort_error("session creation", e))
+    }
+
+    fn initializer_value(&self, binding: &InitializerBinding) -> Result<Arc<DynValue>> {
+        let view = self
+            .file
+            .tensor_view(&binding.tensor_name)
+            .map_err(|error| match error {
+                RsmfError::NotFound { .. } => RuntimeError::InitializerTensorNotFound {
+                    initializer_name: binding.initializer_name.clone(),
+                    tensor_name: binding.tensor_name.clone(),
+                },
+                other => RuntimeError::Core(other),
+            })?;
+        validate_initializer_view(binding, &view)?;
+        let shape = shape_u64_to_usize(view.shape()).map_err(|error| {
+            RuntimeError::UnsupportedInitializer {
+                initializer_name: binding.initializer_name.clone(),
+                tensor_name: binding.tensor_name.clone(),
+                reason: error,
+            }
+        })?;
+        let data = view
+            .to_vec::<f32>()
+            .map_err(|error| RuntimeError::UnsupportedInitializer {
+                initializer_name: binding.initializer_name.clone(),
+                tensor_name: binding.tensor_name.clone(),
+                reason: error.to_string(),
+            })?;
+        tensor_from_vec(shape, data).map(Arc::new)
     }
 }
 
@@ -498,6 +592,51 @@ fn shape_to_usize(shape: &[i64]) -> Result<Vec<usize>> {
             })
         })
         .collect()
+}
+
+fn shape_u64_to_usize(shape: &[u64]) -> std::result::Result<Vec<usize>, String> {
+    shape
+        .iter()
+        .map(|&dim| {
+            usize::try_from(dim).map_err(|_| format!("dimension {dim} cannot convert to usize"))
+        })
+        .collect()
+}
+
+fn validate_initializer_view(binding: &InitializerBinding, view: &TensorView<'_>) -> Result<()> {
+    let reason = if view.dtype() != LogicalDtype::F32 {
+        Some(format!(
+            "only F32 initializers are supported, got {:?}",
+            view.dtype()
+        ))
+    } else if view.encoding != EncodingKind::Raw {
+        Some(format!(
+            "only raw canonical initializers are supported, got {:?}",
+            view.encoding
+        ))
+    } else if view.layout != LayoutTag::RowMajor {
+        Some(format!(
+            "only row-major initializers are supported, got {:?}",
+            view.layout
+        ))
+    } else if view.storage_dtype != StorageDtype::Logical(LogicalDtype::F32) {
+        Some(format!(
+            "only logical F32 storage is supported, got {:?}",
+            view.storage_dtype
+        ))
+    } else {
+        None
+    };
+
+    if let Some(reason) = reason {
+        Err(RuntimeError::UnsupportedInitializer {
+            initializer_name: binding.initializer_name.clone(),
+            tensor_name: binding.tensor_name.clone(),
+            reason,
+        })
+    } else {
+        Ok(())
+    }
 }
 
 fn materialize_tensor_f32(value: &DynValue) -> Result<RuntimeTensor> {
@@ -708,11 +847,111 @@ mod tests {
         assert_eq!(z.iter().copied().collect::<Vec<_>>(), vec![4.0, 1.0]);
     }
 
+    #[test]
+    fn runs_onnx_graph_with_rsmf_external_initializer() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("add-initializer.onnx.rsmf");
+        RsmfWriter::new()
+            .with_tensor(TensorInput {
+                name: "bias.tensor".to_string(),
+                dtype: LogicalDtype::F32,
+                shape: vec![2],
+                shard_id: 0,
+                metadata: Vec::new(),
+                canonical: VariantInput::canonical_raw(f32_bytes(&[10.0, -4.0])),
+                packed: Vec::new(),
+            })
+            .with_graph(GraphInput::onnx(tiny_add_external_initializer_onnx_model()))
+            .write_to_path(&path)
+            .unwrap();
+
+        let engine = Engine::new(RsmfFile::open(path).unwrap()).unwrap();
+        let options = SessionOptions {
+            initializers: vec![InitializerBinding::new("bias", "bias.tensor")],
+            ..SessionOptions::default()
+        };
+        let handle = engine.session_handle(0, options.clone()).unwrap();
+        let input_names = handle
+            .inputs()
+            .iter()
+            .map(|input| input.name.as_str())
+            .collect::<Vec<_>>();
+        let output_names = handle
+            .outputs()
+            .iter()
+            .map(|output| output.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(input_names, vec!["x"]);
+        assert_eq!(output_names, vec!["z"]);
+
+        let outputs = engine
+            .run_f32_with_options(
+                0,
+                options,
+                HashMap::from([(
+                    "x".to_string(),
+                    ArrayD::from_shape_vec(vec![2], vec![1.5, 2.0]).unwrap(),
+                )]),
+            )
+            .unwrap();
+
+        let z = outputs.get("z").unwrap();
+        assert_eq!(z.shape(), &[2]);
+        assert_eq!(z.iter().copied().collect::<Vec<_>>(), vec![11.5, -2.0]);
+    }
+
+    #[test]
+    fn missing_initializer_tensor_is_typed_error() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("missing-initializer.rsmf");
+        RsmfWriter::new()
+            .with_tensor(TensorInput {
+                name: "fixture.weight".to_string(),
+                dtype: LogicalDtype::F32,
+                shape: vec![1],
+                shard_id: 0,
+                metadata: Vec::new(),
+                canonical: VariantInput::canonical_raw(0.0f32.to_le_bytes().to_vec()),
+                packed: Vec::new(),
+            })
+            .with_graph(GraphInput::onnx(tiny_add_external_initializer_onnx_model()))
+            .write_to_path(&path)
+            .unwrap();
+
+        let engine = Engine::new(RsmfFile::open(path).unwrap()).unwrap();
+        let err = engine
+            .session_handle(
+                0,
+                SessionOptions {
+                    initializers: vec![InitializerBinding::new("bias", "missing.tensor")],
+                    ..SessionOptions::default()
+                },
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            RuntimeError::InitializerTensorNotFound {
+                initializer_name,
+                tensor_name
+            } if initializer_name == "bias" && tensor_name == "missing.tensor"
+        ));
+    }
+
     fn tiny_add_onnx_model() -> Vec<u8> {
         let mut model = Vec::new();
         push_i64(&mut model, 1, 7);
         push_string(&mut model, 2, "rsmf-runtime-test");
         push_message(&mut model, 7, tiny_add_graph());
+        push_message(&mut model, 8, opset_import("", 13));
+        model
+    }
+
+    fn tiny_add_external_initializer_onnx_model() -> Vec<u8> {
+        let mut model = Vec::new();
+        push_i64(&mut model, 1, 7);
+        push_string(&mut model, 2, "rsmf-runtime-test");
+        push_message(&mut model, 7, tiny_add_graph_with_external_initializer());
         push_message(&mut model, 8, opset_import("", 13));
         model
     }
@@ -727,6 +966,16 @@ mod tests {
         graph
     }
 
+    fn tiny_add_graph_with_external_initializer() -> Vec<u8> {
+        let mut graph = Vec::new();
+        push_message(&mut graph, 1, add_initializer_node());
+        push_string(&mut graph, 2, "rsmf_add_initializer_graph");
+        push_message(&mut graph, 5, external_f32_tensor("bias", &[2]));
+        push_message(&mut graph, 11, value_info("x", &[2]));
+        push_message(&mut graph, 12, value_info("z", &[2]));
+        graph
+    }
+
     fn add_node() -> Vec<u8> {
         let mut node = Vec::new();
         push_string(&mut node, 1, "x");
@@ -735,6 +984,42 @@ mod tests {
         push_string(&mut node, 3, "add");
         push_string(&mut node, 4, "Add");
         node
+    }
+
+    fn add_initializer_node() -> Vec<u8> {
+        let mut node = Vec::new();
+        push_string(&mut node, 1, "x");
+        push_string(&mut node, 1, "bias");
+        push_string(&mut node, 2, "z");
+        push_string(&mut node, 3, "add_initializer");
+        push_string(&mut node, 4, "Add");
+        node
+    }
+
+    fn external_f32_tensor(name: &str, shape: &[i64]) -> Vec<u8> {
+        let mut tensor = Vec::new();
+        for &dim in shape {
+            push_i64(&mut tensor, 1, dim);
+        }
+        push_i32(&mut tensor, 2, 1);
+        push_string(&mut tensor, 8, name);
+        push_message(&mut tensor, 13, string_string_entry("location", "rsmf"));
+        push_i32(&mut tensor, 14, 1);
+        tensor
+    }
+
+    fn string_string_entry(key: &str, value: &str) -> Vec<u8> {
+        let mut entry = Vec::new();
+        push_string(&mut entry, 1, key);
+        push_string(&mut entry, 2, value);
+        entry
+    }
+
+    fn f32_bytes(values: &[f32]) -> Vec<u8> {
+        values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect()
     }
 
     fn value_info(name: &str, shape: &[i64]) -> Vec<u8> {
