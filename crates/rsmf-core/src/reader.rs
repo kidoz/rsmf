@@ -295,6 +295,38 @@ impl RsmfFile {
         self
     }
 
+    /// Open a master file and attach shard files by id.
+    pub fn open_with_shards(
+        path: impl AsRef<Path>,
+        shards: impl IntoIterator<Item = (u64, PathBuf)>,
+    ) -> Result<Self> {
+        let mut file = Self::open(path)?;
+        for (shard_id, shard_path) in shards {
+            file = file.with_shard_path(shard_id, shard_path)?;
+        }
+        Ok(file)
+    }
+
+    /// Attach a physical shard file by path.
+    pub fn with_shard_path(mut self, shard_id: u64, path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        let file = File::open(path).map_err(|e| RsmfError::IoWithPath {
+            path: path.to_path_buf(),
+            source: e,
+        })?;
+        // SAFETY: the returned mmap is read-only and the file handle is not
+        // mutated by this reader. The OS keeps the mapping valid independently
+        // of the `File` value after `map` returns.
+        let mmap = unsafe { Mmap::map(&file) }.map_err(|e| RsmfError::IoWithPath {
+            path: path.to_path_buf(),
+            source: e,
+        })?;
+        #[cfg(feature = "tracing")]
+        info!(shard_id, size = mmap.len(), path = ?path, "attaching external shard");
+        self.shard_mmaps.insert(shard_id, Arc::new(mmap));
+        Ok(self)
+    }
+
     /// Return a reference to the raw bytes of the master mapping.
     #[must_use]
     pub fn bytes(&self) -> &[u8] {

@@ -23,6 +23,7 @@ pub mod preamble;
 pub mod reader;
 pub mod section;
 pub mod selection;
+pub mod shard;
 pub mod streaming_writer;
 pub mod tensor;
 pub mod tier;
@@ -58,6 +59,9 @@ pub use section::{SectionDescriptor, SectionKind};
 pub use selection::{
     Capabilities, CpuFeatures, ExecutionMode, GpuBackend, SelectedVariant, TensorPlan,
     select_variants_with_tier,
+};
+pub use shard::{
+    ShardArtifact, ShardStrategy, ShardWriteOptions, ShardWriteSummary, write_sharded_file,
 };
 pub use streaming_writer::StreamingRsmfWriter;
 pub use tensor::descriptor::TensorDescriptor;
