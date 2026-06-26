@@ -29,6 +29,7 @@ use crate::error::{Result, RsmfError};
 use crate::manifest::Manifest;
 use crate::moe::{MoeIndex, moe_index_from_manifest};
 use crate::preamble::{PREAMBLE_LEN, Preamble};
+use crate::prefetch::{PrefetchIndex, prefetch_index_from_manifest};
 use crate::reader::{decompress_zstd, validate_manifest, validate_section_table};
 use crate::section::{SECTION_DESC_LEN, SectionDescriptor, SectionKind};
 use crate::tensor::variant::VariantDescriptor;
@@ -285,6 +286,11 @@ impl<R: RangeReader> LazyRsmfFile<R> {
     /// Index Mixture-of-Experts tensor metadata without fetching payload bytes.
     pub fn moe_experts(&self) -> Result<MoeIndex> {
         moe_index_from_manifest(&self.manifest)
+    }
+
+    /// Index prefetch / locality metadata without fetching payload bytes.
+    pub fn prefetch_hints(&self) -> Result<PrefetchIndex> {
+        prefetch_index_from_manifest(&self.manifest)
     }
 
     /// Fetch the canonical variant's bytes for a named tensor.

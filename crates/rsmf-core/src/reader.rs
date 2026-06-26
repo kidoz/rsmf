@@ -426,6 +426,23 @@ impl RsmfFile {
         crate::moe::moe_index_from_manifest(&self.manifest)
     }
 
+    /// Index the file's prefetch / locality metadata.
+    ///
+    /// Walks variants carrying `prefetch.*` metadata and groups them by
+    /// `prefetch.group`. Returns an empty index for files without prefetch
+    /// hints. See `docs/CONVENTIONS.md` for the metadata convention.
+    ///
+    /// ```no_run
+    /// # use rsmf_core::RsmfFile;
+    /// let file = RsmfFile::open("model.rsmf")?;
+    /// let prefetch = file.prefetch_hints()?;
+    /// println!("{} prefetch groups", prefetch.groups.len());
+    /// # Ok::<(), rsmf_core::RsmfError>(())
+    /// ```
+    pub fn prefetch_hints(&self) -> Result<crate::prefetch::PrefetchIndex> {
+        crate::prefetch::prefetch_index_from_manifest(&self.manifest)
+    }
+
     /// Build a high-level summary.
     #[must_use]
     pub fn inspect(&self) -> ManifestSummary {

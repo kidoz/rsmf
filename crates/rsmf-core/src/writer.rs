@@ -14,6 +14,7 @@ use crate::error::{Result, RsmfError};
 use crate::manifest::{AssetDescriptor, GraphDescriptor, GraphKind, MANIFEST_VERSION, Manifest};
 use crate::placement::{PLACEMENT_SECTION_KIND, PlacementManifest};
 use crate::preamble::{FORMAT_MAJOR, FORMAT_MINOR, MAGIC, PREAMBLE_LEN, Preamble};
+use crate::prefetch::{set_prefetch_affinity, set_prefetch_group};
 use crate::section::{
     CUSTOM_SECTION_RANGE_START, SECTION_DESC_LEN, SectionDescriptor, SectionKind,
 };
@@ -202,6 +203,23 @@ impl VariantInput {
     #[must_use]
     pub fn with_tier_class(mut self, class: impl Into<String>) -> Self {
         set_tier_class(&mut self.meta.extra, class);
+        self
+    }
+
+    /// Attach `prefetch.group` metadata to this variant.
+    #[must_use]
+    pub fn with_prefetch_group(mut self, group: impl Into<String>) -> Self {
+        set_prefetch_group(&mut self.meta.extra, group);
+        self
+    }
+
+    /// Attach `prefetch.affinity` metadata to this variant.
+    ///
+    /// The value should be a comma-separated list of shard / expert / writer
+    /// labels commonly co-active with this variant.
+    #[must_use]
+    pub fn with_prefetch_affinity(mut self, affinity: impl Into<String>) -> Self {
+        set_prefetch_affinity(&mut self.meta.extra, affinity);
         self
     }
 }

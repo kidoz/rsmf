@@ -20,6 +20,7 @@ pub mod manifest;
 pub mod moe;
 pub mod placement;
 pub mod preamble;
+pub mod prefetch;
 pub mod reader;
 pub mod section;
 pub mod selection;
@@ -54,6 +55,10 @@ pub use placement::{
     PLACEMENT_SECTION_KIND, PLACEMENT_VERSION, PlacementManifest, PlacementRecord,
 };
 pub use preamble::{FORMAT_MAJOR, FORMAT_MINOR, MAGIC, Preamble};
+pub use prefetch::{
+    PREFETCH_AFFINITY_KEY, PREFETCH_GROUP_KEY, PrefetchEntry, PrefetchGroup, PrefetchIndex,
+    PrefetchVariantRef, prefetch_index_from_manifest,
+};
 pub use reader::{AssetRef, CustomSectionPayload, GraphPayload, RsmfFile};
 pub use section::{SectionDescriptor, SectionKind};
 pub use selection::{
