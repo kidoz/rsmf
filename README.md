@@ -203,14 +203,20 @@ and owns runtime concerns: graph selection, ORT session options, CPU execution
 provider defaults, cached sessions, graph input/output metadata, and typed
 owned input/output tensors.
 
+R2 adds explicit initializer bindings through `SessionOptions.initializers`,
+mapping ONNX initializer names to canonical RSMF tensor names. The first
+supported path is row-major F32 on CPU. It avoids embedding duplicate weight
+bytes in the graph payload, while the pinned ORT Rust API still materializes an
+ORT-owned initializer value during session build.
+
 Build it explicitly:
 
 ```sh
 cargo test -p rsmf-runtime
 ```
 
-RSMF-managed external initializer binding and provider-specific device I/O
-binding are future runtime milestones, not part of the R1 API.
+Provider-specific device I/O binding and true mmap/device zero-copy residency
+are future runtime milestones.
 
 ### Minimal MoE runtime PoC
 
