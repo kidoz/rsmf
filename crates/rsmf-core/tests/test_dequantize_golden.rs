@@ -26,8 +26,8 @@ fn assert_f32_equality(actual: &[f32], expected: &[f32]) {
 
 #[test]
 fn test_q4_k_golden() {
-    let raw = include_bytes!("../../../tmp/golden/golden_q4_k.raw");
-    let f32_bytes = include_bytes!("../../../tmp/golden/golden_q4_k.f32");
+    let raw = include_bytes!("golden/golden_q4_k.raw");
+    let f32_bytes = include_bytes!("golden/golden_q4_k.f32");
 
     let expected_f32: Vec<f32> = f32_bytes
         .chunks_exact(4)
@@ -40,8 +40,8 @@ fn test_q4_k_golden() {
 
 #[test]
 fn test_q5_k_golden() {
-    let raw = include_bytes!("../../../tmp/golden/golden_q5_k.raw");
-    let f32_bytes = include_bytes!("../../../tmp/golden/golden_q5_k.f32");
+    let raw = include_bytes!("golden/golden_q5_k.raw");
+    let f32_bytes = include_bytes!("golden/golden_q5_k.f32");
 
     let expected_f32: Vec<f32> = f32_bytes
         .chunks_exact(4)
@@ -54,8 +54,8 @@ fn test_q5_k_golden() {
 
 #[test]
 fn test_q6_k_golden() {
-    let raw = include_bytes!("../../../tmp/golden/golden_q6_k.raw");
-    let f32_bytes = include_bytes!("../../../tmp/golden/golden_q6_k.f32");
+    let raw = include_bytes!("golden/golden_q6_k.raw");
+    let f32_bytes = include_bytes!("golden/golden_q6_k.f32");
 
     let expected_f32: Vec<f32> = f32_bytes
         .chunks_exact(4)
@@ -68,8 +68,8 @@ fn test_q6_k_golden() {
 
 #[test]
 fn test_q2_k_golden() {
-    let raw = include_bytes!("../../../tmp/golden/golden_q2_k.raw");
-    let f32_bytes = include_bytes!("../../../tmp/golden/golden_q2_k.f32");
+    let raw = include_bytes!("golden/golden_q2_k.raw");
+    let f32_bytes = include_bytes!("golden/golden_q2_k.f32");
 
     let expected_f32: Vec<f32> = f32_bytes
         .chunks_exact(4)
@@ -82,8 +82,8 @@ fn test_q2_k_golden() {
 
 #[test]
 fn test_q5_0_golden() {
-    let raw = include_bytes!("../../../tmp/golden/golden_q5_0.raw");
-    let f32_bytes = include_bytes!("../../../tmp/golden/golden_q5_0.f32");
+    let raw = include_bytes!("golden/golden_q5_0.raw");
+    let f32_bytes = include_bytes!("golden/golden_q5_0.f32");
 
     let expected_f32: Vec<f32> = f32_bytes
         .chunks_exact(4)
