@@ -31,6 +31,9 @@ def test_public_api_surface() -> None:
         "FileInfo",
         "TensorInfo",
         "VariantInfo",
+        "MoeEntry",
+        "MoeGroup",
+        "MoeIndex",
     ):
         assert hasattr(rsmf, name), f"rsmf.{name} missing"
 
@@ -97,6 +100,14 @@ def test_tensor_info_matches_written_shape(open_file: rsmf.RsmfFile) -> None:
     assert info["dtype"] == "f32"
     assert info["shape"] == [16, 8]
     assert info["element_count"] == 128
+
+
+def test_moe_experts_empty_without_annotations(open_file: rsmf.RsmfFile) -> None:
+    idx = open_file.moe_experts()
+    assert idx["n_experts"] is None
+    assert idx["top_k"] is None
+    assert idx["entries"] == []
+    assert idx["groups"] == []
 
 
 def test_unknown_tensor_raises_notfound(open_file: rsmf.RsmfFile) -> None:

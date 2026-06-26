@@ -34,7 +34,17 @@ from ._rsmf import (
     RsmfVerificationError,
 )
 from ._rsmf import RsmfFile as _NativeRsmfFile
-from ._types import Adapter, AdapterEntry, AdapterIndex, FileInfo, TensorInfo, VariantInfo
+from ._types import (
+    Adapter,
+    AdapterEntry,
+    AdapterIndex,
+    FileInfo,
+    MoeEntry,
+    MoeGroup,
+    MoeIndex,
+    TensorInfo,
+    VariantInfo,
+)
 
 if TYPE_CHECKING:
     import numpy as np
@@ -53,6 +63,9 @@ __all__ = [
     "Adapter",
     "AdapterEntry",
     "AdapterIndex",
+    "MoeEntry",
+    "MoeGroup",
+    "MoeIndex",
 ]
 
 __version__ = "0.1.0"
@@ -204,3 +217,13 @@ class RsmfFile:
         convention.
         """
         return self._require_open().adapters()  # type: ignore[return-value]
+
+    def moe_experts(self) -> MoeIndex:
+        """Group MoE tensors by ``moe.layer`` / ``moe.expert`` / role.
+
+        Returns file-level MoE metadata (``n_experts``, ``top_k``,
+        ``n_shared``, ``model_arch``), the annotated tensor entries, and a
+        grouped view. Files without ``moe.*`` annotations return empty
+        ``entries`` and ``groups`` lists.
+        """
+        return self._require_open().moe_experts()  # type: ignore[return-value]

@@ -76,3 +76,34 @@ class AdapterIndex(TypedDict):
     base_model_name: str | None
     base_model_sha256: str | None
     adapters: list[Adapter]
+
+
+class MoeEntry(TypedDict):
+    """One tensor annotated with ``moe.*`` metadata."""
+
+    tensor_name: str
+    layer: int
+    expert_id: int | None
+    shared: bool
+    role: str  # "router" | "gate" | "up" | "down" | other
+
+
+class MoeGroup(TypedDict):
+    """A group of MoE tensors sharing layer/expert/shared/role."""
+
+    layer: int
+    expert_id: int | None
+    shared: bool
+    role: str
+    tensor_names: list[str]
+
+
+class MoeIndex(TypedDict):
+    """Return type of :meth:`rsmf.RsmfFile.moe_experts`."""
+
+    n_experts: int | None
+    top_k: int | None
+    n_shared: int | None
+    model_arch: str | None
+    entries: list[MoeEntry]
+    groups: list[MoeGroup]

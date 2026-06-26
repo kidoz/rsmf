@@ -13,7 +13,7 @@ use std::collections::HashMap;
 
 use rsmf_core::manifest::GraphKind;
 use rsmf_core::{
-    AdapterKind, AdapterRole, LogicalDtype, RsmfError as CoreError, RsmfFile as CoreFile,
+    AdapterKind, AdapterRole, LogicalDtype, MoeRole, RsmfError as CoreError, RsmfFile as CoreFile,
 };
 
 /// A NumPy-compatible view over raw variant bytes.
@@ -373,6 +373,47 @@ impl RsmfFile {
         out.set_item("adapters", adapters_list)?;
         Ok(out)
     }
+
+    /// Index Mixture-of-Experts tensors from `moe.*` metadata.
+    fn moe_experts<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let idx = self.inner.moe_experts().map_err(map_core_error)?;
+        let out = PyDict::new_bound(py);
+        out.set_item("n_experts", idx.n_experts)?;
+        out.set_item("top_k", idx.top_k)?;
+        out.set_item("n_shared", idx.n_shared)?;
+        out.set_item("model_arch", idx.model_arch.clone())?;
+
+        let entries: Vec<Bound<'py, PyDict>> = idx
+            .entries
+            .iter()
+            .map(|e| {
+                let d = PyDict::new_bound(py);
+                d.set_item("tensor_name", &e.tensor_name)?;
+                d.set_item("layer", e.layer)?;
+                d.set_item("expert_id", e.expert_id)?;
+                d.set_item("shared", e.shared)?;
+                d.set_item("role", moe_role_to_str(&e.role))?;
+                Ok(d)
+            })
+            .collect::<PyResult<_>>()?;
+        out.set_item("entries", entries)?;
+
+        let groups: Vec<Bound<'py, PyDict>> = idx
+            .groups
+            .iter()
+            .map(|g| {
+                let d = PyDict::new_bound(py);
+                d.set_item("layer", g.layer)?;
+                d.set_item("expert_id", g.expert_id)?;
+                d.set_item("shared", g.shared)?;
+                d.set_item("role", moe_role_to_str(&g.role))?;
+                d.set_item("tensor_names", g.tensor_names.clone())?;
+                Ok(d)
+            })
+            .collect::<PyResult<_>>()?;
+        out.set_item("groups", groups)?;
+        Ok(out)
+    }
 }
 
 fn adapter_kind_to_str(k: &AdapterKind) -> String {
@@ -380,6 +421,10 @@ fn adapter_kind_to_str(k: &AdapterKind) -> String {
 }
 
 fn adapter_role_to_str(r: &AdapterRole) -> String {
+    r.as_str().to_string()
+}
+
+fn moe_role_to_str(r: &MoeRole) -> String {
     r.as_str().to_string()
 }
 
