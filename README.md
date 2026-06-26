@@ -209,7 +209,9 @@ cargo test -p rsmf-moe-runtime --features wgpu
 ```
 
 The `wgpu` feature runs expert matmuls through WGPU when an adapter is
-available and falls back cleanly to CPU otherwise.
+available and falls back cleanly to CPU otherwise. `MoeRuntimeOptions::limits`
+provides finite default guardrails for token batches, decoded tensors, and
+output allocations.
 
 ### Rewrite: ship a smaller artifact by stripping dev-only variants / assets
 

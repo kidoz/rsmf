@@ -19,10 +19,31 @@ For one MoE layer, the runtime:
 The reference path uses the same router and expert math without placement-based
 batching. Tests compare the two paths on a fixed 2-shard fixture.
 
+## Runtime Contract
+
+The runtime is intentionally stricter than the metadata index:
+
+- `run_layer_top1` only accepts `moe.top_k=1` when `moe.top_k` is present.
+- A layer must have exactly one router tensor, and router tensors must not set
+  `moe.expert`.
+- Each router row must have a matching expert id with exactly one `up` and one
+  `down` tensor.
+- `SiluGated` activation requires exactly one `gate` tensor per expert.
+- Expert `up` / `down` / `gate` tensors must live on the same `shard_id` so a
+  placement record names one owning device for the expert.
+- Shared MoE experts are rejected by this crate; the PoC covers routed top-1
+  experts only.
+
+`MoeRuntimeOptions::limits` rejects oversized token batches, decoded rank-2
+tensors, and output buffers before the runtime allocates large working memory.
+The defaults are deliberately finite and can be widened or disabled per field
+by callers that own the deployment envelope.
+
 ## WGPU Execution And Fallback
 
 The optional `wgpu` feature runs expert `up` / `down` matmuls through a small
-WGPU compute shader when an adapter is available. A single physical adapter may
+WGPU compute shader when an adapter is available. The shader pipeline is created
+once per runtime and reused across expert batches. A single physical adapter may
 back multiple logical WGPU placement devices in this PoC; the placement records
 are still used for routing and reporting.
 

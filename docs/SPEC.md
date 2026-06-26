@@ -544,6 +544,8 @@ minimal one-layer MoE proof of concept:
 - optional use of `prefetch.*` groups for report/planning metadata,
 - WGPU expert matmuls when the optional runtime feature and adapter are
   available,
+- runtime-level limits for token batches, decoded tensor elements, and output
+  allocations,
 - CPU reference execution for correctness.
 
 No activation payloads, network transport, graph IR, or runtime dispatch format
