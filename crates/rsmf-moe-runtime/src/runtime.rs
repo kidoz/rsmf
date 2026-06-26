@@ -51,6 +51,8 @@ pub struct MoeRuntime {
     prefetch: PrefetchIndex,
     backend: RuntimeBackend,
     options: MoeRuntimeOptions,
+    #[cfg(feature = "wgpu")]
+    wgpu: Option<crate::wgpu_compute::WgpuExecutor>,
 }
 
 impl MoeRuntime {
@@ -63,6 +65,9 @@ impl MoeRuntime {
             .placement_manifest()?
             .ok_or_else(|| MoeRuntimeError::Missing("PlacementManifest".to_string()))?;
         let prefetch = file.prefetch_hints()?;
+        #[cfg(feature = "wgpu")]
+        let (backend, wgpu) = select_backend(&placement, options.prefer_wgpu);
+        #[cfg(not(feature = "wgpu"))]
         let backend = select_backend(&placement, options.prefer_wgpu);
         Ok(Self {
             file,
@@ -70,6 +75,8 @@ impl MoeRuntime {
             prefetch,
             backend,
             options,
+            #[cfg(feature = "wgpu")]
+            wgpu,
         })
     }
 
@@ -116,20 +123,9 @@ impl MoeRuntime {
         let device_batches = self.device_batches(&loaded, &routing_batches)?;
         let dispatch_time = dispatch_start.elapsed();
 
-        let mut output = vec![0.0; token_count * loaded.output_width];
         let compute_start = Instant::now();
-        for batch in &device_batches {
-            let expert = loaded
-                .experts
-                .get(&batch.expert_id)
-                .ok_or_else(|| MoeRuntimeError::Missing(format!("expert {}", batch.expert_id)))?;
-            for &token_idx in &batch.token_indices {
-                let input_row = &input[token_idx * input_width..(token_idx + 1) * input_width];
-                let row = eval_expert(input_row, expert, self.options.activation)?;
-                let out_start = token_idx * loaded.output_width;
-                output[out_start..out_start + loaded.output_width].copy_from_slice(&row);
-            }
-        }
+        let output =
+            self.compute_batches(&loaded, input, input_width, token_count, &device_batches)?;
         let compute_time = compute_start.elapsed();
 
         let combine_start = Instant::now();
@@ -349,6 +345,119 @@ impl MoeRuntime {
         }
         Ok(out)
     }
+
+    fn compute_batches(
+        &self,
+        loaded: &LoadedLayer,
+        input: &[f32],
+        input_width: usize,
+        token_count: usize,
+        device_batches: &[DeviceBatch],
+    ) -> Result<Vec<f32>> {
+        #[cfg(feature = "wgpu")]
+        if let Some(executor) = &self.wgpu {
+            return self.compute_batches_wgpu(
+                executor,
+                loaded,
+                input,
+                input_width,
+                token_count,
+                device_batches,
+            );
+        }
+        self.compute_batches_cpu(loaded, input, input_width, token_count, device_batches)
+    }
+
+    fn compute_batches_cpu(
+        &self,
+        loaded: &LoadedLayer,
+        input: &[f32],
+        input_width: usize,
+        token_count: usize,
+        device_batches: &[DeviceBatch],
+    ) -> Result<Vec<f32>> {
+        let mut output = vec![0.0; token_count * loaded.output_width];
+        for batch in device_batches {
+            let expert = loaded
+                .experts
+                .get(&batch.expert_id)
+                .ok_or_else(|| MoeRuntimeError::Missing(format!("expert {}", batch.expert_id)))?;
+            for &token_idx in &batch.token_indices {
+                let input_row = &input[token_idx * input_width..(token_idx + 1) * input_width];
+                let row = eval_expert(input_row, expert, self.options.activation)?;
+                let out_start = token_idx * loaded.output_width;
+                output[out_start..out_start + loaded.output_width].copy_from_slice(&row);
+            }
+        }
+        Ok(output)
+    }
+
+    #[cfg(feature = "wgpu")]
+    fn compute_batches_wgpu(
+        &self,
+        executor: &crate::wgpu_compute::WgpuExecutor,
+        loaded: &LoadedLayer,
+        input: &[f32],
+        input_width: usize,
+        token_count: usize,
+        device_batches: &[DeviceBatch],
+    ) -> Result<Vec<f32>> {
+        let mut output = vec![0.0; token_count * loaded.output_width];
+        for batch in device_batches {
+            let expert = loaded
+                .experts
+                .get(&batch.expert_id)
+                .ok_or_else(|| MoeRuntimeError::Missing(format!("expert {}", batch.expert_id)))?;
+            let mut batch_input = Vec::with_capacity(batch.token_indices.len() * input_width);
+            for &token_idx in &batch.token_indices {
+                batch_input.extend_from_slice(
+                    &input[token_idx * input_width..(token_idx + 1) * input_width],
+                );
+            }
+
+            let up = executor.matmul(
+                &expert.up.data,
+                expert.up.rows,
+                expert.up.cols,
+                &batch_input,
+                batch.token_indices.len(),
+            )?;
+            let hidden = match self.options.activation {
+                ExpertActivation::Identity => up,
+                ExpertActivation::SiluGated => {
+                    let gate = expert
+                        .gate
+                        .as_ref()
+                        .ok_or_else(|| MoeRuntimeError::Missing("gate tensor".to_string()))?;
+                    let gate_values = executor.matmul(
+                        &gate.data,
+                        gate.rows,
+                        gate.cols,
+                        &batch_input,
+                        batch.token_indices.len(),
+                    )?;
+                    up.into_iter()
+                        .zip(gate_values)
+                        .map(|(up, gate)| up * silu(gate))
+                        .collect()
+                }
+            };
+            let batch_output = executor.matmul(
+                &expert.down.data,
+                expert.down.rows,
+                expert.down.cols,
+                &hidden,
+                batch.token_indices.len(),
+            )?;
+            for (batch_row, &token_idx) in batch.token_indices.iter().enumerate() {
+                let src_start = batch_row * loaded.output_width;
+                let dst_start = token_idx * loaded.output_width;
+                output[dst_start..dst_start + loaded.output_width]
+                    .copy_from_slice(&batch_output[src_start..src_start + loaded.output_width]);
+            }
+        }
+        Ok(output)
+    }
 }
 
 #[derive(Debug)]
@@ -529,6 +638,56 @@ fn tensor_descriptor<'a>(file: &'a RsmfFile, tensor_name: &str) -> Result<&'a Te
         .ok_or_else(|| MoeRuntimeError::Missing(format!("tensor {tensor_name}")))
 }
 
+#[cfg(feature = "wgpu")]
+fn select_backend(
+    placement: &PlacementManifest,
+    prefer_wgpu: bool,
+) -> (RuntimeBackend, Option<crate::wgpu_compute::WgpuExecutor>) {
+    if !prefer_wgpu {
+        return (
+            RuntimeBackend::CpuFallback {
+                reason: "prefer_wgpu=false".to_string(),
+            },
+            None,
+        );
+    }
+
+    let requested_devices = placement
+        .devices
+        .iter()
+        .filter(|device| device.kind == DeviceKind::Wgpu)
+        .count();
+
+    if requested_devices == 0 {
+        return (
+            RuntimeBackend::CpuFallback {
+                reason: "prefer_wgpu=true but placement has no WGPU devices".to_string(),
+            },
+            None,
+        );
+    }
+
+    let Some(executor) = crate::wgpu_compute::WgpuExecutor::new() else {
+        return (
+            RuntimeBackend::CpuFallback {
+                reason: format!(
+                    "requested {requested_devices} WGPU devices but no adapter is available"
+                ),
+            },
+            None,
+        );
+    };
+    (
+        RuntimeBackend::WgpuCompute {
+            requested_devices,
+            available_adapters: 1,
+            adapter_name: executor.adapter_name().to_string(),
+        },
+        Some(executor),
+    )
+}
+
+#[cfg(not(feature = "wgpu"))]
 fn select_backend(placement: &PlacementManifest, prefer_wgpu: bool) -> RuntimeBackend {
     if !prefer_wgpu {
         return RuntimeBackend::CpuFallback {
@@ -542,35 +701,9 @@ fn select_backend(placement: &PlacementManifest, prefer_wgpu: bool) -> RuntimeBa
         .filter(|device| device.kind == DeviceKind::Wgpu)
         .count();
 
-    #[cfg(feature = "wgpu")]
-    {
-        let available_adapters = usize::from(rsmf_wgpu::detect_capabilities().is_some());
-        if available_adapters == 0 {
-            RuntimeBackend::CpuFallback {
-                reason: format!(
-                    "requested {requested_devices} WGPU devices but no adapter is available"
-                ),
-            }
-        } else if requested_devices > available_adapters {
-            RuntimeBackend::CpuFallback {
-                reason: format!(
-                    "requested {requested_devices} WGPU placement devices but only {available_adapters} adapter was detected"
-                ),
-            }
-        } else {
-            RuntimeBackend::WgpuProbe {
-                requested_devices,
-                available_adapters,
-            }
-        }
-    }
-
-    #[cfg(not(feature = "wgpu"))]
-    {
-        RuntimeBackend::CpuFallback {
-            reason: format!(
-                "requested {requested_devices} WGPU placement devices but rsmf-moe-runtime was built without the wgpu feature"
-            ),
-        }
+    RuntimeBackend::CpuFallback {
+        reason: format!(
+            "requested {requested_devices} WGPU placement devices but rsmf-moe-runtime was built without the wgpu feature"
+        ),
     }
 }

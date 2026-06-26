@@ -1,0 +1,302 @@
+//! Small WGPU compute executor for the MoE proof-of-concept runtime.
+
+use std::borrow::Cow;
+use std::sync::mpsc;
+
+use wgpu::util::DeviceExt;
+
+use crate::{MoeRuntimeError, Result};
+
+const SHADER: &str = r#"
+struct Dims {
+    tokens: u32,
+    rows: u32,
+    cols: u32,
+    _pad: u32,
+};
+
+@group(0) @binding(0)
+var<storage, read> input: array<f32>;
+
+@group(0) @binding(1)
+var<storage, read> matrix: array<f32>;
+
+@group(0) @binding(2)
+var<storage, read_write> output: array<f32>;
+
+@group(0) @binding(3)
+var<uniform> dims: Dims;
+
+@compute @workgroup_size(8, 8, 1)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let token = gid.x;
+    let row = gid.y;
+    if (token >= dims.tokens || row >= dims.rows) {
+        return;
+    }
+
+    var acc = 0.0;
+    var col = 0u;
+    loop {
+        if (col >= dims.cols) {
+            break;
+        }
+        acc = acc + input[token * dims.cols + col] * matrix[row * dims.cols + col];
+        col = col + 1u;
+    }
+    output[token * dims.rows + row] = acc;
+}
+"#;
+
+/// WGPU executor used by `MoeRuntime` when the `wgpu` feature is enabled.
+#[derive(Debug)]
+pub(crate) struct WgpuExecutor {
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    adapter_name: String,
+}
+
+impl WgpuExecutor {
+    pub(crate) fn new() -> Option<Self> {
+        let caps = rsmf_wgpu::detect_capabilities()?;
+        let adapter_name = caps.info.name.clone();
+        let handle = rsmf_wgpu::request_device(&caps)?;
+        Some(Self {
+            device: handle.device,
+            queue: handle.queue,
+            adapter_name,
+        })
+    }
+
+    pub(crate) fn adapter_name(&self) -> &str {
+        &self.adapter_name
+    }
+
+    pub(crate) fn matmul(
+        &self,
+        matrix: &[f32],
+        rows: usize,
+        cols: usize,
+        input: &[f32],
+        tokens: usize,
+    ) -> Result<Vec<f32>> {
+        if tokens == 0 {
+            return Ok(Vec::new());
+        }
+        let expected_matrix = rows.checked_mul(cols).ok_or_else(|| {
+            MoeRuntimeError::Shape("WGPU matrix element count overflow".to_string())
+        })?;
+        if matrix.len() != expected_matrix {
+            return Err(MoeRuntimeError::Shape(format!(
+                "WGPU matrix has {} values, expected {expected_matrix}",
+                matrix.len()
+            )));
+        }
+        let expected_input = tokens.checked_mul(cols).ok_or_else(|| {
+            MoeRuntimeError::Shape("WGPU input element count overflow".to_string())
+        })?;
+        if input.len() != expected_input {
+            return Err(MoeRuntimeError::Shape(format!(
+                "WGPU input has {} values, expected {expected_input}",
+                input.len()
+            )));
+        }
+
+        let output_len = tokens.checked_mul(rows).ok_or_else(|| {
+            MoeRuntimeError::Shape("WGPU output element count overflow".to_string())
+        })?;
+        let output_bytes = byte_len(output_len)?;
+
+        let input_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("rsmf-moe input"),
+                contents: &f32s_to_le_bytes(input),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+        let matrix_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("rsmf-moe matrix"),
+                contents: &f32s_to_le_bytes(matrix),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+        let output_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("rsmf-moe output"),
+            size: output_bytes,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let dims_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("rsmf-moe dims"),
+                contents: &dims_bytes(tokens, rows, cols)?,
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+        let staging_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("rsmf-moe staging"),
+            size: output_bytes,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let shader = self
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("rsmf-moe matmul shader"),
+                source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(SHADER)),
+            });
+        let bind_group_layout =
+            self.device
+                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("rsmf-moe matmul bgl"),
+                    entries: &[
+                        storage_entry(0, true),
+                        storage_entry(1, true),
+                        storage_entry(2, false),
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 3,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Uniform,
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                    ],
+                });
+        let pipeline_layout = self
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("rsmf-moe matmul pipeline layout"),
+                bind_group_layouts: &[&bind_group_layout],
+                push_constant_ranges: &[],
+            });
+        let pipeline = self
+            .device
+            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("rsmf-moe matmul pipeline"),
+                layout: Some(&pipeline_layout),
+                module: &shader,
+                entry_point: "main",
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                cache: None,
+            });
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("rsmf-moe matmul bind group"),
+            layout: &bind_group_layout,
+            entries: &[
+                binding(0, &input_buffer),
+                binding(1, &matrix_buffer),
+                binding(2, &output_buffer),
+                binding(3, &dims_buffer),
+            ],
+        });
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("rsmf-moe matmul encoder"),
+            });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("rsmf-moe matmul pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.dispatch_workgroups(div_ceil(tokens as u32, 8), div_ceil(rows as u32, 8), 1);
+        }
+        encoder.copy_buffer_to_buffer(&output_buffer, 0, &staging_buffer, 0, output_bytes);
+        self.queue.submit([encoder.finish()]);
+
+        let slice = staging_buffer.slice(..);
+        let (sender, receiver) = mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ignored = sender.send(result);
+        });
+        self.device.poll(wgpu::Maintain::Wait);
+        receiver
+            .recv()
+            .map_err(|e| MoeRuntimeError::Unsupported(format!("WGPU map callback failed: {e}")))?
+            .map_err(|e| MoeRuntimeError::Unsupported(format!("WGPU output map failed: {e}")))?;
+
+        let mapped = slice.get_mapped_range();
+        let out = le_bytes_to_f32s(&mapped)?;
+        drop(mapped);
+        staging_buffer.unmap();
+        Ok(out)
+    }
+}
+
+fn storage_entry(binding: u32, read_only: bool) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Storage { read_only },
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        count: None,
+    }
+}
+
+fn binding<'a>(binding: u32, buffer: &'a wgpu::Buffer) -> wgpu::BindGroupEntry<'a> {
+    wgpu::BindGroupEntry {
+        binding,
+        resource: buffer.as_entire_binding(),
+    }
+}
+
+fn byte_len(values: usize) -> Result<u64> {
+    values
+        .checked_mul(std::mem::size_of::<f32>())
+        .and_then(|bytes| u64::try_from(bytes).ok())
+        .ok_or_else(|| MoeRuntimeError::Shape("WGPU buffer byte length overflow".to_string()))
+}
+
+fn dims_bytes(tokens: usize, rows: usize, cols: usize) -> Result<Vec<u8>> {
+    let dims = [
+        u32::try_from(tokens)
+            .map_err(|_| MoeRuntimeError::Shape("WGPU token count exceeds u32::MAX".to_string()))?,
+        u32::try_from(rows)
+            .map_err(|_| MoeRuntimeError::Shape("WGPU row count exceeds u32::MAX".to_string()))?,
+        u32::try_from(cols).map_err(|_| {
+            MoeRuntimeError::Shape("WGPU column count exceeds u32::MAX".to_string())
+        })?,
+        0,
+    ];
+    let mut out = Vec::with_capacity(16);
+    for value in dims {
+        out.extend_from_slice(&value.to_le_bytes());
+    }
+    Ok(out)
+}
+
+fn f32s_to_le_bytes(values: &[f32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(std::mem::size_of_val(values));
+    for value in values {
+        out.extend_from_slice(&value.to_le_bytes());
+    }
+    out
+}
+
+fn le_bytes_to_f32s(bytes: &[u8]) -> Result<Vec<f32>> {
+    if bytes.len() % std::mem::size_of::<f32>() != 0 {
+        return Err(MoeRuntimeError::Shape(format!(
+            "WGPU output byte length {} is not divisible by 4",
+            bytes.len()
+        )));
+    }
+    Ok(bytes
+        .chunks_exact(4)
+        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .collect())
+}
+
+fn div_ceil(value: u32, divisor: u32) -> u32 {
+    value.div_ceil(divisor)
+}

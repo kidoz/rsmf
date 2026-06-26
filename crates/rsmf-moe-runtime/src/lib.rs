@@ -7,7 +7,8 @@
 //!
 //! GPU execution is feature-gated behind `wgpu`. In the default build the
 //! runtime reports a CPU fallback and still exercises the same routing,
-//! placement, and sharded-read contracts.
+//! placement, and sharded-read contracts. With the feature enabled and an
+//! adapter available, expert matmuls run through a small WGPU compute shader.
 //!
 //! ```
 //! use rsmf_moe_runtime::batch_by_destination;
@@ -27,6 +28,8 @@ use rsmf_core::RsmfError;
 
 mod routing;
 mod runtime;
+#[cfg(feature = "wgpu")]
+mod wgpu_compute;
 
 pub use routing::{RoutingBatch, batch_by_destination};
 pub use runtime::{ExpertActivation, MoeRuntime, MoeRuntimeOptions};
@@ -59,14 +62,16 @@ pub enum RuntimeBackend {
         /// Human-readable reason for the fallback.
         reason: String,
     },
-    /// WGPU was requested and an adapter probe succeeded. The current PoC still
-    /// executes the matmul kernels on CPU; this status records that GPU routing
-    /// prerequisites were visible to the runtime.
-    WgpuProbe {
+    /// WGPU was requested and a compute device was selected. The PoC uses one
+    /// WGPU device as a logical executor for the placement devices recorded in
+    /// the file when multiple physical adapters are not available.
+    WgpuCompute {
         /// Number of WGPU placement devices requested by the placement manifest.
         requested_devices: usize,
         /// Number of WGPU adapters observed by the probe.
         available_adapters: usize,
+        /// Human-readable adapter name.
+        adapter_name: String,
     },
 }
 

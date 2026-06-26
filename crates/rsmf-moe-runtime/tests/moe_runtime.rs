@@ -240,6 +240,40 @@ fn two_shard_runtime_matches_single_device_reference() {
     assert!(parallel.report.tokens_per_second().is_finite());
 }
 
+#[cfg(feature = "wgpu")]
+#[test]
+fn wgpu_preference_matches_reference_or_falls_back() {
+    let fixture = build_fixture();
+    let file = fixture.open();
+    let runtime = MoeRuntime::new(
+        file,
+        MoeRuntimeOptions {
+            prefer_wgpu: true,
+            ..MoeRuntimeOptions::default()
+        },
+    )
+    .unwrap();
+    let input = vec![2.0, 1.0, 1.0, 3.0, 4.0, 0.0, 0.0, 5.0];
+    let parallel = runtime.run_layer_top1(0, &input, 2).unwrap();
+    let reference = runtime.run_layer_reference_top1(0, &input, 2).unwrap();
+
+    assert_close(&parallel.output, &reference, 1e-5);
+    match &parallel.report.backend {
+        RuntimeBackend::WgpuCompute {
+            requested_devices,
+            available_adapters,
+            adapter_name,
+        } => {
+            assert_eq!(*requested_devices, 2);
+            assert!(*available_adapters >= 1);
+            assert!(!adapter_name.is_empty());
+        }
+        RuntimeBackend::CpuFallback { reason } => {
+            assert!(!reason.is_empty());
+        }
+    }
+}
+
 #[test]
 fn missing_placement_manifest_is_rejected() {
     let dir = tempdir().unwrap();
@@ -259,4 +293,15 @@ fn missing_placement_manifest_is_rejected() {
     let err =
         MoeRuntime::new(RsmfFile::open(path).unwrap(), MoeRuntimeOptions::default()).unwrap_err();
     assert!(matches!(err, MoeRuntimeError::Missing(message) if message == "PlacementManifest"));
+}
+
+#[cfg(feature = "wgpu")]
+fn assert_close(left: &[f32], right: &[f32], tolerance: f32) {
+    assert_eq!(left.len(), right.len());
+    for (idx, (&left, &right)) in left.iter().zip(right).enumerate() {
+        assert!(
+            (left - right).abs() <= tolerance,
+            "value {idx} differs: {left} vs {right}"
+        );
+    }
 }

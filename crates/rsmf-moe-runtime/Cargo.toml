@@ -17,11 +17,15 @@ thiserror.workspace = true
 workspace = true
 optional = true
 
+[dependencies.wgpu]
+workspace = true
+optional = true
+
 [features]
 default = []
 # Probe WGPU availability for the expert-parallel PoC. The default runtime
 # remains CPU-only so CI can run without an adapter.
-wgpu = ["dep:rsmf-wgpu"]
+wgpu = ["dep:rsmf-wgpu", "dep:wgpu"]
 
 [dev-dependencies]
 tempfile.workspace = true
