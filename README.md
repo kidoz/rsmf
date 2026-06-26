@@ -205,7 +205,8 @@ owned input/output tensors.
 
 R2 adds explicit initializer bindings through `SessionOptions.initializers`,
 mapping ONNX initializer names to canonical RSMF tensor names. The first
-supported path is row-major F32 on CPU. It avoids embedding duplicate weight
+supported path is row-major F32 on CPU, with ONNX initializer dtype/shape
+preflight before ORT session creation. It avoids embedding duplicate weight
 bytes in the graph payload, while the pinned ORT Rust API still materializes an
 ORT-owned initializer value during session build.
 
