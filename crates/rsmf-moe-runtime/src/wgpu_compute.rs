@@ -53,6 +53,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 pub(crate) struct WgpuExecutor {
     device: wgpu::Device,
     queue: wgpu::Queue,
+    bind_group_layout: wgpu::BindGroupLayout,
+    pipeline: wgpu::ComputePipeline,
     adapter_name: String,
 }
 
@@ -61,9 +63,56 @@ impl WgpuExecutor {
         let caps = rsmf_wgpu::detect_capabilities()?;
         let adapter_name = caps.info.name.clone();
         let handle = rsmf_wgpu::request_device(&caps)?;
+        let shader = handle
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("rsmf-moe matmul shader"),
+                source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(SHADER)),
+            });
+        let bind_group_layout =
+            handle
+                .device
+                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("rsmf-moe matmul bgl"),
+                    entries: &[
+                        storage_entry(0, true),
+                        storage_entry(1, true),
+                        storage_entry(2, false),
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 3,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Uniform,
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                    ],
+                });
+        let pipeline_layout =
+            handle
+                .device
+                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("rsmf-moe matmul pipeline layout"),
+                    bind_group_layouts: &[&bind_group_layout],
+                    push_constant_ranges: &[],
+                });
+        let pipeline = handle
+            .device
+            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("rsmf-moe matmul pipeline"),
+                layout: Some(&pipeline_layout),
+                module: &shader,
+                entry_point: "main",
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                cache: None,
+            });
         Some(Self {
             device: handle.device,
             queue: handle.queue,
+            bind_group_layout,
+            pipeline,
             adapter_name,
         })
     }
@@ -141,52 +190,9 @@ impl WgpuExecutor {
             mapped_at_creation: false,
         });
 
-        let shader = self
-            .device
-            .create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("rsmf-moe matmul shader"),
-                source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(SHADER)),
-            });
-        let bind_group_layout =
-            self.device
-                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                    label: Some("rsmf-moe matmul bgl"),
-                    entries: &[
-                        storage_entry(0, true),
-                        storage_entry(1, true),
-                        storage_entry(2, false),
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 3,
-                            visibility: wgpu::ShaderStages::COMPUTE,
-                            ty: wgpu::BindingType::Buffer {
-                                ty: wgpu::BufferBindingType::Uniform,
-                                has_dynamic_offset: false,
-                                min_binding_size: None,
-                            },
-                            count: None,
-                        },
-                    ],
-                });
-        let pipeline_layout = self
-            .device
-            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("rsmf-moe matmul pipeline layout"),
-                bind_group_layouts: &[&bind_group_layout],
-                push_constant_ranges: &[],
-            });
-        let pipeline = self
-            .device
-            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("rsmf-moe matmul pipeline"),
-                layout: Some(&pipeline_layout),
-                module: &shader,
-                entry_point: "main",
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-                cache: None,
-            });
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("rsmf-moe matmul bind group"),
-            layout: &bind_group_layout,
+            layout: &self.bind_group_layout,
             entries: &[
                 binding(0, &input_buffer),
                 binding(1, &matrix_buffer),
@@ -205,7 +211,7 @@ impl WgpuExecutor {
                 label: Some("rsmf-moe matmul pass"),
                 timestamp_writes: None,
             });
-            pass.set_pipeline(&pipeline);
+            pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &bind_group, &[]);
             pass.dispatch_workgroups(div_ceil(tokens as u32, 8), div_ceil(rows as u32, 8), 1);
         }
