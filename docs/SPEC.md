@@ -467,6 +467,27 @@ only those candidates; otherwise it falls back to the existing backend-only
 selection for that tensor. This preserves current behavior for files without
 tier metadata.
 
+## 8.3 Prefetch / locality metadata
+
+Prefetch hints are represented as per-variant metadata, not as runtime behavior
+or a new descriptor field. A variant may carry:
+
+- `prefetch.group`: non-empty opaque group id. Variants sharing a group are
+  candidates for speculative co-loading / co-eviction.
+- `prefetch.affinity`: optional comma-separated list of non-empty labels such as
+  shard ids, expert ids, tier labels, or writer-defined locality labels commonly
+  co-active with this variant.
+
+Readers MUST reject variants carrying any `prefetch.*` key without a non-empty
+`prefetch.group`, duplicate `prefetch.group` / `prefetch.affinity` keys, and
+empty affinity tokens. Prefetch-unaware readers ignore these keys and continue
+to read variant descriptors and arena bytes normally.
+
+The reference reader exposes these hints through
+`RsmfFile::prefetch_hints()` / `LazyRsmfFile::prefetch_hints()`. The accessor is
+metadata-only; no prefetching, eviction, transport, or scheduling is performed
+by the v1 reader.
+
 ---
 
 ## 9. Writer paths and feature matrix

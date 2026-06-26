@@ -130,6 +130,7 @@ rsmf pack --from-npy embeddings.npy \
 
 ```sh
 rsmf inspect  model.rsmf
+rsmf inspect  model.rsmf --moe --prefetch
 rsmf verify   model.rsmf --full
 rsmf select   model.rsmf --mode cpu
 rsmf select   model.rsmf --mode gpu --tier nvme --assume-wgpu
@@ -157,6 +158,11 @@ rsmf verify ./sharded/master.rsmf --full \
 by the first `tier.intent` found on a tensor's variants, and `--by size`
 greedily balances total variant bytes. The master keeps placeholder arena bytes;
 full checksum verification needs every shard attached.
+
+Per-variant `prefetch.group` / `prefetch.affinity` metadata is inspectable with
+`rsmf inspect --prefetch`. These hints are metadata-only in v1 and are intended
+for later runtimes that want to speculatively co-load expert or shard-local
+variants.
 
 ### Placement manifests
 

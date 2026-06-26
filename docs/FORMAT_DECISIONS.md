@@ -119,6 +119,18 @@ already-specified `shard_id != 0` path and preserves the existing reader
 contract. The reference CLI provides `--by size`, `--by tier`, and `--by expert`
 assignment strategies.
 
+## D15 — Prefetch hints as per-variant metadata
+
+Prefetch / locality hints use `VariantMeta.extra` keys instead of a runtime
+section or descriptor fields: `prefetch.group` names an opaque co-loading /
+co-eviction group, and `prefetch.affinity` carries comma-separated shard,
+expert, tier, or writer-defined labels commonly co-active with the variant.
+
+This keeps the format metadata-only. The reader exposes a typed
+`prefetch_hints()` index for runtimes to consume later, but the v1 reader does
+not prefetch, evict, transport, or schedule anything by itself. Existing readers
+that ignore the keys continue to read variant bytes unchanged.
+
 ## D8 — Source-format conversion priorities
 
 The `rsmf pack` and `rsmf import` CLIs ingest from a fixed priority-ordered

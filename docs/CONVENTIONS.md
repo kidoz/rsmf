@@ -29,6 +29,7 @@ namespace are writer-specific and should be avoided in published files.
 | `shape.*` | Logical-vs-physical shape info | Per-tensor metadata |
 | `variant.*` | Per-variant annotations | Per-variant metadata |
 | `tier.*` | Variant residency / access tier hints | Per-variant metadata |
+| `prefetch.*` | Variant prefetch / locality hints | Per-variant metadata |
 | `graph.*` | Graph-payload hints | Per-graph metadata |
 | `asset.*` | Asset-payload hints | Per-asset metadata |
 | `adapter.*` | LoRA / DoRA / IA³ adapter tensors | Manifest (global) + per-tensor metadata |
@@ -99,6 +100,8 @@ Keys can also appear on variant metadata when quantization is per-variant.
 | `variant.calibration_error` | Decimal string. Scheme-specific metric (L2, KL, SNR). |
 | `tier.intent` | Intended residency tier for this variant: `vram`, `ram`, or `nvme`. Used by tier-aware variant selection. |
 | `tier.class` | Optional access/precision class label. Recommended values: `hot`, `warm`, `cold`; unknown non-empty strings are preserved. |
+| `prefetch.group` | Opaque group id. Variants sharing a group are candidates for speculative co-loading / co-eviction. |
+| `prefetch.affinity` | Optional comma-separated shard / expert / writer labels commonly co-active with this variant. |
 | `bench.decode_ns_per_elem` | Measured decode speed. |
 | `bench.env` | Free-form hardware/software fingerprint. `M2-Max macOS-15 rustc-1.85 release`. |
 
@@ -112,6 +115,14 @@ winner. If a tensor has no variant for the requested tier, selection falls back
 to the existing backend-only behavior for that tensor. Readers reject malformed
 `tier.intent` values and duplicate `tier.intent` / `tier.class` keys with a
 structural error.
+
+Prefetch hints do not affect variant selection or byte loading by themselves.
+Runtimes that implement speculative loading can call
+`RsmfFile::prefetch_hints()` to group variants by `prefetch.group` and parse
+`prefetch.affinity`. Any variant carrying a `prefetch.*` key MUST include a
+non-empty `prefetch.group`; `prefetch.affinity`, when present, is a
+comma-separated list of non-empty tokens. Unknown `prefetch.*` keys are
+preserved for future convention growth.
 
 ---
 
