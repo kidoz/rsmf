@@ -4,6 +4,7 @@ use crate::error::{Result, RsmfError};
 use crate::manifest::Manifest;
 use crate::tensor::descriptor::TensorDescriptor;
 use crate::tensor::variant::{EncodingKind, TargetTag, VariantDescriptor};
+use crate::tier::{Tier, tier_class_from_meta, tier_intent_from_meta};
 
 /// Requested execution mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -111,6 +112,10 @@ pub struct SelectedVariant {
     pub target: TargetTag,
     /// Encoding kind of the selected variant.
     pub encoding: EncodingKind,
+    /// Optional `tier.intent` metadata on the selected variant.
+    pub tier_intent: Option<Tier>,
+    /// Optional `tier.class` metadata on the selected variant.
+    pub tier_class: Option<String>,
     /// Score assigned by the selector; useful for diagnostics.
     pub score: i32,
 }
@@ -148,9 +153,24 @@ pub fn select_variants(
     mode: ExecutionMode,
     caps: &Capabilities,
 ) -> Result<TensorPlan> {
+    select_variants_with_tier(manifest, mode, caps, None)
+}
+
+/// Compute a variant plan with an optional requested residency tier.
+///
+/// When `tier` is `Some`, the selector first considers variants whose
+/// `tier.intent` equals that tier. If a tensor has no matching tier-tagged
+/// candidate, selection falls back to the backend-only scoring used by
+/// [`select_variants`].
+pub fn select_variants_with_tier(
+    manifest: &Manifest,
+    mode: ExecutionMode,
+    caps: &Capabilities,
+    tier: Option<Tier>,
+) -> Result<TensorPlan> {
     let mut out = TensorPlan::default();
     for tensor in &manifest.tensors {
-        let selection = pick_for_tensor(manifest, tensor, mode, caps)?;
+        let selection = pick_for_tensor(manifest, tensor, mode, caps, tier)?;
         out.selections.push(selection);
     }
     Ok(out)
@@ -161,32 +181,62 @@ fn pick_for_tensor<'a>(
     tensor: &TensorDescriptor,
     mode: ExecutionMode,
     caps: &Capabilities,
+    tier: Option<Tier>,
 ) -> Result<SelectedVariant> {
-    let mut best: Option<(i32, u32, &'a VariantDescriptor)> = None;
-
-    // Canonical variant is always a candidate.
+    let mut candidates: Vec<(u32, &'a VariantDescriptor)> = Vec::new();
     if let Some(v) = manifest.variants.get(tensor.canonical_variant as usize) {
-        update_best(&mut best, tensor.canonical_variant, v, mode, caps);
+        candidates.push((tensor.canonical_variant, v));
     }
     for &idx in &tensor.packed_variants {
         if let Some(v) = manifest.variants.get(idx as usize) {
-            update_best(&mut best, idx, v, mode, caps);
+            candidates.push((idx, v));
         }
     }
 
-    let (score, idx, v) = best.ok_or_else(|| {
+    let mut tier_matches = Vec::new();
+    if let Some(requested) = tier {
+        for &(idx, v) in &candidates {
+            if tier_intent_from_meta(&v.meta.extra)? == Some(requested) {
+                tier_matches.push((idx, v));
+            }
+        }
+    }
+
+    let candidate_set = if tier.is_some() && !tier_matches.is_empty() {
+        tier_matches.as_slice()
+    } else {
+        candidates.as_slice()
+    };
+
+    let (score, idx, v) = choose_best(candidate_set, mode, caps).ok_or_else(|| {
         RsmfError::not_found(format!(
             "tensor {} missing at least a canonical variant",
             tensor.name
         ))
     })?;
+    let tier_intent = tier_intent_from_meta(&v.meta.extra)?;
+    let tier_class = tier_class_from_meta(&v.meta.extra)?.map(str::to_string);
     Ok(SelectedVariant {
         tensor_name: tensor.name.clone(),
         variant_index: idx,
         target: v.target,
         encoding: v.encoding,
+        tier_intent,
+        tier_class,
         score,
     })
+}
+
+fn choose_best<'a>(
+    candidates: &[(u32, &'a VariantDescriptor)],
+    mode: ExecutionMode,
+    caps: &Capabilities,
+) -> Option<(i32, u32, &'a VariantDescriptor)> {
+    let mut best: Option<(i32, u32, &'a VariantDescriptor)> = None;
+    for &(idx, v) in candidates {
+        update_best(&mut best, idx, v, mode, caps);
+    }
+    best
 }
 
 fn update_best<'a>(

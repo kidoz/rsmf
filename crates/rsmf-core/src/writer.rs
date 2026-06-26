@@ -20,6 +20,7 @@ use crate::section::{
 use crate::tensor::descriptor::TensorDescriptor;
 use crate::tensor::dtype::{LogicalDtype, StorageDtype};
 use crate::tensor::variant::{EncodingKind, LayoutTag, TargetTag, VariantDescriptor, VariantMeta};
+use crate::tier::{Tier, set_tier_class, set_tier_intent};
 
 /// Default alignment for the canonical arena in bytes.
 pub const DEFAULT_CANONICAL_ALIGNMENT: u32 = 64;
@@ -188,6 +189,20 @@ impl VariantInput {
             bytes,
             meta: VariantMeta::default(),
         }
+    }
+
+    /// Attach `tier.intent` metadata to this variant.
+    #[must_use]
+    pub fn with_tier_intent(mut self, tier: Tier) -> Self {
+        set_tier_intent(&mut self.meta.extra, tier);
+        self
+    }
+
+    /// Attach `tier.class` metadata to this variant.
+    #[must_use]
+    pub fn with_tier_class(mut self, class: impl Into<String>) -> Self {
+        set_tier_class(&mut self.meta.extra, class);
+        self
     }
 }
 

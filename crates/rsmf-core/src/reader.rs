@@ -24,6 +24,7 @@ use crate::section::{SECTION_DESC_LEN, SectionDescriptor, SectionKind};
 use crate::selection::{Capabilities, ExecutionMode, TensorPlan, select_variants};
 use crate::tensor::variant::VariantDescriptor;
 use crate::tensor::view::TensorView;
+use crate::tier::{Tier, validate_tier_metadata};
 
 /// Human-readable summary of a file. Useful for `rsmf inspect` output.
 #[derive(Debug, Clone)]
@@ -187,6 +188,7 @@ impl RsmfFile {
         let manifest_bytes = &bytes[manifest_section.offset as usize
             ..(manifest_section.offset + manifest_section.length) as usize];
         let manifest = Manifest::decode(manifest_bytes)?;
+        validate_manifest_tier_metadata(&manifest)?;
 
         let canonical_section_idx = sections
             .iter()
@@ -414,6 +416,31 @@ impl RsmfFile {
         #[cfg(feature = "tracing")]
         let _span = info_span!("select_variants", mode = ?mode).entered();
         select_variants(&self.manifest, mode, caps)
+    }
+
+    /// Compute a variant-selection plan constrained by a requested tier when
+    /// matching tier-tagged candidates exist.
+    ///
+    /// ```no_run
+    /// # use rsmf_core::{Capabilities, ExecutionMode, RsmfFile, Tier};
+    /// let file = RsmfFile::open("model.rsmf")?;
+    /// let plan = file.select_variants_for_tier(
+    ///     ExecutionMode::HybridAuto,
+    ///     &Capabilities::detect(),
+    ///     Tier::Nvme,
+    /// )?;
+    /// println!("{} tensors planned", plan.selections.len());
+    /// # Ok::<(), rsmf_core::RsmfError>(())
+    /// ```
+    pub fn select_variants_for_tier(
+        &self,
+        mode: ExecutionMode,
+        caps: &Capabilities,
+        tier: Tier,
+    ) -> Result<TensorPlan> {
+        #[cfg(feature = "tracing")]
+        let _span = info_span!("select_variants_for_tier", mode = ?mode, tier = ?tier).entered();
+        crate::selection::select_variants_with_tier(&self.manifest, mode, caps, Some(tier))
     }
 
     /// Return a mmap-backed view over the canonical variant of the named tensor.
@@ -984,6 +1011,15 @@ pub(crate) fn validate_manifest(
                 v.section_relative_offset, align
             )));
         }
+    }
+    Ok(())
+}
+
+fn validate_manifest_tier_metadata(manifest: &Manifest) -> Result<()> {
+    for (i, variant) in manifest.variants.iter().enumerate() {
+        validate_tier_metadata(&variant.meta.extra).map_err(|e| {
+            RsmfError::structural(format!("variant[{i}] tier metadata invalid: {e}"))
+        })?;
     }
     Ok(())
 }

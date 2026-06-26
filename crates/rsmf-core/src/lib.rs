@@ -25,6 +25,7 @@ pub mod section;
 pub mod selection;
 pub mod streaming_writer;
 pub mod tensor;
+pub mod tier;
 pub mod validator;
 pub mod writer;
 
@@ -56,6 +57,7 @@ pub use reader::{AssetRef, CustomSectionPayload, GraphPayload, RsmfFile};
 pub use section::{SectionDescriptor, SectionKind};
 pub use selection::{
     Capabilities, CpuFeatures, ExecutionMode, GpuBackend, SelectedVariant, TensorPlan,
+    select_variants_with_tier,
 };
 pub use streaming_writer::StreamingRsmfWriter;
 pub use tensor::descriptor::TensorDescriptor;
@@ -64,6 +66,7 @@ pub use tensor::variant::{
     ArenaGroup, EncodingKind, LayoutTag, TargetTag, VariantDescriptor, VariantMeta,
 };
 pub use tensor::view::TensorView;
+pub use tier::{TIER_CLASS_KEY, TIER_INTENT_KEY, Tier};
 pub use validator::Validator;
 pub use writer::{
     AssetInput, CustomSectionInput, GraphInput, RsmfWriter, TensorInput, VariantInput,
