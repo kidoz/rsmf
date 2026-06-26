@@ -1,6 +1,6 @@
 //! Runtime planner and F32 MoE layer execution.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::time::Instant;
 
 use rsmf_core::{
@@ -29,6 +29,8 @@ pub struct MoeRuntimeOptions {
     pub prefer_wgpu: bool,
     /// Expert activation convention.
     pub activation: ExpertActivation,
+    /// Runtime resource limits checked before large allocations.
+    pub limits: RuntimeLimits,
 }
 
 impl Default for MoeRuntimeOptions {
@@ -36,7 +38,68 @@ impl Default for MoeRuntimeOptions {
         Self {
             prefer_wgpu: false,
             activation: ExpertActivation::Identity,
+            limits: RuntimeLimits::default(),
         }
+    }
+}
+
+/// Resource limits for one MoE layer invocation.
+///
+/// These guardrails reject malformed or unexpectedly large inputs before the
+/// runtime allocates output buffers or decoded matrix storage. Set a field to
+/// `None` to disable that specific guard.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeLimits {
+    /// Maximum number of token rows accepted by one run.
+    pub max_tokens: Option<usize>,
+    /// Maximum decoded elements accepted for one rank-2 tensor.
+    pub max_tensor_elements: Option<usize>,
+    /// Maximum output elements allocated for one run.
+    pub max_output_elements: Option<usize>,
+}
+
+impl Default for RuntimeLimits {
+    fn default() -> Self {
+        Self {
+            max_tokens: Some(1_048_576),
+            max_tensor_elements: Some(1_073_741_824),
+            max_output_elements: Some(1_073_741_824),
+        }
+    }
+}
+
+impl RuntimeLimits {
+    fn check_tokens(&self, token_count: usize) -> Result<()> {
+        if let Some(limit) = self.max_tokens
+            && token_count > limit
+        {
+            return Err(MoeRuntimeError::Shape(format!(
+                "token count {token_count} exceeds runtime limit {limit}"
+            )));
+        }
+        Ok(())
+    }
+
+    fn check_tensor_elements(&self, tensor_name: &str, elements: usize) -> Result<()> {
+        if let Some(limit) = self.max_tensor_elements
+            && elements > limit
+        {
+            return Err(MoeRuntimeError::Shape(format!(
+                "{tensor_name} has {elements} elements, exceeding runtime limit {limit}"
+            )));
+        }
+        Ok(())
+    }
+
+    fn check_output_elements(&self, elements: usize) -> Result<()> {
+        if let Some(limit) = self.max_output_elements
+            && elements > limit
+        {
+            return Err(MoeRuntimeError::Shape(format!(
+                "output has {elements} elements, exceeding runtime limit {limit}"
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -113,6 +176,7 @@ impl MoeRuntime {
     ) -> Result<MoeRunOutput> {
         let loaded = self.load_layer(layer, input_width)?;
         let token_count = checked_token_count(input, input_width)?;
+        self.options.limits.check_tokens(token_count)?;
 
         let gating_start = Instant::now();
         let assignments = route_top1(&loaded.router, input, token_count)?;
@@ -163,8 +227,13 @@ impl MoeRuntime {
     ) -> Result<Vec<f32>> {
         let loaded = self.load_layer(layer, input_width)?;
         let token_count = checked_token_count(input, input_width)?;
+        self.options.limits.check_tokens(token_count)?;
         let assignments = route_top1(&loaded.router, input, token_count)?;
-        let mut output = vec![0.0; token_count * loaded.output_width];
+        let total_output_len = output_len(token_count, loaded.output_width)?;
+        self.options
+            .limits
+            .check_output_elements(total_output_len)?;
+        let mut output = vec![0.0; total_output_len];
         for (token_idx, expert_id) in assignments.iter().copied().enumerate() {
             let expert = loaded
                 .experts
@@ -180,40 +249,113 @@ impl MoeRuntime {
 
     fn load_layer(&self, layer: u32, input_width: usize) -> Result<LoadedLayer> {
         let moe = self.file.moe_experts()?;
-        let router_entry = moe
+        if let Some(top_k) = moe.top_k
+            && top_k != 1
+        {
+            return Err(MoeRuntimeError::Unsupported(format!(
+                "run_layer_top1 requires moe.top_k=1, got {top_k}"
+            )));
+        }
+
+        let mut router_entries = moe
             .entries
             .iter()
-            .find(|entry| entry.layer == layer && entry.role == MoeRole::Router)
+            .filter(|entry| entry.layer == layer && entry.role == MoeRole::Router);
+        let router_entry = router_entries
+            .next()
             .ok_or_else(|| MoeRuntimeError::Missing(format!("layer {layer} router tensor")))?;
-        let router = load_matrix(&self.file, &router_entry.tensor_name)?;
+        if let Some(duplicate) = router_entries.next() {
+            return Err(MoeRuntimeError::Shape(format!(
+                "layer {layer} has multiple router tensors: {} and {}",
+                router_entry.tensor_name, duplicate.tensor_name
+            )));
+        }
+        if let Some(expert_id) = router_entry.expert_id {
+            return Err(MoeRuntimeError::Shape(format!(
+                "router tensor {} must not set moe.expert={expert_id}",
+                router_entry.tensor_name
+            )));
+        }
+        let router = self.load_matrix(&router_entry.tensor_name)?;
         if router.cols != input_width {
             return Err(MoeRuntimeError::Shape(format!(
                 "router {} has input width {}, got {input_width}",
                 router_entry.tensor_name, router.cols
             )));
         }
+        if router.rows == 0 {
+            return Err(MoeRuntimeError::Shape(format!(
+                "router {} must have at least one expert row",
+                router_entry.tensor_name
+            )));
+        }
+        let router_rows = u32::try_from(router.rows).map_err(|_| {
+            MoeRuntimeError::Shape(format!(
+                "router {} row count exceeds u32::MAX",
+                router_entry.tensor_name
+            ))
+        })?;
+        if let Some(n_experts) = moe.n_experts
+            && router_rows != n_experts
+        {
+            return Err(MoeRuntimeError::Shape(format!(
+                "router {} has {router_rows} expert rows, but moe.n_experts={n_experts}",
+                router_entry.tensor_name
+            )));
+        }
 
-        let mut builders: HashMap<u32, ExpertBuilder> = HashMap::new();
+        let mut builders: BTreeMap<u32, ExpertBuilder> = BTreeMap::new();
         for entry in moe
             .entries
             .iter()
             .filter(|entry| entry.layer == layer && entry.expert_id.is_some())
         {
+            if entry.shared {
+                return Err(MoeRuntimeError::Unsupported(format!(
+                    "shared MoE experts are not supported by rsmf-moe-runtime: {}",
+                    entry.tensor_name
+                )));
+            }
             let expert_id = entry.expert_id.unwrap_or(0);
+            if let Some(n_experts) = moe.n_experts
+                && expert_id >= n_experts
+            {
+                return Err(MoeRuntimeError::Shape(format!(
+                    "layer {layer} expert {expert_id} is outside moe.n_experts={n_experts}"
+                )));
+            }
             let builder = builders.entry(expert_id).or_insert_with(|| ExpertBuilder {
                 up_name: None,
                 down_name: None,
                 gate_name: None,
             });
             match &entry.role {
-                MoeRole::Up => builder.up_name = Some(entry.tensor_name.clone()),
-                MoeRole::Down => builder.down_name = Some(entry.tensor_name.clone()),
-                MoeRole::Gate => builder.gate_name = Some(entry.tensor_name.clone()),
+                MoeRole::Up => set_once(
+                    &mut builder.up_name,
+                    &entry.tensor_name,
+                    "up",
+                    layer,
+                    expert_id,
+                )?,
+                MoeRole::Down => set_once(
+                    &mut builder.down_name,
+                    &entry.tensor_name,
+                    "down",
+                    layer,
+                    expert_id,
+                )?,
+                MoeRole::Gate => set_once(
+                    &mut builder.gate_name,
+                    &entry.tensor_name,
+                    "gate",
+                    layer,
+                    expert_id,
+                )?,
                 _ => {}
             }
         }
 
-        let mut experts = HashMap::with_capacity(builders.len());
+        let mut experts = BTreeMap::new();
         let mut output_width = None;
         for (expert_id, builder) in builders {
             let up_name = builder.up_name.ok_or_else(|| {
@@ -222,8 +364,8 @@ impl MoeRuntime {
             let down_name = builder.down_name.ok_or_else(|| {
                 MoeRuntimeError::Missing(format!("layer {layer} expert {expert_id} down tensor"))
             })?;
-            let up = load_matrix(&self.file, &up_name)?;
-            let down = load_matrix(&self.file, &down_name)?;
+            let up = self.load_matrix(&up_name)?;
+            let down = self.load_matrix(&down_name)?;
             if up.cols != input_width {
                 return Err(MoeRuntimeError::Shape(format!(
                     "{up_name} has input width {}, expected {input_width}",
@@ -245,8 +387,9 @@ impl MoeRuntime {
                 }
                 _ => output_width = Some(down.rows),
             }
-            let gate = if let Some(gate_name) = builder.gate_name {
-                let gate = load_matrix(&self.file, &gate_name)?;
+            let gate_name = builder.gate_name;
+            let gate = if let Some(gate_name) = &gate_name {
+                let gate = self.load_matrix(gate_name)?;
                 if gate.rows != up.rows || gate.cols != up.cols {
                     return Err(MoeRuntimeError::Shape(format!(
                         "{gate_name} shape [{}x{}] does not match {up_name} shape [{}x{}]",
@@ -261,10 +404,13 @@ impl MoeRuntime {
             } else {
                 None
             };
-            let shard_id = shared_expert_shard(&self.file, &[&up_name, &down_name])?;
+            let mut shard_tensor_names = vec![up_name.as_str(), down_name.as_str()];
+            if let Some(gate_name) = &gate_name {
+                shard_tensor_names.push(gate_name.as_str());
+            }
+            let shard_id = shared_expert_shard(&self.file, &shard_tensor_names)?;
             let placement = self.placement_for_shard(shard_id)?;
-            let prefetch_groups =
-                self.prefetch_groups_for_tensors([up_name.as_str(), down_name.as_str()]);
+            let prefetch_groups = self.prefetch_groups_for_tensors(shard_tensor_names);
             experts.insert(
                 expert_id,
                 ExpertWeights {
@@ -280,6 +426,13 @@ impl MoeRuntime {
 
         let output_width = output_width
             .ok_or_else(|| MoeRuntimeError::Missing(format!("layer {layer} expert tensors")))?;
+        for expert_id in 0..router_rows {
+            if !experts.contains_key(&expert_id) {
+                return Err(MoeRuntimeError::Missing(format!(
+                    "layer {layer} expert {expert_id} tensors"
+                )));
+            }
+        }
         Ok(LoadedLayer {
             router,
             experts,
@@ -308,6 +461,36 @@ impl MoeRuntime {
             )));
         }
         Ok(placement)
+    }
+
+    fn load_matrix(&self, tensor_name: &str) -> Result<Matrix> {
+        let view = self.file.tensor_view(tensor_name)?;
+        let shape = view.shape();
+        if shape.len() != 2 {
+            return Err(MoeRuntimeError::Shape(format!(
+                "{tensor_name} must be rank-2, got rank {}",
+                shape.len()
+            )));
+        }
+        let rows = usize::try_from(shape[0]).map_err(|_| {
+            MoeRuntimeError::Shape(format!("{tensor_name} row count exceeds usize::MAX"))
+        })?;
+        let cols = usize::try_from(shape[1]).map_err(|_| {
+            MoeRuntimeError::Shape(format!("{tensor_name} column count exceeds usize::MAX"))
+        })?;
+        let expected = output_len(rows, cols)
+            .map_err(|_| MoeRuntimeError::Shape(format!("{tensor_name} element count overflow")))?;
+        self.options
+            .limits
+            .check_tensor_elements(tensor_name, expected)?;
+        let data = view.decode_f32()?;
+        if data.len() != expected {
+            return Err(MoeRuntimeError::Shape(format!(
+                "{tensor_name} decoded {} values, expected {expected}",
+                data.len()
+            )));
+        }
+        Ok(Matrix { rows, cols, data })
     }
 
     fn prefetch_groups_for_tensors<'a>(
@@ -376,7 +559,11 @@ impl MoeRuntime {
         token_count: usize,
         device_batches: &[DeviceBatch],
     ) -> Result<Vec<f32>> {
-        let mut output = vec![0.0; token_count * loaded.output_width];
+        let total_output_len = output_len(token_count, loaded.output_width)?;
+        self.options
+            .limits
+            .check_output_elements(total_output_len)?;
+        let mut output = vec![0.0; total_output_len];
         for batch in device_batches {
             let expert = loaded
                 .experts
@@ -402,13 +589,18 @@ impl MoeRuntime {
         token_count: usize,
         device_batches: &[DeviceBatch],
     ) -> Result<Vec<f32>> {
-        let mut output = vec![0.0; token_count * loaded.output_width];
+        let total_output_len = output_len(token_count, loaded.output_width)?;
+        self.options
+            .limits
+            .check_output_elements(total_output_len)?;
+        let mut output = vec![0.0; total_output_len];
         for batch in device_batches {
             let expert = loaded
                 .experts
                 .get(&batch.expert_id)
                 .ok_or_else(|| MoeRuntimeError::Missing(format!("expert {}", batch.expert_id)))?;
-            let mut batch_input = Vec::with_capacity(batch.token_indices.len() * input_width);
+            let batch_input_len = output_len(batch.token_indices.len(), input_width)?;
+            let mut batch_input = Vec::with_capacity(batch_input_len);
             for &token_idx in &batch.token_indices {
                 batch_input.extend_from_slice(
                     &input[token_idx * input_width..(token_idx + 1) * input_width],
@@ -463,7 +655,7 @@ impl MoeRuntime {
 #[derive(Debug)]
 struct LoadedLayer {
     router: Matrix,
-    experts: HashMap<u32, ExpertWeights>,
+    experts: BTreeMap<u32, ExpertWeights>,
     output_width: usize,
 }
 
@@ -504,6 +696,11 @@ fn checked_token_count(input: &[f32], input_width: usize) -> Result<usize> {
         )));
     }
     Ok(input.len() / input_width)
+}
+
+fn output_len(rows: usize, cols: usize) -> Result<usize> {
+    rows.checked_mul(cols)
+        .ok_or_else(|| MoeRuntimeError::Shape("element count overflow".to_string()))
 }
 
 fn route_top1(router: &Matrix, input: &[f32], token_count: usize) -> Result<Vec<u32>> {
@@ -585,34 +782,6 @@ impl Matrix {
     }
 }
 
-fn load_matrix(file: &RsmfFile, tensor_name: &str) -> Result<Matrix> {
-    let view = file.tensor_view(tensor_name)?;
-    let shape = view.shape();
-    if shape.len() != 2 {
-        return Err(MoeRuntimeError::Shape(format!(
-            "{tensor_name} must be rank-2, got rank {}",
-            shape.len()
-        )));
-    }
-    let rows = usize::try_from(shape[0]).map_err(|_| {
-        MoeRuntimeError::Shape(format!("{tensor_name} row count exceeds usize::MAX"))
-    })?;
-    let cols = usize::try_from(shape[1]).map_err(|_| {
-        MoeRuntimeError::Shape(format!("{tensor_name} column count exceeds usize::MAX"))
-    })?;
-    let data = view.decode_f32()?;
-    let expected = rows
-        .checked_mul(cols)
-        .ok_or_else(|| MoeRuntimeError::Shape(format!("{tensor_name} element count overflow")))?;
-    if data.len() != expected {
-        return Err(MoeRuntimeError::Shape(format!(
-            "{tensor_name} decoded {} values, expected {expected}",
-            data.len()
-        )));
-    }
-    Ok(Matrix { rows, cols, data })
-}
-
 fn shared_expert_shard(file: &RsmfFile, tensor_names: &[&str]) -> Result<u64> {
     let mut shard_id = None;
     for tensor_name in tensor_names {
@@ -636,6 +805,22 @@ fn tensor_descriptor<'a>(file: &'a RsmfFile, tensor_name: &str) -> Result<&'a Te
         .iter()
         .find(|tensor| tensor.name == tensor_name)
         .ok_or_else(|| MoeRuntimeError::Missing(format!("tensor {tensor_name}")))
+}
+
+fn set_once(
+    slot: &mut Option<String>,
+    tensor_name: &str,
+    role: &str,
+    layer: u32,
+    expert_id: u32,
+) -> Result<()> {
+    if let Some(existing) = slot {
+        return Err(MoeRuntimeError::Shape(format!(
+            "layer {layer} expert {expert_id} has multiple {role} tensors: {existing} and {tensor_name}"
+        )));
+    }
+    *slot = Some(tensor_name.to_string());
+    Ok(())
 }
 
 #[cfg(feature = "wgpu")]

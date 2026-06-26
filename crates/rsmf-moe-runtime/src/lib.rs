@@ -32,7 +32,7 @@ mod runtime;
 mod wgpu_compute;
 
 pub use routing::{RoutingBatch, batch_by_destination};
-pub use runtime::{ExpertActivation, MoeRuntime, MoeRuntimeOptions};
+pub use runtime::{ExpertActivation, MoeRuntime, MoeRuntimeOptions, RuntimeLimits};
 
 /// Result alias for the MoE runtime crate.
 pub type Result<T> = std::result::Result<T, MoeRuntimeError>;

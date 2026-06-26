@@ -9,7 +9,9 @@ use rsmf_core::{
     DeviceDescriptor, DeviceKind, LogicalDtype, MemoryTier, PLACEMENT_FLAG_PIN, PLACEMENT_VERSION,
     PlacementManifest, PlacementRecord, RsmfFile,
 };
-use rsmf_moe_runtime::{MoeRuntime, MoeRuntimeError, MoeRuntimeOptions, RuntimeBackend};
+use rsmf_moe_runtime::{
+    ExpertActivation, MoeRuntime, MoeRuntimeError, MoeRuntimeOptions, RuntimeBackend, RuntimeLimits,
+};
 use tempfile::{TempDir, tempdir};
 
 fn f32_bytes(values: &[f32]) -> Vec<u8> {
@@ -64,11 +66,8 @@ impl Fixture {
     }
 }
 
-fn build_fixture() -> Fixture {
-    let dir = tempdir().unwrap();
-    let master_path = dir.path().join("moe.rsmf");
-
-    let tensors = vec![
+fn fixture_tensors() -> Vec<TensorInput> {
+    vec![
         tensor(
             "layers.0.router.weight",
             0,
@@ -109,14 +108,11 @@ fn build_fixture() -> Fixture {
             &[1.0, 0.0, 0.0, 1.0],
             Some("layer0.expert1"),
         ),
-    ];
+    ]
+}
 
-    let tensor_bytes: HashMap<String, Vec<u8>> = tensors
-        .iter()
-        .map(|tensor| (tensor.name.clone(), tensor.canonical.bytes.clone()))
-        .collect();
-
-    let placement = PlacementManifest {
+fn fixture_placement() -> PlacementManifest {
+    PlacementManifest {
         version: PLACEMENT_VERSION,
         metadata: vec![("fixture".into(), "two-shard-moe".into())],
         devices: vec![
@@ -153,13 +149,34 @@ fn build_fixture() -> Fixture {
                 replicas: Vec::new(),
             },
         ],
-    };
+    }
+}
 
+fn build_fixture() -> Fixture {
+    build_fixture_with(Vec::new(), fixture_tensors(), fixture_placement())
+}
+
+fn build_fixture_with(
+    metadata: Vec<(&str, &str)>,
+    tensors: Vec<TensorInput>,
+    placement: PlacementManifest,
+) -> Fixture {
+    let dir = tempdir().unwrap();
+    let master_path = dir.path().join("moe.rsmf");
+
+    let tensor_bytes: HashMap<String, Vec<u8>> = tensors
+        .iter()
+        .map(|tensor| (tensor.name.clone(), tensor.canonical.bytes.clone()))
+        .collect();
+
+    let writer = metadata
+        .into_iter()
+        .fold(RsmfWriter::new(), |writer, (key, value)| {
+            writer.with_metadata(key, value)
+        });
     let writer = tensors
         .into_iter()
-        .fold(RsmfWriter::new(), |writer, tensor| {
-            writer.with_tensor(tensor)
-        })
+        .fold(writer, |writer, tensor| writer.with_tensor(tensor))
         .with_placement_manifest(&placement)
         .unwrap();
     writer.write_to_path(&master_path).unwrap();
@@ -238,6 +255,117 @@ fn two_shard_runtime_matches_single_device_reference() {
         RuntimeBackend::CpuFallback { .. }
     ));
     assert!(parallel.report.tokens_per_second().is_finite());
+}
+
+#[test]
+fn runtime_limits_reject_excessive_token_count() {
+    let fixture = build_fixture();
+    let runtime = MoeRuntime::new(
+        fixture.open(),
+        MoeRuntimeOptions {
+            limits: RuntimeLimits {
+                max_tokens: Some(3),
+                ..RuntimeLimits::default()
+            },
+            ..MoeRuntimeOptions::default()
+        },
+    )
+    .unwrap();
+
+    let err = runtime
+        .run_layer_top1(0, &[2.0, 1.0, 1.0, 3.0, 4.0, 0.0, 0.0, 5.0], 2)
+        .unwrap_err();
+
+    assert!(
+        matches!(err, MoeRuntimeError::Shape(message) if message.contains("token count 4 exceeds runtime limit 3"))
+    );
+}
+
+#[test]
+fn duplicate_expert_role_is_rejected() {
+    let mut tensors = fixture_tensors();
+    tensors.push(tensor(
+        "layers.0.experts.0.up.duplicate",
+        1,
+        [2, 2],
+        moe_meta(0, Some(0), "up"),
+        &[1.0, 0.0, 0.0, 1.0],
+        None,
+    ));
+    let fixture = build_fixture_with(Vec::new(), tensors, fixture_placement());
+    let runtime = MoeRuntime::new(fixture.open(), MoeRuntimeOptions::default()).unwrap();
+
+    let err = runtime.run_layer_top1(0, &[2.0, 1.0], 2).unwrap_err();
+
+    assert!(
+        matches!(err, MoeRuntimeError::Shape(message) if message.contains("multiple up tensors"))
+    );
+}
+
+#[test]
+fn non_top1_metadata_is_rejected() {
+    let fixture = build_fixture_with(
+        vec![("moe.top_k", "2")],
+        fixture_tensors(),
+        fixture_placement(),
+    );
+    let runtime = MoeRuntime::new(fixture.open(), MoeRuntimeOptions::default()).unwrap();
+
+    let err = runtime.run_layer_top1(0, &[2.0, 1.0], 2).unwrap_err();
+
+    assert!(
+        matches!(err, MoeRuntimeError::Unsupported(message) if message.contains("moe.top_k=1"))
+    );
+}
+
+#[test]
+fn n_experts_must_match_router_rows() {
+    let fixture = build_fixture_with(
+        vec![("moe.n_experts", "3")],
+        fixture_tensors(),
+        fixture_placement(),
+    );
+    let runtime = MoeRuntime::new(fixture.open(), MoeRuntimeOptions::default()).unwrap();
+
+    let err = runtime.run_layer_top1(0, &[2.0, 1.0], 2).unwrap_err();
+
+    assert!(matches!(err, MoeRuntimeError::Shape(message) if message.contains("moe.n_experts=3")));
+}
+
+#[test]
+fn silu_gate_must_share_expert_shard() {
+    let mut tensors = fixture_tensors();
+    tensors.push(tensor(
+        "layers.0.experts.0.gate",
+        3,
+        [2, 2],
+        moe_meta(0, Some(0), "gate"),
+        &[1.0, 0.0, 0.0, 1.0],
+        Some("layer0.expert0.gate"),
+    ));
+    tensors.push(tensor(
+        "layers.0.experts.1.gate",
+        2,
+        [2, 2],
+        moe_meta(0, Some(1), "gate"),
+        &[1.0, 0.0, 0.0, 1.0],
+        Some("layer0.expert1"),
+    ));
+    let fixture = build_fixture_with(Vec::new(), tensors, fixture_placement());
+    let runtime = MoeRuntime::new(
+        fixture.open(),
+        MoeRuntimeOptions {
+            activation: ExpertActivation::SiluGated,
+            ..MoeRuntimeOptions::default()
+        },
+    )
+    .unwrap();
+
+    let err = runtime.run_layer_top1(0, &[2.0, 1.0], 2).unwrap_err();
+
+    assert!(
+        matches!(err, MoeRuntimeError::Shape(message) if message.contains("expert tensors span multiple shards"))
+    );
 }
 
 #[cfg(feature = "wgpu")]
