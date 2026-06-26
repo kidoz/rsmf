@@ -10,8 +10,8 @@ use std::process::Command;
 use safetensors::tensor::{Dtype, TensorView};
 use tempfile::tempdir;
 
-use rsmf_core::LogicalDtype;
 use rsmf_core::writer::{RsmfWriter, TensorInput, VariantInput};
+use rsmf_core::{LogicalDtype, TargetTag};
 
 fn rsmf_bin() -> &'static str {
     env!("CARGO_BIN_EXE_rsmf")
@@ -149,6 +149,53 @@ fn inspect_moe_prints_expert_grouping() {
     );
     assert!(
         stdout.contains("layers.0.experts.3.up"),
+        "inspect stdout: {stdout}"
+    );
+}
+
+#[test]
+fn inspect_prefetch_prints_groups() {
+    let dir = tempdir().unwrap();
+    let rsmf_path = dir.path().join("prefetch.rsmf");
+
+    RsmfWriter::new()
+        .with_tensor(TensorInput {
+            shard_id: 0,
+            name: "layers.0.experts.3.up".into(),
+            dtype: LogicalDtype::F32,
+            shape: vec![2, 2],
+            metadata: vec![],
+            canonical: VariantInput::canonical_raw(f32_bytes(4, 1.0))
+                .with_prefetch_group("layer0.expert3")
+                .with_prefetch_affinity("shard:1,expert:0:2"),
+            packed: vec![
+                VariantInput::packed_cast_f16(TargetTag::CpuGeneric, vec![0; 8])
+                    .with_prefetch_group("layer0.expert3")
+                    .with_prefetch_affinity("tier:nvme"),
+            ],
+        })
+        .write_to_path(&rsmf_path)
+        .unwrap();
+
+    let out = Command::new(rsmf_bin())
+        .arg("inspect")
+        .arg("--prefetch")
+        .arg(&rsmf_path)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "inspect --prefetch failed: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("Prefetch:"), "inspect stdout: {stdout}");
+    assert!(
+        stdout.contains("group=layer0.expert3"),
+        "inspect stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("affinity=shard:1,expert:0:2,tier:nvme"),
+        "inspect stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("layers.0.experts.3.up#0,layers.0.experts.3.up#1"),
         "inspect stdout: {stdout}"
     );
 }

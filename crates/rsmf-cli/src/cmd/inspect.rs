@@ -14,6 +14,9 @@ pub struct Args {
     /// Include Mixture-of-Experts grouping from `moe.*` metadata.
     #[arg(long)]
     pub moe: bool,
+    /// Include prefetch / locality grouping from `prefetch.*` metadata.
+    #[arg(long)]
+    pub prefetch: bool,
 }
 
 /// Execute `rsmf inspect`.
@@ -124,6 +127,34 @@ pub fn run(args: Args) -> Result<(), CliError> {
                     shared = group.shared,
                     role = group.role.as_str(),
                     tensors = group.tensor_names.join(","),
+                );
+            }
+        }
+    }
+
+    if args.prefetch {
+        let prefetch = file.prefetch_hints()?;
+        println!();
+        println!("Prefetch:");
+        if prefetch.groups.is_empty() {
+            println!("  groups: (none)");
+        } else {
+            println!("  groups:");
+            for group in &prefetch.groups {
+                let affinity = if group.affinity.is_empty() {
+                    String::from("(none)")
+                } else {
+                    group.affinity.join(",")
+                };
+                let variants: Vec<String> = group
+                    .variants
+                    .iter()
+                    .map(|v| format!("{}#{}", v.tensor_name, v.variant_index))
+                    .collect();
+                println!(
+                    "    group={group_id} affinity={affinity} variants={variants}",
+                    group_id = group.group,
+                    variants = variants.join(","),
                 );
             }
         }
