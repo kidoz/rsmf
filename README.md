@@ -35,7 +35,7 @@ Format version **1.0**. Full specification in [`docs/SPEC.md`](docs/SPEC.md); ar
 | `rsmf-cuda` | synchronous CUDA host→device upload helper | no |
 | `rsmf-metal` | synchronous Metal host→GPU upload helper | no |
 | `rsmf-moe-runtime` | experimental placement-aware MoE runtime PoC | no |
-| `rsmf-runtime` | ONNX Runtime inference engine | no |
+| `rsmf-runtime` | production-oriented ONNX Runtime inference engine | no |
 | `rsmf-python` | PyO3 bindings | no |
 
 GPU / runtime / Python crates are excluded from `default-members` so `cargo build` and `cargo test` stay fast and hardware-free.
@@ -194,6 +194,23 @@ replicas = [1]
 rsmf placement set model.rsmf --plan placement.toml
 rsmf placement inspect model.rsmf
 ```
+
+### Production ORT runtime
+
+`rsmf-runtime` is the first production-facing general inference engine for
+embedded ONNX / ORT graph payloads. It keeps RSMF as a storage/container format
+and owns runtime concerns: graph selection, ORT session options, CPU execution
+provider defaults, cached sessions, graph input/output metadata, and typed
+owned input/output tensors.
+
+Build it explicitly:
+
+```sh
+cargo test -p rsmf-runtime
+```
+
+RSMF-managed external initializer binding and provider-specific device I/O
+binding are future runtime milestones, not part of the R1 API.
 
 ### Minimal MoE runtime PoC
 

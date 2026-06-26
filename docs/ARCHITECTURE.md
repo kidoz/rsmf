@@ -10,7 +10,7 @@ rsmf-core  (library)           ← format, reader, writer, validator, selection
    ├── rsmf-cuda  (library)     ← synchronous CUDA host→device upload helper (excluded from default-members)
    ├── rsmf-metal (library)     ← synchronous Metal host→GPU upload helper (excluded from default-members)
    ├── rsmf-moe-runtime (library) ← experimental placement-aware MoE runtime PoC (excluded from default-members)
-   ├── rsmf-runtime (library)   ← high-level inference engine (ONNX Runtime / ort)
+   ├── rsmf-runtime (library)   ← production-oriented inference engine (ONNX Runtime / ort)
    ├── rsmf-python (library)    ← PyO3 bindings for Python / NumPy
    └── rsmf-bench (library+bench) ← criterion benchmarks
 ```
@@ -24,7 +24,11 @@ rsmf-core  (library)           ← format, reader, writer, validator, selection
   perform zero-copy, streaming, or backend-specific layout translation. All
   three are excluded from `default-members` for fast, dependency-free core
   builds. Real vendor zero-copy paths remain future work.
-- `rsmf-runtime` integrates the `ort` v2 crate to run inference on embedded graphs using memory-mapped tensors.
+- `rsmf-runtime` integrates the `ort` v2 crate to run embedded ONNX / ORT graph
+  payloads with explicit graph selection, configurable session options, CPU as
+  the portable default execution provider, cached sessions, graph
+  input/output metadata, and typed owned input/output tensors. RSMF-managed
+  external initializer binding remains future work.
 - `rsmf-moe-runtime` is a proof-of-concept runtime for one MoE layer: host-side
   top-1 gating, token batching by destination expert, placement-aware expert
   shard lookup, WGPU expert matmuls when available, and a CPU reference path.
