@@ -17,6 +17,7 @@ pub mod checksum;
 pub mod error;
 pub mod lazy_reader;
 pub mod manifest;
+pub mod moe;
 pub mod preamble;
 pub mod reader;
 pub mod section;
@@ -44,6 +45,7 @@ pub use adapter::{
 };
 pub use error::{Result, RsmfError};
 pub use lazy_reader::{LazyRsmfFile, RangeReader, SliceRangeReader};
+pub use moe::{MoeEntry, MoeGroup, MoeIndex, MoeRole, moe_index_from_manifest};
 pub use preamble::{FORMAT_MAJOR, FORMAT_MINOR, MAGIC, Preamble};
 pub use reader::{AssetRef, GraphPayload, RsmfFile};
 pub use section::{SectionDescriptor, SectionKind};

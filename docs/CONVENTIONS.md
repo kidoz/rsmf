@@ -209,9 +209,8 @@ is strict about enum growth. When a *convention-level* metadata value
 is unknown (e.g. `asset.role = "tokenizer_v2"`) readers MUST accept
 the string unchanged and pass it through.
 
-Format-level growth requires ADRs (`docs/FORMAT_DECISIONS.md` +
-`.agents/contexts/decisions/`). Convention-level growth requires only
-this document to be updated.
+Format-level growth requires ADRs (`docs/FORMAT_DECISIONS.md`).
+Convention-level growth requires only this document to be updated.
 
 ---
 

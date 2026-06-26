@@ -299,6 +299,24 @@ impl RsmfFile {
         crate::adapter::adapter_index_from_manifest(&self.manifest)
     }
 
+    /// Index the file's Mixture-of-Experts tensor metadata.
+    ///
+    /// Walks tensors carrying `moe.*` metadata and groups them by layer,
+    /// expert id, shared flag, and role. Returns an empty index for files
+    /// without MoE annotations. See `docs/CONVENTIONS.md` for the metadata
+    /// convention.
+    ///
+    /// ```no_run
+    /// # use rsmf_core::RsmfFile;
+    /// let file = RsmfFile::open("model.rsmf")?;
+    /// let moe = file.moe_experts()?;
+    /// println!("{} MoE tensors", moe.len());
+    /// # Ok::<(), rsmf_core::RsmfError>(())
+    /// ```
+    pub fn moe_experts(&self) -> Result<crate::moe::MoeIndex> {
+        crate::moe::moe_index_from_manifest(&self.manifest)
+    }
+
     /// Build a high-level summary.
     #[must_use]
     pub fn inspect(&self) -> ManifestSummary {

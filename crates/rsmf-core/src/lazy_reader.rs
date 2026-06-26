@@ -27,6 +27,7 @@ use tracing::info_span;
 use crate::adapter::{AdapterIndex, adapter_index_from_manifest};
 use crate::error::{Result, RsmfError};
 use crate::manifest::Manifest;
+use crate::moe::{MoeIndex, moe_index_from_manifest};
 use crate::preamble::{PREAMBLE_LEN, Preamble};
 use crate::reader::{decompress_zstd, validate_manifest, validate_section_table};
 use crate::section::{SECTION_DESC_LEN, SectionDescriptor, SectionKind};
@@ -279,6 +280,11 @@ impl<R: RangeReader> LazyRsmfFile<R> {
     /// Index adapter tensors (metadata-only, no payload fetch).
     pub fn adapters(&self) -> Result<AdapterIndex> {
         adapter_index_from_manifest(&self.manifest)
+    }
+
+    /// Index Mixture-of-Experts tensor metadata without fetching payload bytes.
+    pub fn moe_experts(&self) -> Result<MoeIndex> {
+        moe_index_from_manifest(&self.manifest)
     }
 
     /// Fetch the canonical variant's bytes for a named tensor.
