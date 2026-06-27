@@ -65,13 +65,17 @@ rsmf-core  (library)           ← format, reader, writer, validator, selection
   EOS-aware generation, deterministic sampling controls, and a backend selector.
   `auto` resolves to CPU reference, while `accelerated` currently dispatches to
   the in-tree threaded CPU logits path. `Engine::native_decoder_check_reference_logits()`
-  compares runtime logits against local or exported references, and the first
-  performance slice adds page-sized KV-cache allocation accounting plus threaded
-  final projection without adding GPU dependencies. `Engine::native_decoder_tokenizer()`
-  and `Engine::native_decoder_generate_text()` add the first text-level native
-  decoder path for simple `WordLevel` tokenizer assets: prompts are whitespace
-  tokenized by vocab lookup and token ids decode by joining token strings with
-  spaces.
+  compares runtime logits against local or exported references, including a
+  checked-in tiny HF-compatible reference fixture. Sampling supports
+  temperature, top-k, top-p, deterministic seeds, repetition penalty, minimum
+  generation length, stop-token overrides, and optional prompt logits.
+  `Engine::native_decoder_tokenizer()` and `Engine::native_decoder_generate_text()`
+  add text-level native decoding for `WordLevel` and limited BPE tokenizer
+  assets. The BPE path supports vocab/merges, simple whitespace or ByteLevel
+  pre-tokenization, added special-token ids, and explicit unsupported
+  normalizer/post-processor errors. The first performance slices add real paged
+  KV-cache attention reads, chunked prefill scheduling, threaded final
+  projection, and Criterion benches without adding GPU dependencies.
 - `rsmf-moe-runtime` is a proof-of-concept runtime for one MoE layer: host-side
   top-1 gating, token batching by destination expert, placement-aware expert
   shard lookup, WGPU expert matmuls when available, and a CPU reference path.

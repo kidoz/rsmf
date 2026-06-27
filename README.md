@@ -250,19 +250,23 @@ grouped-query attention, SwiGLU MLP, and residual additions over supplied f32
 buffers. `Engine::native_decoder_weights()` decodes validated RSMF tensor
 variants into owned f32 weights, and `Engine::native_decoder_greedy_decode()`
 adds a correctness-oriented KV cache, logits, EOS-aware token generation,
-sampling controls (`temperature`, `top_k`, `top_p`, deterministic `seed`), and a
-backend selector. `auto` resolves to the CPU reference backend; `accelerated`
-currently dispatches to an in-tree threaded CPU path for the final LM-head
-projection. Native decoder verification also exposes
+sampling controls (`temperature`, `top_k`, `top_p`, deterministic `seed`,
+repetition penalty, min tokens, stop-token overrides, and optional prompt
+logits), and a backend selector. `auto` resolves to the CPU reference backend;
+`accelerated` currently dispatches to an in-tree threaded CPU path for the final
+LM-head projection. Native decoder verification also exposes
 `Engine::native_decoder_check_reference_logits()` for comparing local or
-exported tiny-model logits within an absolute tolerance. Performance work has
-started with page-sized KV-cache allocation and threaded CPU logits; tokenizer
-parsing, text-level generation, paged attention kernels, and GPU/vendor kernels
-remain future milestones.
+exported tiny-model logits within an absolute tolerance, including a checked-in
+synthetic HF-compatible reference fixture. Performance work has started with
+real paged KV-cache attention reads, chunked prefill scheduling, threaded CPU
+logits, and Criterion benches under `cargo bench -p rsmf-bench --bench
+native_decoder`; GPU/vendor kernels remain future milestones.
 `Engine::native_decoder_tokenizer()` and `Engine::native_decoder_generate_text()`
-add the first text-level path for simple `WordLevel` tokenizer assets. This
-slice encodes prompts by whitespace token lookup and decodes by joining
-tokens with spaces; full HuggingFace tokenizer parity remains future work.
+add the first text-level path for `WordLevel` and limited BPE tokenizer assets.
+The BPE path covers vocab/merges, simple whitespace or ByteLevel-style
+pre-tokenization, added special tokens, and typed errors for unsupported
+normalizers/post-processors; full HuggingFace tokenizer parity remains future
+work.
 
 ### Minimal MoE runtime PoC
 
