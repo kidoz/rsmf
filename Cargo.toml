@@ -72,6 +72,7 @@ numpy = "0.22"
 
 # Internal crates.
 rsmf-core = { path = "crates/rsmf-core", version = "0.1.0" }
+rsmf-runtime = { path = "crates/rsmf-runtime", version = "0.1.0" }
 rsmf-wgpu = { path = "crates/rsmf-wgpu", version = "0.1.0" }
 rsmf-moe-runtime = { path = "crates/rsmf-moe-runtime", version = "0.1.0" }
 rsmf-cuda = { path = "crates/rsmf-cuda", version = "0.1.0" }

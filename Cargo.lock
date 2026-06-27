@@ -2400,7 +2400,9 @@ dependencies = [
  "pollster",
  "rsmf-core",
  "rsmf-moe-runtime",
+ "rsmf-runtime",
  "rsmf-wgpu",
+ "serde_json",
  "tempfile",
  "wgpu",
 ]

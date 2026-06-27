@@ -17,6 +17,8 @@ anyhow.workspace = true
 criterion.workspace = true
 tempfile.workspace = true
 rsmf-moe-runtime.workspace = true
+rsmf-runtime.workspace = true
+serde_json.workspace = true
 
 [features]
 default = []
@@ -50,4 +52,8 @@ required-features = ["wgpu"]
 
 [[bench]]
 name = "moe_dispatch"
+harness = false
+
+[[bench]]
+name = "native_decoder"
 harness = false
