@@ -215,6 +215,14 @@ still materializes an ORT-owned initializer value during session build.
 `SessionHandle::memory_report` exposes graph payload bytes and
 per-initializer materialized bytes.
 
+R3 starts the runtime server layer with `RuntimeExecutor`: a bounded
+in-process priority queue around `Engine::run`. It supports FIFO ordering
+within a priority level, higher-priority dispatch, pre-dispatch deadline
+expiry, typed runtime error propagation, per-request queue/run timings, and
+cumulative executor metrics. It is intentionally graph-runtime agnostic so
+dynamic batching and native decoder execution can share the same control
+plane later.
+
 Build it explicitly:
 
 ```sh
