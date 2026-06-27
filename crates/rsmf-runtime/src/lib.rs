@@ -133,6 +133,9 @@ pub struct InitializerBinding {
     pub initializer_name: String,
     /// Name of the tensor in the RSMF manifest.
     pub tensor_name: String,
+    /// Optional global RSMF variant index to bind instead of the canonical
+    /// variant.
+    pub variant_idx: Option<u32>,
 }
 
 impl InitializerBinding {
@@ -143,7 +146,16 @@ impl InitializerBinding {
         Self {
             initializer_name: initializer_name.into(),
             tensor_name: tensor_name.into(),
+            variant_idx: None,
         }
+    }
+
+    /// Bind a specific global RSMF variant index instead of the canonical
+    /// tensor variant.
+    #[must_use]
+    pub fn with_variant(mut self, variant_idx: u32) -> Self {
+        self.variant_idx = Some(variant_idx);
+        self
     }
 }
 
@@ -264,6 +276,9 @@ pub struct InitializerMemoryReport {
     pub initializer_name: String,
     /// RSMF tensor name used as the initializer source.
     pub tensor_name: String,
+    /// Global RSMF variant index used as the initializer source, or `None`
+    /// when the canonical variant was used.
+    pub variant_idx: Option<u32>,
     /// Bytes materialized into an ORT-owned initializer value.
     pub materialized_bytes: usize,
 }
@@ -555,16 +570,7 @@ impl Engine {
     }
 
     fn initializer_value(&self, binding: &InitializerBinding) -> Result<InitializerValue> {
-        let view = self
-            .file
-            .tensor_view(&binding.tensor_name)
-            .map_err(|error| match error {
-                RsmfError::NotFound { .. } => RuntimeError::InitializerTensorNotFound {
-                    initializer_name: binding.initializer_name.clone(),
-                    tensor_name: binding.tensor_name.clone(),
-                },
-                other => RuntimeError::Core(other),
-            })?;
+        let view = self.initializer_view(binding)?;
         validate_initializer_view(binding, &view)?;
         let shape = shape_u64_to_usize(view.shape()).map_err(|error| {
             RuntimeError::UnsupportedInitializer {
@@ -579,6 +585,7 @@ impl Engine {
             memory_report: InitializerMemoryReport {
                 initializer_name: binding.initializer_name.clone(),
                 tensor_name: binding.tensor_name.clone(),
+                variant_idx: binding.variant_idx,
                 materialized_bytes,
             },
         })
@@ -609,16 +616,7 @@ impl Engine {
                     reason: "initializer is not declared by the ONNX graph".to_string(),
                 });
             };
-            let view =
-                self.file
-                    .tensor_view(&binding.tensor_name)
-                    .map_err(|error| match error {
-                        RsmfError::NotFound { .. } => RuntimeError::InitializerTensorNotFound {
-                            initializer_name: binding.initializer_name.clone(),
-                            tensor_name: binding.tensor_name.clone(),
-                        },
-                        other => RuntimeError::Core(other),
-                    })?;
+            let view = self.initializer_view(binding)?;
             validate_initializer_view(binding, &view)?;
             let expected_data_type = OnnxTensorDataType::from_logical_dtype(view.dtype())
                 .ok_or_else(|| RuntimeError::UnsupportedInitializer {
@@ -661,6 +659,29 @@ impl Engine {
         }
 
         Ok(())
+    }
+
+    fn initializer_view<'a>(&'a self, binding: &InitializerBinding) -> Result<TensorView<'a>> {
+        let result = if let Some(variant_idx) = binding.variant_idx {
+            self.file
+                .tensor_view_variant(&binding.tensor_name, variant_idx)
+        } else {
+            self.file.tensor_view(&binding.tensor_name)
+        };
+        result.map_err(|error| match error {
+            RsmfError::NotFound { what } if what == format!("tensor {}", binding.tensor_name) => {
+                RuntimeError::InitializerTensorNotFound {
+                    initializer_name: binding.initializer_name.clone(),
+                    tensor_name: binding.tensor_name.clone(),
+                }
+            }
+            RsmfError::NotFound { what } => RuntimeError::UnsupportedInitializer {
+                initializer_name: binding.initializer_name.clone(),
+                tensor_name: binding.tensor_name.clone(),
+                reason: what,
+            },
+            other => RuntimeError::Core(other),
+        })
     }
 }
 
@@ -1238,9 +1259,10 @@ fn ort_error(stage: &'static str, error: impl std::fmt::Display) -> RuntimeError
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rsmf_core::GraphInput;
-    use rsmf_core::LogicalDtype;
     use rsmf_core::writer::{RsmfWriter, TensorInput, VariantInput};
+    use rsmf_core::{
+        EncodingKind, GraphInput, LayoutTag, LogicalDtype, StorageDtype, TargetTag, VariantMeta,
+    };
     use tempfile::tempdir;
 
     #[test]
@@ -1392,6 +1414,7 @@ mod tests {
             vec![InitializerMemoryReport {
                 initializer_name: "bias".to_string(),
                 tensor_name: "bias.tensor".to_string(),
+                variant_idx: None,
                 materialized_bytes: 8,
             }]
         );
@@ -1424,6 +1447,101 @@ mod tests {
         let z = outputs.get("z").unwrap();
         assert_eq!(z.shape(), &[2]);
         assert_eq!(z.iter().copied().collect::<Vec<_>>(), vec![11.5, -2.0]);
+    }
+
+    #[test]
+    fn runs_onnx_graph_with_selected_raw_rsmf_initializer_variant() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("add-selected-variant.onnx.rsmf");
+        let graph = tiny_add_external_initializer_onnx_model();
+        RsmfWriter::new()
+            .with_tensor(TensorInput {
+                name: "bias.tensor".to_string(),
+                dtype: LogicalDtype::F32,
+                shape: vec![2],
+                shard_id: 0,
+                metadata: Vec::new(),
+                canonical: VariantInput::canonical_raw(f32_bytes(&[0.0, 0.0])),
+                packed: vec![raw_variant(
+                    StorageDtype::Logical(LogicalDtype::F32),
+                    LayoutTag::RowMajor,
+                    f32_bytes(&[10.0, -4.0]),
+                )],
+            })
+            .with_graph(GraphInput::onnx(graph.clone()))
+            .write_to_path(&path)
+            .unwrap();
+
+        let engine = Engine::new(RsmfFile::open(path).unwrap()).unwrap();
+        let options = SessionOptions {
+            initializers: vec![InitializerBinding::new("bias", "bias.tensor").with_variant(1)],
+            ..SessionOptions::default()
+        };
+        let handle = engine.session_handle(0, options.clone()).unwrap();
+        assert_eq!(handle.memory_report().initializer_materialized_bytes, 8);
+        assert_eq!(
+            handle.memory_report().initializers,
+            vec![InitializerMemoryReport {
+                initializer_name: "bias".to_string(),
+                tensor_name: "bias.tensor".to_string(),
+                variant_idx: Some(1),
+                materialized_bytes: 8,
+            }]
+        );
+
+        let outputs = engine
+            .run_f32_with_options(
+                0,
+                options,
+                HashMap::from([(
+                    "x".to_string(),
+                    ArrayD::from_shape_vec(vec![2], vec![1.5, 2.0]).unwrap(),
+                )]),
+            )
+            .unwrap();
+
+        let z = outputs.get("z").unwrap();
+        assert_eq!(z.iter().copied().collect::<Vec<_>>(), vec![11.5, -2.0]);
+    }
+
+    #[test]
+    fn blocked_initializer_variant_is_typed_error() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("blocked-initializer-variant.rsmf");
+        RsmfWriter::new()
+            .with_tensor(TensorInput {
+                name: "bias.tensor".to_string(),
+                dtype: LogicalDtype::F32,
+                shape: vec![2],
+                shard_id: 0,
+                metadata: Vec::new(),
+                canonical: VariantInput::canonical_raw(f32_bytes(&[0.0, 0.0])),
+                packed: vec![raw_variant(
+                    StorageDtype::Logical(LogicalDtype::F32),
+                    LayoutTag::Blocked,
+                    f32_bytes(&[10.0, -4.0]),
+                )],
+            })
+            .with_graph(GraphInput::onnx(tiny_add_external_initializer_onnx_model()))
+            .write_to_path(&path)
+            .unwrap();
+
+        let engine = Engine::new(RsmfFile::open(path).unwrap()).unwrap();
+        let err = engine
+            .session_handle(
+                0,
+                SessionOptions {
+                    initializers: vec![
+                        InitializerBinding::new("bias", "bias.tensor").with_variant(1),
+                    ],
+                    ..SessionOptions::default()
+                },
+            )
+            .unwrap_err();
+
+        assert!(
+            matches!(err, RuntimeError::UnsupportedInitializer { reason, .. } if reason.contains("row-major"))
+        );
     }
 
     #[test]
@@ -1667,6 +1785,18 @@ mod tests {
         push_message(&mut tensor, 13, string_string_entry("location", "rsmf"));
         push_i32(&mut tensor, 14, 1);
         tensor
+    }
+
+    fn raw_variant(storage_dtype: StorageDtype, layout: LayoutTag, bytes: Vec<u8>) -> VariantInput {
+        VariantInput {
+            target: TargetTag::CpuGeneric,
+            encoding: EncodingKind::Raw,
+            storage_dtype: Some(storage_dtype),
+            layout,
+            alignment: 64,
+            bytes,
+            meta: VariantMeta::default(),
+        }
     }
 
     fn string_string_entry(key: &str, value: &str) -> Vec<u8> {
