@@ -105,8 +105,10 @@ cargo bench -p rsmf-bench --bench native_decoder
 ```
 
 The current bench intentionally measures the stable `Engine` API, including
-weight loading. Add a lower-level bench if future optimized weight residency or
-step-level APIs need isolated measurement.
+weight loading. Add a resident-session bench for
+`Engine::native_decoder_session()` when measuring Apple Accelerate, Metal/WGPU,
+or other kernel-level improvements where per-call weight loading would hide the
+kernel cost.
 
 Source: `crates/rsmf-bench/benches/native_decoder.rs`.
 
