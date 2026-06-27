@@ -26,7 +26,7 @@ fn build_safetensors_bytes() -> Vec<u8> {
         "b".into(),
         TensorView::new(Dtype::F32, vec![3], &b).unwrap(),
     );
-    safetensors::serialize(&tensors, &None).unwrap()
+    safetensors::serialize(&tensors, None).unwrap()
 }
 
 fn build_safetensors_with_metadata() -> Vec<u8> {
@@ -39,7 +39,7 @@ fn build_safetensors_with_metadata() -> Vec<u8> {
     let mut meta = HashMap::new();
     meta.insert("model_name".into(), "test-model".into());
     meta.insert("version".into(), "42".into());
-    safetensors::serialize(&tensors, &Some(meta)).unwrap()
+    safetensors::serialize(&tensors, Some(meta)).unwrap()
 }
 
 #[test]

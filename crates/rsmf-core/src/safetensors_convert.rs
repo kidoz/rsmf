@@ -46,7 +46,7 @@ pub fn writer_from_safetensors_bytes(bytes: &[u8]) -> Result<RsmfWriter> {
 
         writer = writer.with_tensor(TensorInput {
             shard_id: 0,
-            name: (*name).clone(),
+            name: name.to_owned(),
             dtype,
             shape,
             metadata: Vec::new(),

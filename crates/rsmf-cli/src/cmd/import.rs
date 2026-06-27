@@ -143,7 +143,7 @@ pub fn run(args: Args) -> Result<(), CliError> {
 
             let mut tensor_input = TensorInput {
                 shard_id: shard_idx as u64,
-                name: (*name).clone(),
+                name: name.to_owned(),
                 dtype,
                 shape,
                 metadata: Vec::new(),

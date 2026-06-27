@@ -35,14 +35,15 @@ pub struct DeviceHandle {
 /// (e.g. on CI runners without a GPU).
 #[must_use]
 pub fn detect_capabilities() -> Option<WgpuCapabilities> {
-    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::default());
+    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
     let adapter = instance
         .request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::default(),
             force_fallback_adapter: false,
             compatible_surface: None,
         })
-        .block_on()?;
+        .block_on()
+        .ok()?;
     let info = adapter.get_info();
     let limits = adapter.limits();
     let features = adapter.features();
@@ -60,15 +61,13 @@ pub fn detect_capabilities() -> Option<WgpuCapabilities> {
 pub fn request_device(caps: &WgpuCapabilities) -> Option<DeviceHandle> {
     let (device, queue) = caps
         .adapter
-        .request_device(
-            &wgpu::DeviceDescriptor {
-                label: Some("rsmf-wgpu"),
-                required_features: wgpu::Features::empty(),
-                required_limits: caps.limits.clone(),
-                memory_hints: wgpu::MemoryHints::default(),
-            },
-            None,
-        )
+        .request_device(&wgpu::DeviceDescriptor {
+            label: Some("rsmf-wgpu"),
+            required_features: wgpu::Features::empty(),
+            required_limits: caps.limits.clone(),
+            memory_hints: wgpu::MemoryHints::default(),
+            trace: wgpu::Trace::Off,
+        })
         .block_on()
         .ok()?;
     Some(DeviceHandle {

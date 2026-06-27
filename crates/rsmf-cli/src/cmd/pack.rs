@@ -193,7 +193,7 @@ pub fn run(args: Args) -> Result<(), CliError> {
                 let shape: Vec<u64> = tv.shape().iter().map(|&d| d as u64).collect();
                 let tensor_bytes = tv.data().to_vec();
                 let mut tensor_input = rsmf_core::TensorInput {
-                    name: (*name).clone(),
+                    name: name.to_owned(),
                     dtype,
                     shape,
                     shard_id: 0,
@@ -791,7 +791,7 @@ fn stream_from_safetensors(
         let dtype = rsmf_core::safetensors_convert::map_dtype(tv.dtype())?;
         let shape: Vec<u64> = tv.shape().iter().map(|&d| d as u64).collect();
         writer
-            .stream_canonical_tensor(name.clone(), dtype, shape, tv.data())
+            .stream_canonical_tensor(name, dtype, shape, tv.data())
             .map_err(CliError::from)?;
     }
     append_graphs_and_assets(&mut writer, graphs, assets)?;

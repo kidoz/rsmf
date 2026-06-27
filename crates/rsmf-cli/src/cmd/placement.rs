@@ -124,8 +124,7 @@ fn set(args: SetArgs) -> Result<(), CliError> {
 }
 
 fn parse_plan(plan: &str) -> Result<PlacementManifest, CliError> {
-    let value: Value = plan
-        .parse()
+    let value: Value = toml::from_str(plan.trim_start())
         .map_err(|e| CliError::user(anyhow!("invalid TOML placement plan: {e}")))?;
     let root = value
         .as_table()

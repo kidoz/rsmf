@@ -89,7 +89,7 @@ fn run_safetensors(args: SafetensorsArgs) -> Result<(), CliError> {
 
     let views = build_safetensors_views(&tensors)?;
     let metadata = export_metadata(&file);
-    safetensors::serialize_to_file(views, &metadata, &args.out)
+    safetensors::serialize_to_file(views, metadata, &args.out)
         .map_err(|e| CliError::user(anyhow!("safetensors export failed: {e}")))?;
 
     println!(

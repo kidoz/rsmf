@@ -36,12 +36,12 @@ struct ZeroCopyView {
 impl ZeroCopyView {
     #[getter]
     fn __array_interface__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let dict = PyDict::new_bound(py);
+        let dict = PyDict::new(py);
         dict.set_item("version", 3)?;
         // `shape` MUST be a Python tuple per the array-interface spec;
         // passing a list makes NumPy reject the view with
         // `TypeError: shape must be a tuple`.
-        dict.set_item("shape", PyTuple::new_bound(py, &self.shape))?;
+        dict.set_item("shape", PyTuple::new(py, &self.shape)?)?;
         dict.set_item("typestr", &self.typestr)?;
         dict.set_item("data", (self.ptr, true))?; // (ptr, readonly)
         Ok(dict)
@@ -117,7 +117,7 @@ impl RsmfFile {
         // cross-reference validation all run on the thread — drop the GIL so
         // concurrent Python work keeps progressing for large files.
         let inner = py
-            .allow_threads(|| CoreFile::open(&path))
+            .detach(|| CoreFile::open(&path))
             .map_err(map_core_error)?;
         Ok(Self { inner })
     }
@@ -174,7 +174,7 @@ impl RsmfFile {
         let payload = payloads
             .get(idx)
             .ok_or_else(|| PyIndexError::new_err(format!("graph index {idx} out of range")))?;
-        Ok(PyBytes::new_bound(py, payload.bytes))
+        Ok(PyBytes::new(py, payload.bytes))
     }
 
     fn metadata(&self) -> HashMap<String, String> {
@@ -183,7 +183,7 @@ impl RsmfFile {
 
     fn file_info<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         let info = self.inner.inspect();
-        let d = PyDict::new_bound(py);
+        let d = PyDict::new(py);
         d.set_item("file_size", info.file_size)?;
         d.set_item("format_major", info.format_major)?;
         d.set_item("format_minor", info.format_minor)?;
@@ -204,7 +204,7 @@ impl RsmfFile {
             .find(|t| t.name == name)
             .ok_or_else(|| RsmfNotFound::new_err(format!("tensor not found: {name}")))?;
 
-        let d = PyDict::new_bound(py);
+        let d = PyDict::new(py);
         d.set_item("name", &t.name)?;
         d.set_item("dtype", t.dtype.name())?;
         d.set_item("shape", t.shape.clone())?;
@@ -220,7 +220,7 @@ impl RsmfFile {
     fn verify(&self, py: Python<'_>) -> PyResult<()> {
         // BLAKE3 over every section + variant + graph + asset can run for
         // seconds on multi-GB files; release the GIL for the hash work.
-        py.allow_threads(|| self.inner.full_verify())
+        py.detach(|| self.inner.full_verify())
             .map_err(map_core_error)
     }
 
@@ -280,7 +280,7 @@ impl RsmfFile {
                     "tensor {name} references invalid variant index {g_idx}"
                 ))
             })?;
-            let d = PyDict::new_bound(py);
+            let d = PyDict::new(py);
             d.set_item("variant_idx", g_idx)?;
             d.set_item("local_idx", local_idx)?;
             d.set_item("is_canonical", local_idx == 0)?;
@@ -307,7 +307,7 @@ impl RsmfFile {
 
     fn get_asset<'py>(&self, py: Python<'py>, name: &str) -> PyResult<Option<Bound<'py, PyAny>>> {
         if let Some(asset) = self.inner.asset(name) {
-            Ok(Some(PyBytes::new_bound(py, asset.bytes).into_any()))
+            Ok(Some(PyBytes::new(py, asset.bytes).into_any()))
         } else {
             Ok(None)
         }
@@ -340,7 +340,7 @@ impl RsmfFile {
     /// files that don't carry adapter annotations.
     fn adapters<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         let idx = self.inner.adapters().map_err(map_core_error)?;
-        let out = PyDict::new_bound(py);
+        let out = PyDict::new(py);
         out.set_item("base_model_name", idx.base_model_name.clone())?;
         out.set_item("base_model_sha256", idx.base_model_sha256.clone())?;
 
@@ -348,7 +348,7 @@ impl RsmfFile {
             .adapters
             .iter()
             .map(|a| {
-                let d = PyDict::new_bound(py);
+                let d = PyDict::new(py);
                 d.set_item("name", &a.name)?;
                 d.set_item("kind", adapter_kind_to_str(&a.kind))?;
                 d.set_item("rank", a.rank)?;
@@ -359,7 +359,7 @@ impl RsmfFile {
                     .entries
                     .iter()
                     .map(|e| {
-                        let ed = PyDict::new_bound(py);
+                        let ed = PyDict::new(py);
                         ed.set_item("tensor_name", &e.tensor_name)?;
                         ed.set_item("role", adapter_role_to_str(&e.role))?;
                         ed.set_item("target", e.target.clone())?;
@@ -377,7 +377,7 @@ impl RsmfFile {
     /// Index Mixture-of-Experts tensors from `moe.*` metadata.
     fn moe_experts<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         let idx = self.inner.moe_experts().map_err(map_core_error)?;
-        let out = PyDict::new_bound(py);
+        let out = PyDict::new(py);
         out.set_item("n_experts", idx.n_experts)?;
         out.set_item("top_k", idx.top_k)?;
         out.set_item("n_shared", idx.n_shared)?;
@@ -387,7 +387,7 @@ impl RsmfFile {
             .entries
             .iter()
             .map(|e| {
-                let d = PyDict::new_bound(py);
+                let d = PyDict::new(py);
                 d.set_item("tensor_name", &e.tensor_name)?;
                 d.set_item("layer", e.layer)?;
                 d.set_item("expert_id", e.expert_id)?;
@@ -402,7 +402,7 @@ impl RsmfFile {
             .groups
             .iter()
             .map(|g| {
-                let d = PyDict::new_bound(py);
+                let d = PyDict::new(py);
                 d.set_item("layer", g.layer)?;
                 d.set_item("expert_id", g.expert_id)?;
                 d.set_item("shared", g.shared)?;
@@ -479,7 +479,7 @@ impl RsmfFile {
 
 /// Owned buffer produced by decoding a tensor variant off-GIL. The enum keeps
 /// the per-dtype return path monomorphic while letting us do the heavy
-/// copy/dequant in a single `py.allow_threads` block.
+/// copy/dequant in a single `py.detach` block.
 enum DecodedBuf {
     F32(Vec<f32>),
     F64(Vec<f64>),
@@ -562,7 +562,7 @@ fn decode_view_to_pyarray<'py>(
                     shape: shape.clone(),
                 };
                 let py_view = Bound::new(py, zc_view)?;
-                let np = py.import_bound("numpy")?;
+                let np = py.import("numpy")?;
                 let arr = np.getattr("asarray")?.call1((py_view,))?;
                 return Ok(arr.into_any());
             }
@@ -570,8 +570,8 @@ fn decode_view_to_pyarray<'py>(
     }
 
     // Decode / copy happens without the GIL. The result is an owned `Vec`
-    // moved into NumPy via `into_pyarray_bound` (no second copy).
-    let buf: Result<DecodedBuf, rsmf_core::RsmfError> = py.allow_threads(|| match dtype {
+    // moved into NumPy via `into_pyarray` (no second copy).
+    let buf: Result<DecodedBuf, rsmf_core::RsmfError> = py.detach(|| match dtype {
         // F16 and BF16 have no stable numpy dtype; surface them as f32.
         LogicalDtype::F32 | LogicalDtype::F16 | LogicalDtype::BF16 => {
             view.decode_f32().map(DecodedBuf::F32)
@@ -593,17 +593,17 @@ fn decode_view_to_pyarray<'py>(
 
     let decoded = buf.map_err(map_core_error)?;
     match decoded {
-        DecodedBuf::F32(v) => Ok(v.into_pyarray_bound(py).reshape(shape)?.into_any()),
-        DecodedBuf::F64(v) => Ok(v.into_pyarray_bound(py).reshape(shape)?.into_any()),
-        DecodedBuf::I64(v) => Ok(v.into_pyarray_bound(py).reshape(shape)?.into_any()),
-        DecodedBuf::I32(v) => Ok(v.into_pyarray_bound(py).reshape(shape)?.into_any()),
-        DecodedBuf::I16(v) => Ok(v.into_pyarray_bound(py).reshape(shape)?.into_any()),
-        DecodedBuf::I8(v) => Ok(v.into_pyarray_bound(py).reshape(shape)?.into_any()),
-        DecodedBuf::U64(v) => Ok(v.into_pyarray_bound(py).reshape(shape)?.into_any()),
-        DecodedBuf::U32(v) => Ok(v.into_pyarray_bound(py).reshape(shape)?.into_any()),
-        DecodedBuf::U16(v) => Ok(v.into_pyarray_bound(py).reshape(shape)?.into_any()),
-        DecodedBuf::U8(v) => Ok(v.into_pyarray_bound(py).reshape(shape)?.into_any()),
-        DecodedBuf::Bool(v) => Ok(v.into_pyarray_bound(py).reshape(shape)?.into_any()),
+        DecodedBuf::F32(v) => Ok(v.into_pyarray(py).reshape(shape)?.into_any()),
+        DecodedBuf::F64(v) => Ok(v.into_pyarray(py).reshape(shape)?.into_any()),
+        DecodedBuf::I64(v) => Ok(v.into_pyarray(py).reshape(shape)?.into_any()),
+        DecodedBuf::I32(v) => Ok(v.into_pyarray(py).reshape(shape)?.into_any()),
+        DecodedBuf::I16(v) => Ok(v.into_pyarray(py).reshape(shape)?.into_any()),
+        DecodedBuf::I8(v) => Ok(v.into_pyarray(py).reshape(shape)?.into_any()),
+        DecodedBuf::U64(v) => Ok(v.into_pyarray(py).reshape(shape)?.into_any()),
+        DecodedBuf::U32(v) => Ok(v.into_pyarray(py).reshape(shape)?.into_any()),
+        DecodedBuf::U16(v) => Ok(v.into_pyarray(py).reshape(shape)?.into_any()),
+        DecodedBuf::U8(v) => Ok(v.into_pyarray(py).reshape(shape)?.into_any()),
+        DecodedBuf::Bool(v) => Ok(v.into_pyarray(py).reshape(shape)?.into_any()),
     }
 }
 
@@ -612,20 +612,17 @@ fn _rsmf(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<RsmfFile>()?;
 
     // Register exception types so callers can do `except rsmf.RsmfError`.
-    m.add("RsmfError", py.get_type_bound::<RsmfError>())?;
-    m.add("RsmfNotFound", py.get_type_bound::<RsmfNotFound>())?;
-    m.add(
-        "RsmfStructuralError",
-        py.get_type_bound::<RsmfStructuralError>(),
-    )?;
+    m.add("RsmfError", py.get_type::<RsmfError>())?;
+    m.add("RsmfNotFound", py.get_type::<RsmfNotFound>())?;
+    m.add("RsmfStructuralError", py.get_type::<RsmfStructuralError>())?;
     m.add(
         "RsmfVerificationError",
-        py.get_type_bound::<RsmfVerificationError>(),
+        py.get_type::<RsmfVerificationError>(),
     )?;
-    m.add("RsmfIoError", py.get_type_bound::<RsmfIoError>())?;
+    m.add("RsmfIoError", py.get_type::<RsmfIoError>())?;
     m.add(
         "RsmfUnsupportedError",
-        py.get_type_bound::<RsmfUnsupportedError>(),
+        py.get_type::<RsmfUnsupportedError>(),
     )?;
     Ok(())
 }

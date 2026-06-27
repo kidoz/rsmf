@@ -24,7 +24,7 @@ fn build_fixture(dir: &std::path::Path) -> std::path::PathBuf {
         "weight".into(),
         TensorView::new(Dtype::F32, vec![3, 4], &w).unwrap(),
     );
-    let bytes = safetensors::serialize(&tensors, &None).unwrap();
+    let bytes = safetensors::serialize(&tensors, None).unwrap();
     let path = dir.join("model.safetensors");
     std::fs::write(&path, bytes).unwrap();
     path
@@ -330,7 +330,7 @@ fn build_multi_tensor_fixture(dir: &std::path::Path) -> std::path::PathBuf {
         "encoder.bias".into(),
         TensorView::new(Dtype::F32, vec![6], &w_b).unwrap(),
     );
-    let bytes = safetensors::serialize(&tensors, &None).unwrap();
+    let bytes = safetensors::serialize(&tensors, None).unwrap();
     let path = dir.join("model_multi.safetensors");
     std::fs::write(&path, bytes).unwrap();
     path
@@ -667,7 +667,7 @@ fn rewrite_dedup_shrinks_file_with_tied_tensors() {
             "lm_head".into(),
             TensorView::new(Dtype::F32, vec![8, 8], &shared).unwrap(),
         );
-        let bytes = safetensors::serialize(&tensors, &None).unwrap();
+        let bytes = safetensors::serialize(&tensors, None).unwrap();
         std::fs::write(&st_path, bytes).unwrap();
     }
 

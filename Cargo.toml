@@ -32,13 +32,13 @@ readme = "README.md"
 [workspace.dependencies]
 # Core format deps.
 memmap2 = "0.9"
-bytemuck = { version = "1.19", features = ["derive", "extern_crate_alloc"] }
-blake3 = "1.5"
+bytemuck = { version = "1.25", features = ["derive", "extern_crate_alloc"] }
+blake3 = "1.8"
 thiserror = "2.0"
 anyhow = "1.0"
-half = { version = "2.4", features = ["bytemuck"] }
+half = { version = "2.7", features = ["bytemuck"] }
 wide = "0.7"
-rayon = "1.10"
+rayon = "1.12"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
@@ -46,29 +46,29 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 zstd = "0.13"
 
 # CLI / conversion.
-clap = { version = "4.5", features = ["derive"] }
-safetensors = "0.4"
+clap = { version = "4.6", features = ["derive"] }
+safetensors = "0.8"
 gguf-rs-lib = { version = "0.2", features = ["mmap"] }
 ndarray-npy = "0.10"
-hf-hub = "0.4"
+hf-hub = "0.5"
 serde = "1.0"
 serde_json = "1.0"
-toml = "0.8"
-tempfile = "3.10"
+toml = "1.1"
+tempfile = "3.27"
 hex = "0.4"
 
 # Bench.
-criterion = { version = "0.5", default-features = false, features = ["html_reports"] }
+criterion = { version = "0.7", default-features = false, features = ["html_reports"] }
 
 # Optional GPU.
-wgpu = { version = "22", default-features = false, features = ["wgsl"] }
+wgpu = { version = "26", default-features = false, features = ["std", "wgsl", "metal", "vulkan", "dx12", "gles"] }
 pollster = "0.4"
-cudarc = { version = "0.12", features = ["cuda-12000"] }
-metal = "0.29"
+cudarc = { version = "0.19", features = ["cuda-12000"] }
+metal = "0.33"
 objc = "0.2"
 ort = { version = "2.0.0-rc.12", features = ["ndarray"] }
-pyo3 = { version = "0.22", features = ["extension-module", "abi3-py38"] }
-numpy = "0.22"
+pyo3 = { version = "0.29", features = ["extension-module", "abi3-py38"] }
+numpy = "0.29"
 
 # Internal crates.
 rsmf-core = { path = "crates/rsmf-core", version = "0.1.0" }

@@ -5,7 +5,7 @@ use std::sync::Arc;
 /// A handle to an active CUDA device.
 pub struct DeviceHandle {
     /// The underlying cudarc device handle.
-    pub device: Arc<cudarc::driver::CudaDevice>,
+    pub device: Arc<cudarc::driver::CudaContext>,
 }
 
 /// Detect if CUDA capabilities are available on this system.
@@ -27,6 +27,6 @@ pub fn detect_capabilities() -> bool {
 ///
 /// Returns a handle if the device can be initialised, or an error otherwise.
 pub fn request_device(ordinal: usize) -> Result<DeviceHandle, cudarc::driver::DriverError> {
-    let device = cudarc::driver::CudaDevice::new(ordinal)?;
+    let device = cudarc::driver::CudaContext::new(ordinal)?;
     Ok(DeviceHandle { device })
 }

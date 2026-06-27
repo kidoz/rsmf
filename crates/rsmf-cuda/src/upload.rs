@@ -18,7 +18,7 @@ pub enum UploadError {
 /// Upload a byte slice into a newly allocated CUDA device buffer asynchronously.
 ///
 /// # Safety and Synchronization
-/// This function uses [`cudarc::driver::CudaDevice::htod_copy`], which
+/// This function uses [`cudarc::driver::CudaStream::clone_htod`], which
 /// performs an **asynchronous** host-to-device copy, allowing overlapping
 /// with computation. It consumes a `Vec` to keep the host memory alive
 /// until the transfer completes.
@@ -33,8 +33,8 @@ pub fn upload_canonical_tensor_async(
     // Copy to an owned Vec so it can be safely referenced during async transfer
     let host_vec = bytes.to_vec();
 
-    // htod_copy handles allocating the CudaSlice and starting the async copy
-    let slice = handle.device.htod_copy(host_vec)?;
+    // clone_htod handles allocating the CudaSlice and starting the async copy.
+    let slice = handle.device.default_stream().clone_htod(&host_vec)?;
 
     Ok(slice)
 }

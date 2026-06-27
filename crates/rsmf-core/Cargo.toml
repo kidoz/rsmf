@@ -14,7 +14,7 @@ name = "rsmf_core"
 path = "src/lib.rs"
 
 [dependencies]
-tokio = { version = "1.0", features = ["io-util", "fs", "macros"], optional = true }
+tokio = { version = "1.52", features = ["io-util", "fs", "macros"], optional = true }
 memmap2.workspace = true
 bytemuck.workspace = true
 blake3.workspace = true
@@ -58,4 +58,4 @@ safetensors.workspace = true
 # Property-based / fuzz-friendly coverage for malformed-input parsers.
 # Kept at the workspace level would drag it into every downstream crate,
 # so it lives only in rsmf-core tests.
-proptest = { version = "1.5", default-features = false, features = ["std"] }
+proptest = { version = "1.11", default-features = false, features = ["std"] }
