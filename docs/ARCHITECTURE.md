@@ -67,7 +67,11 @@ rsmf-core  (library)           ← format, reader, writer, validator, selection
   the in-tree threaded CPU logits path. `Engine::native_decoder_check_reference_logits()`
   compares runtime logits against local or exported references, and the first
   performance slice adds page-sized KV-cache allocation accounting plus threaded
-  final projection without adding GPU dependencies.
+  final projection without adding GPU dependencies. `Engine::native_decoder_tokenizer()`
+  and `Engine::native_decoder_generate_text()` add the first text-level native
+  decoder path for simple `WordLevel` tokenizer assets: prompts are whitespace
+  tokenized by vocab lookup and token ids decode by joining token strings with
+  spaces.
 - `rsmf-moe-runtime` is a proof-of-concept runtime for one MoE layer: host-side
   top-1 gating, token batching by destination expert, placement-aware expert
   shard lookup, WGPU expert matmuls when available, and a CPU reference path.

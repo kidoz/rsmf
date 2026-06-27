@@ -259,6 +259,10 @@ exported tiny-model logits within an absolute tolerance. Performance work has
 started with page-sized KV-cache allocation and threaded CPU logits; tokenizer
 parsing, text-level generation, paged attention kernels, and GPU/vendor kernels
 remain future milestones.
+`Engine::native_decoder_tokenizer()` and `Engine::native_decoder_generate_text()`
+add the first text-level path for simple `WordLevel` tokenizer assets. This
+slice encodes prompts by whitespace token lookup and decodes by joining
+tokens with spaces; full HuggingFace tokenizer parity remains future work.
 
 ### Minimal MoE runtime PoC
 
