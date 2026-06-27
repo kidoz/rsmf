@@ -17,6 +17,8 @@ serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 ndarray = "0.17"
 unicode-normalization.workspace = true
+regex.workspace = true
+minijinja.workspace = true
 tracing = { workspace = true, optional = true }
 
 [features]

@@ -1,5 +1,16 @@
 use super::*;
+use minijinja::{Environment, ErrorKind as JinjaErrorKind, value::Value as JinjaValue};
+use regex::Regex;
+use serde_json::json;
 use unicode_normalization::UnicodeNormalization;
+use unicode_normalization::char::is_combining_mark;
+
+const MAX_TOKENIZER_JSON_BYTES: usize = 64 * 1024 * 1024;
+const MAX_TOKENIZER_VOCAB_ENTRIES: usize = 2_000_000;
+const MAX_TOKENIZER_TOKEN_CHARS: usize = 16_384;
+const MAX_CHAT_TEMPLATE_BYTES: usize = 1024 * 1024;
+const MAX_CHAT_RENDERED_BYTES: usize = 8 * 1024 * 1024;
+const CHAT_TEMPLATE_FUEL: u64 = 500_000;
 
 /// Role/content message consumed by native decoder chat templates.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -36,7 +47,10 @@ pub struct NativeDecoderTokenizer {
     post_processor: NativeDecoderPostProcessor,
     bpe_ranks: HashMap<(String, String), usize>,
     unigram_scores: HashMap<String, i64>,
+    wordpiece_prefix: String,
+    max_input_chars_per_word: usize,
     byte_fallback: bool,
+    decoder: NativeDecoderDecoder,
     special_tokens: Vec<String>,
     chat_template: Option<NativeDecoderChatTemplate>,
 }
@@ -52,6 +66,15 @@ impl NativeDecoderTokenizer {
         tokenizer_config: Option<&[u8]>,
         chat_template_asset: Option<&[u8]>,
     ) -> Result<Self> {
+        if bytes.len() > MAX_TOKENIZER_JSON_BYTES {
+            return Err(RuntimeError::NativeDecoderTokenizerInvalid {
+                reason: format!(
+                    "tokenizer.json is too large: {} bytes exceeds {}",
+                    bytes.len(),
+                    MAX_TOKENIZER_JSON_BYTES
+                ),
+            });
+        }
         let raw: NativeDecoderTokenizerJson = serde_json::from_slice(bytes).map_err(|error| {
             RuntimeError::NativeDecoderTokenizerInvalid {
                 reason: error.to_string(),
@@ -64,10 +87,11 @@ impl NativeDecoderTokenizer {
             "WordLevel" => NativeDecoderTokenizerMode::WordLevel,
             "BPE" => NativeDecoderTokenizerMode::Bpe,
             "Unigram" => NativeDecoderTokenizerMode::Unigram,
+            "WordPiece" => NativeDecoderTokenizerMode::WordPiece,
             other => {
                 return Err(RuntimeError::NativeDecoderTokenizerInvalid {
                     reason: format!(
-                        "only WordLevel, BPE, and Unigram tokenizer.json assets are supported, got {other}"
+                        "only WordLevel, BPE, Unigram, and WordPiece tokenizer.json assets are supported, got {other}"
                     ),
                 });
             }
@@ -91,8 +115,10 @@ impl NativeDecoderTokenizer {
                     .find_map(|(token, id)| (*id == token_id).then(|| token.clone()));
             }
         }
+        let decoder = NativeDecoderDecoder::from_json(raw.decoder.as_ref())?;
         let mut special_tokens = Vec::new();
         for added in raw.added_tokens {
+            validate_tokenizer_token(&added.content)?;
             if added.special {
                 special_tokens.push(added.content.clone());
             }
@@ -106,8 +132,18 @@ impl NativeDecoderTokenizer {
                 reason: "tokenizer vocab must not be empty".to_string(),
             });
         }
+        if vocab.len() > MAX_TOKENIZER_VOCAB_ENTRIES {
+            return Err(RuntimeError::NativeDecoderTokenizerInvalid {
+                reason: format!(
+                    "tokenizer vocab has {} entries, maximum supported is {}",
+                    vocab.len(),
+                    MAX_TOKENIZER_VOCAB_ENTRIES
+                ),
+            });
+        }
         let mut id_to_token = HashMap::with_capacity(vocab.len());
         for (token, token_id) in &vocab {
+            validate_tokenizer_token(token)?;
             if id_to_token.insert(*token_id, token.clone()).is_some() {
                 return Err(RuntimeError::NativeDecoderTokenizerInvalid {
                     reason: format!("duplicate tokenizer id {token_id}"),
@@ -132,7 +168,13 @@ impl NativeDecoderTokenizer {
             post_processor,
             bpe_ranks,
             unigram_scores,
+            wordpiece_prefix: raw
+                .model
+                .continuing_subword_prefix
+                .unwrap_or_else(|| "##".to_string()),
+            max_input_chars_per_word: raw.model.max_input_chars_per_word.unwrap_or(100),
             byte_fallback: raw.model.byte_fallback,
+            decoder,
             special_tokens,
             chat_template: NativeDecoderChatTemplate::from_assets(
                 tokenizer_config,
@@ -148,16 +190,20 @@ impl NativeDecoderTokenizer {
     /// exact special-token lookup. Unsupported tokenizer components fail at
     /// load time with typed errors.
     pub fn encode(&self, text: &str) -> Result<Vec<i64>> {
-        let model_token_ids = self.encode_without_post_processor(text)?;
-        self.post_processor.apply_single(model_token_ids)
+        Ok(self.encode_to_encoding(text)?.ids)
     }
 
     /// Encode a pair of text sequences and apply a pair post-processor when
     /// the tokenizer defines one.
     pub fn encode_pair(&self, first: &str, second: &str) -> Result<Vec<i64>> {
-        let first_ids = self.encode_without_post_processor(first)?;
-        let second_ids = self.encode_without_post_processor(second)?;
-        self.post_processor.apply_pair(first_ids, second_ids)
+        let first = self.encode_without_post_processor(first, Some(0))?;
+        let second = self.encode_without_post_processor(second, Some(1))?;
+        Ok(self.post_processor.apply_pair(first, second)?.ids)
+    }
+
+    pub(crate) fn encode_to_encoding(&self, text: &str) -> Result<NativeDecoderEncoding> {
+        let model_encoding = self.encode_without_post_processor(text, Some(0))?;
+        self.post_processor.apply_single(model_encoding)
     }
 
     /// Render the configured chat template to prompt text.
@@ -184,35 +230,68 @@ impl NativeDecoderTokenizer {
         self.encode(&prompt)
     }
 
-    fn encode_without_post_processor(&self, text: &str) -> Result<Vec<i64>> {
+    fn encode_without_post_processor(
+        &self,
+        text: &str,
+        sequence_id: Option<u8>,
+    ) -> Result<NativeDecoderEncoding> {
         let normalized = self.normalizer.normalize(text);
-        let mut token_ids = Vec::new();
+        let mut encoding = NativeDecoderEncoding::new();
         for segment in isolate_special_token_segments(&normalized, &self.special_tokens) {
             match segment {
                 NativeDecoderTokenSegment::Special(token) => {
-                    token_ids.push(self.lookup_token_id(&token)?);
+                    encoding.push(
+                        self.lookup_token_id(&token)?,
+                        token,
+                        None,
+                        0,
+                        true,
+                        sequence_id,
+                    );
                 }
                 NativeDecoderTokenSegment::Text(text) => {
                     for token in self.pre_tokenizer.pieces(&text) {
                         match self.mode {
                             NativeDecoderTokenizerMode::WordLevel => {
-                                token_ids.push(self.lookup_token_id(&token)?);
+                                encoding.push(
+                                    self.lookup_token_id(&token)?,
+                                    token,
+                                    None,
+                                    0,
+                                    false,
+                                    sequence_id,
+                                );
                             }
                             NativeDecoderTokenizerMode::Bpe => {
-                                token_ids.extend(self.encode_bpe_piece(&token)?);
+                                self.extend_encoding_from_ids(
+                                    &mut encoding,
+                                    self.encode_bpe_piece(&token)?,
+                                    sequence_id,
+                                )?;
                             }
                             NativeDecoderTokenizerMode::Unigram => {
-                                token_ids.extend(self.encode_unigram_piece(&token)?);
+                                self.extend_encoding_from_ids(
+                                    &mut encoding,
+                                    self.encode_unigram_piece(&token)?,
+                                    sequence_id,
+                                )?;
+                            }
+                            NativeDecoderTokenizerMode::WordPiece => {
+                                self.extend_encoding_from_ids(
+                                    &mut encoding,
+                                    self.encode_wordpiece_piece(&token)?,
+                                    sequence_id,
+                                )?;
                             }
                         }
                     }
                 }
             }
         }
-        if token_ids.is_empty() {
+        if encoding.ids.is_empty() {
             return Err(RuntimeError::NativeDecoderPromptEmpty);
         }
-        Ok(token_ids)
+        Ok(encoding)
     }
 
     /// Decode token ids back to text.
@@ -228,9 +307,17 @@ impl NativeDecoderTokenizer {
             })
             .collect::<Result<Vec<_>>>()?;
         match self.mode {
+            _ if self.decoder != NativeDecoderDecoder::None => {
+                self.decoder.decode(&tokens, &self.special_tokens)
+            }
             NativeDecoderTokenizerMode::WordLevel => Ok(tokens.join(" ")),
             NativeDecoderTokenizerMode::Bpe => Ok(self.decode_bpe_tokens(&tokens)?),
-            NativeDecoderTokenizerMode::Unigram => Ok(decode_sentencepiece_tokens(&tokens)),
+            NativeDecoderTokenizerMode::Unigram => Ok(decode_sentencepiece_tokens(&tokens, '▁')),
+            NativeDecoderTokenizerMode::WordPiece => Ok(decode_wordpiece_tokens(
+                &tokens,
+                &self.wordpiece_prefix,
+                true,
+            )),
         }
     }
 
@@ -401,6 +488,66 @@ impl NativeDecoderTokenizer {
             .map(|token| self.lookup_token_id(&token))
             .collect()
     }
+
+    pub(crate) fn encode_wordpiece_piece(&self, piece: &str) -> Result<Vec<i64>> {
+        if piece.chars().count() > self.max_input_chars_per_word {
+            return self.lookup_unk_or_unknown(piece);
+        }
+        let boundaries = char_boundaries_with_end(piece);
+        let mut start_index = 0usize;
+        let mut output = Vec::new();
+        while start_index + 1 < boundaries.len() {
+            let mut end_index = boundaries.len() - 1;
+            let mut matched: Option<(usize, i64)> = None;
+            while end_index > start_index {
+                let start = boundaries[start_index];
+                let end = boundaries[end_index];
+                let candidate = if start_index == 0 {
+                    piece[start..end].to_string()
+                } else {
+                    format!("{}{}", self.wordpiece_prefix, &piece[start..end])
+                };
+                if let Some(token_id) = self.vocab.get(&candidate) {
+                    matched = Some((end_index, *token_id));
+                    break;
+                }
+                end_index -= 1;
+            }
+            let Some((next_start, token_id)) = matched else {
+                return self.lookup_unk_or_unknown(piece);
+            };
+            output.push(token_id);
+            start_index = next_start;
+        }
+        Ok(output)
+    }
+
+    pub(crate) fn lookup_unk_or_unknown(&self, piece: &str) -> Result<Vec<i64>> {
+        let Some(unk_token) = &self.unk_token else {
+            return Err(RuntimeError::NativeDecoderTokenizerTokenUnknown {
+                token: piece.to_string(),
+            });
+        };
+        self.lookup_token_id(unk_token)
+            .map(|token_id| vec![token_id])
+    }
+
+    pub(crate) fn extend_encoding_from_ids(
+        &self,
+        encoding: &mut NativeDecoderEncoding,
+        token_ids: Vec<i64>,
+        sequence_id: Option<u8>,
+    ) -> Result<()> {
+        for token_id in token_ids {
+            let token = self.id_to_token.get(&token_id).cloned().ok_or_else(|| {
+                RuntimeError::NativeDecoderTokenizerTokenUnknown {
+                    token: token_id.to_string(),
+                }
+            })?;
+            encoding.push(token_id, token, None, 0, false, sequence_id);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -408,6 +555,57 @@ pub(crate) enum NativeDecoderTokenizerMode {
     WordLevel,
     Bpe,
     Unigram,
+    WordPiece,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NativeDecoderEncoding {
+    ids: Vec<i64>,
+    tokens: Vec<String>,
+    offsets: Vec<Option<(usize, usize)>>,
+    type_ids: Vec<u32>,
+    special_tokens_mask: Vec<bool>,
+    sequence_ids: Vec<Option<u8>>,
+}
+
+impl NativeDecoderEncoding {
+    pub(crate) fn new() -> Self {
+        Self {
+            ids: Vec::new(),
+            tokens: Vec::new(),
+            offsets: Vec::new(),
+            type_ids: Vec::new(),
+            special_tokens_mask: Vec::new(),
+            sequence_ids: Vec::new(),
+        }
+    }
+
+    pub(crate) fn push(
+        &mut self,
+        id: i64,
+        token: String,
+        offset: Option<(usize, usize)>,
+        type_id: u32,
+        special: bool,
+        sequence_id: Option<u8>,
+    ) {
+        self.ids.push(id);
+        self.tokens.push(token);
+        self.offsets.push(offset);
+        self.type_ids.push(type_id);
+        self.special_tokens_mask.push(special);
+        self.sequence_ids.push(sequence_id);
+    }
+
+    pub(crate) fn extend(&mut self, other: &Self) {
+        self.ids.extend_from_slice(&other.ids);
+        self.tokens.extend_from_slice(&other.tokens);
+        self.offsets.extend_from_slice(&other.offsets);
+        self.type_ids.extend_from_slice(&other.type_ids);
+        self.special_tokens_mask
+            .extend_from_slice(&other.special_tokens_mask);
+        self.sequence_ids.extend_from_slice(&other.sequence_ids);
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -438,6 +636,22 @@ pub(crate) enum NativeDecoderNormalizer {
     Nfd,
     Nfkc,
     Nfkd,
+    Strip {
+        strip_left: bool,
+        strip_right: bool,
+    },
+    StripAccents,
+    Replace {
+        pattern: String,
+        content: String,
+        regex: bool,
+    },
+    Bert {
+        clean_text: bool,
+        handle_chinese_chars: bool,
+        strip_accents: Option<bool>,
+        lowercase: bool,
+    },
     Sequence(Vec<NativeDecoderNormalizer>),
 }
 
@@ -460,6 +674,57 @@ impl NativeDecoderNormalizer {
             "NFD" => Ok(Self::Nfd),
             "NFKC" => Ok(Self::Nfkc),
             "NFKD" => Ok(Self::Nfkd),
+            "Strip" => Ok(Self::Strip {
+                strip_left: value
+                    .get("strip_left")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(true),
+                strip_right: value
+                    .get("strip_right")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(true),
+            }),
+            "StripAccents" => Ok(Self::StripAccents),
+            "Replace" => {
+                let (pattern, regex) = replace_pattern_from_json(value.get("pattern"))?;
+                let content = value
+                    .get("content")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| RuntimeError::NativeDecoderTokenizerInvalid {
+                        reason: "normalizer Replace requires string content".to_string(),
+                    })?
+                    .to_string();
+                if regex {
+                    Regex::new(&pattern).map_err(|error| {
+                        RuntimeError::NativeDecoderTokenizerInvalid {
+                            reason: format!("normalizer Replace regex is unsupported: {error}"),
+                        }
+                    })?;
+                }
+                Ok(Self::Replace {
+                    pattern,
+                    content,
+                    regex,
+                })
+            }
+            "BertNormalizer" | "Bert" => Ok(Self::Bert {
+                clean_text: value
+                    .get("clean_text")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(true),
+                handle_chinese_chars: value
+                    .get("handle_chinese_chars")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(true),
+                strip_accents: value
+                    .get("strip_accents")
+                    .and_then(serde_json::Value::as_bool),
+                lowercase: value
+                    .get("lowercase")
+                    .or_else(|| value.get("lower_case"))
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(true),
+            }),
             "Sequence" => {
                 let normalizers = value
                     .get("normalizers")
@@ -486,11 +751,124 @@ impl NativeDecoderNormalizer {
             Self::Nfd => text.nfd().collect(),
             Self::Nfkc => text.nfkc().collect(),
             Self::Nfkd => text.nfkd().collect(),
+            Self::Strip {
+                strip_left,
+                strip_right,
+            } => match (*strip_left, *strip_right) {
+                (true, true) => text.trim().to_string(),
+                (true, false) => text.trim_start().to_string(),
+                (false, true) => text.trim_end().to_string(),
+                (false, false) => text.to_string(),
+            },
+            Self::StripAccents => strip_accents(text),
+            Self::Replace {
+                pattern,
+                content,
+                regex,
+            } => {
+                if *regex {
+                    Regex::new(pattern)
+                        .map(|regex| regex.replace_all(text, content.as_str()).to_string())
+                        .unwrap_or_else(|_| text.to_string())
+                } else {
+                    text.replace(pattern, content)
+                }
+            }
+            Self::Bert {
+                clean_text,
+                handle_chinese_chars,
+                strip_accents: should_strip_accents,
+                lowercase,
+            } => normalize_bert(
+                text,
+                *clean_text,
+                *handle_chinese_chars,
+                should_strip_accents.unwrap_or(*lowercase),
+                *lowercase,
+            ),
             Self::Sequence(normalizers) => normalizers
                 .iter()
                 .fold(text.to_string(), |text, next| next.normalize(&text)),
         }
     }
+}
+
+pub(crate) fn replace_pattern_from_json(
+    value: Option<&serde_json::Value>,
+) -> Result<(String, bool)> {
+    let Some(value) = value else {
+        return Err(RuntimeError::NativeDecoderTokenizerInvalid {
+            reason: "normalizer Replace requires pattern".to_string(),
+        });
+    };
+    if let Some(pattern) = value.as_str() {
+        return Ok((pattern.to_string(), false));
+    }
+    if let Some(pattern) = value.get("String").and_then(serde_json::Value::as_str) {
+        return Ok((pattern.to_string(), false));
+    }
+    if let Some(pattern) = value.get("Regex").and_then(serde_json::Value::as_str) {
+        return Ok((pattern.to_string(), true));
+    }
+    Err(RuntimeError::NativeDecoderTokenizerInvalid {
+        reason: "normalizer Replace pattern must be a string, String, or Regex".to_string(),
+    })
+}
+
+pub(crate) fn normalize_bert(
+    text: &str,
+    clean_text: bool,
+    handle_chinese_chars: bool,
+    strip_accents_flag: bool,
+    lowercase: bool,
+) -> String {
+    let mut output = String::new();
+    for ch in text.chars() {
+        if clean_text && (ch == '\u{0}' || ch == '\u{fffd}' || is_bert_control(ch)) {
+            continue;
+        }
+        let ch = if clean_text && ch.is_whitespace() {
+            ' '
+        } else {
+            ch
+        };
+        if handle_chinese_chars && is_cjk_character(ch) {
+            output.push(' ');
+            output.push(ch);
+            output.push(' ');
+        } else {
+            output.push(ch);
+        }
+    }
+    if lowercase {
+        output = output.to_lowercase();
+    }
+    if strip_accents_flag {
+        output = strip_accents(&output);
+    }
+    output
+}
+
+pub(crate) fn strip_accents(text: &str) -> String {
+    text.nfd().filter(|ch| !is_combining_mark(*ch)).collect()
+}
+
+pub(crate) fn is_bert_control(ch: char) -> bool {
+    ch.is_control() && ch != '\t' && ch != '\n' && ch != '\r'
+}
+
+pub(crate) fn is_cjk_character(ch: char) -> bool {
+    matches!(
+        ch as u32,
+        0x4E00..=0x9FFF
+            | 0x3400..=0x4DBF
+            | 0x20000..=0x2A6DF
+            | 0x2A700..=0x2B73F
+            | 0x2B740..=0x2B81F
+            | 0x2B820..=0x2CEAF
+            | 0xF900..=0xFAFF
+            | 0x2F800..=0x2FA1F
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -500,6 +878,16 @@ pub(crate) enum NativeDecoderPostProcessor {
         single: Vec<NativeDecoderTemplatePiece>,
         pair: Vec<NativeDecoderTemplatePiece>,
     },
+    BertProcessing {
+        sep: NativeDecoderTemplatePiece,
+        cls: NativeDecoderTemplatePiece,
+    },
+    RobertaProcessing {
+        sep: NativeDecoderTemplatePiece,
+        cls: NativeDecoderTemplatePiece,
+    },
+    ByteLevel,
+    Sequence(Vec<NativeDecoderPostProcessor>),
 }
 
 impl NativeDecoderPostProcessor {
@@ -517,9 +905,27 @@ impl NativeDecoderPostProcessor {
             });
         };
         match kind {
-            "RobertaProcessing" => Err(RuntimeError::NativeDecoderTokenizerInvalid {
-                reason: "unsupported post_processor RobertaProcessing; use TemplateProcessing"
-                    .to_string(),
+            "ByteLevel" => Ok(Self::ByteLevel),
+            "Sequence" => {
+                let processors = value
+                    .get("processors")
+                    .or_else(|| value.get("post_processors"))
+                    .and_then(serde_json::Value::as_array)
+                    .ok_or_else(|| RuntimeError::NativeDecoderTokenizerInvalid {
+                        reason: "post_processor Sequence requires a processors array".to_string(),
+                    })?
+                    .iter()
+                    .map(|processor| Self::from_json(Some(processor)))
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(Self::Sequence(processors))
+            }
+            "BertProcessing" => Ok(Self::BertProcessing {
+                sep: post_processor_special_pair(value, "sep")?,
+                cls: post_processor_special_pair(value, "cls")?,
+            }),
+            "RobertaProcessing" => Ok(Self::RobertaProcessing {
+                sep: post_processor_special_pair(value, "sep")?,
+                cls: post_processor_special_pair(value, "cls")?,
             }),
             "TemplateProcessing" => {
                 let special_tokens =
@@ -539,21 +945,88 @@ impl NativeDecoderPostProcessor {
         }
     }
 
-    pub(crate) fn apply_single(&self, ids: Vec<i64>) -> Result<Vec<i64>> {
+    pub(crate) fn apply_single(
+        &self,
+        encoding: NativeDecoderEncoding,
+    ) -> Result<NativeDecoderEncoding> {
         match self {
-            Self::None => Ok(ids),
-            Self::TemplateProcessing { single, .. } => apply_template_pieces(single, &ids, &[]),
+            Self::None | Self::ByteLevel => Ok(encoding),
+            Self::TemplateProcessing { single, .. } => {
+                apply_template_pieces(single, &encoding, &NativeDecoderEncoding::new())
+            }
+            Self::BertProcessing { sep, cls } => apply_template_pieces(
+                &[
+                    cls.clone(),
+                    NativeDecoderTemplatePiece::SequenceA,
+                    sep.clone(),
+                ],
+                &encoding,
+                &NativeDecoderEncoding::new(),
+            ),
+            Self::RobertaProcessing { sep, cls } => apply_template_pieces(
+                &[
+                    cls.clone(),
+                    NativeDecoderTemplatePiece::SequenceA,
+                    sep.clone(),
+                ],
+                &encoding,
+                &NativeDecoderEncoding::new(),
+            ),
+            Self::Sequence(processors) => {
+                processors.iter().try_fold(encoding, |encoding, processor| {
+                    processor.apply_single(encoding)
+                })
+            }
         }
     }
 
-    pub(crate) fn apply_pair(&self, first: Vec<i64>, second: Vec<i64>) -> Result<Vec<i64>> {
+    pub(crate) fn apply_pair(
+        &self,
+        first: NativeDecoderEncoding,
+        second: NativeDecoderEncoding,
+    ) -> Result<NativeDecoderEncoding> {
         match self {
-            Self::None => {
-                let mut ids = first;
-                ids.extend(second);
-                Ok(ids)
+            Self::None | Self::ByteLevel => {
+                let mut output = first;
+                output.extend(&second);
+                Ok(output)
             }
             Self::TemplateProcessing { pair, .. } => apply_template_pieces(pair, &first, &second),
+            Self::BertProcessing { sep, cls } => apply_template_pieces(
+                &[
+                    cls.clone(),
+                    NativeDecoderTemplatePiece::SequenceA,
+                    sep.clone(),
+                    NativeDecoderTemplatePiece::SequenceB,
+                    sep.clone(),
+                ],
+                &first,
+                &second,
+            ),
+            Self::RobertaProcessing { sep, cls } => apply_template_pieces(
+                &[
+                    cls.clone(),
+                    NativeDecoderTemplatePiece::SequenceA,
+                    sep.clone(),
+                    sep.clone(),
+                    NativeDecoderTemplatePiece::SequenceB,
+                    sep.clone(),
+                ],
+                &first,
+                &second,
+            ),
+            Self::Sequence(processors) => {
+                let Some((first_processor, rest)) = processors.split_first() else {
+                    let mut output = first;
+                    output.extend(&second);
+                    return Ok(output);
+                };
+                let mut output = first_processor.apply_pair(first, second)?;
+                for processor in rest {
+                    output = processor.apply_single(output)?;
+                }
+                Ok(output)
+            }
         }
     }
 
@@ -569,6 +1042,19 @@ impl NativeDecoderPostProcessor {
                     | NativeDecoderTemplatePiece::SequenceB => None,
                 })
                 .collect(),
+            Self::BertProcessing { sep, cls } | Self::RobertaProcessing { sep, cls } => [sep, cls]
+                .into_iter()
+                .filter_map(|piece| match piece {
+                    NativeDecoderTemplatePiece::SpecialToken { token, .. } => Some(token.clone()),
+                    NativeDecoderTemplatePiece::SequenceA
+                    | NativeDecoderTemplatePiece::SequenceB => None,
+                })
+                .collect(),
+            Self::ByteLevel => Vec::new(),
+            Self::Sequence(processors) => processors
+                .iter()
+                .flat_map(Self::special_token_strings)
+                .collect(),
         }
     }
 }
@@ -580,25 +1066,242 @@ pub(crate) enum NativeDecoderTemplatePiece {
     SpecialToken { token: String, ids: Vec<i64> },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum NativeDecoderPreTokenizer {
     Whitespace,
+    WhitespaceSplit,
     ByteLevel {
         add_prefix_space: bool,
+        use_regex: bool,
     },
     Metaspace {
         replacement: char,
         add_prefix_space: bool,
     },
+    Punctuation,
+    Digits {
+        individual_digits: bool,
+    },
+    CharDelimiterSplit(char),
+    Split {
+        pattern: String,
+        invert: bool,
+    },
+    Sequence(Vec<NativeDecoderPreTokenizer>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum NativeDecoderDecoder {
+    None,
+    WordPiece {
+        prefix: String,
+        cleanup: bool,
+    },
+    ByteLevel,
+    Metaspace {
+        replacement: char,
+        add_prefix_space: bool,
+    },
+    Bpe {
+        suffix: String,
+    },
+    Fuse,
+    Strip {
+        content: char,
+        start: usize,
+        stop: usize,
+    },
+    Replace {
+        pattern: String,
+        content: String,
+    },
+    Sequence(Vec<NativeDecoderDecoder>),
+}
+
+impl NativeDecoderDecoder {
+    pub(crate) fn from_json(value: Option<&serde_json::Value>) -> Result<Self> {
+        let Some(value) = value else {
+            return Ok(Self::None);
+        };
+        if value.is_null() {
+            return Ok(Self::None);
+        }
+        let Some(kind) = value.get("type").and_then(serde_json::Value::as_str) else {
+            return Err(RuntimeError::NativeDecoderTokenizerInvalid {
+                reason: "decoder.type is required when decoder is present".to_string(),
+            });
+        };
+        match kind {
+            "WordPiece" => Ok(Self::WordPiece {
+                prefix: value
+                    .get("prefix")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("##")
+                    .to_string(),
+                cleanup: value
+                    .get("cleanup")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(true),
+            }),
+            "ByteLevel" => Ok(Self::ByteLevel),
+            "Metaspace" => {
+                let replacement = value
+                    .get("replacement")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("▁");
+                let mut chars = replacement.chars();
+                let Some(replacement) = chars.next() else {
+                    return Err(RuntimeError::NativeDecoderTokenizerInvalid {
+                        reason: "decoder Metaspace replacement must not be empty".to_string(),
+                    });
+                };
+                if chars.next().is_some() {
+                    return Err(RuntimeError::NativeDecoderTokenizerInvalid {
+                        reason: "decoder Metaspace replacement must be one character".to_string(),
+                    });
+                }
+                Ok(Self::Metaspace {
+                    replacement,
+                    add_prefix_space: value
+                        .get("add_prefix_space")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(true),
+                })
+            }
+            "BPEDecoder" => Ok(Self::Bpe {
+                suffix: value
+                    .get("suffix")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("</w>")
+                    .to_string(),
+            }),
+            "Fuse" => Ok(Self::Fuse),
+            "Strip" => {
+                let content = value
+                    .get("content")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(" ");
+                let mut chars = content.chars();
+                let Some(content) = chars.next() else {
+                    return Err(RuntimeError::NativeDecoderTokenizerInvalid {
+                        reason: "decoder Strip content must not be empty".to_string(),
+                    });
+                };
+                if chars.next().is_some() {
+                    return Err(RuntimeError::NativeDecoderTokenizerInvalid {
+                        reason: "decoder Strip content must be one character".to_string(),
+                    });
+                }
+                Ok(Self::Strip {
+                    content,
+                    start: value
+                        .get("start")
+                        .and_then(serde_json::Value::as_u64)
+                        .and_then(|value| usize::try_from(value).ok())
+                        .unwrap_or(0),
+                    stop: value
+                        .get("stop")
+                        .and_then(serde_json::Value::as_u64)
+                        .and_then(|value| usize::try_from(value).ok())
+                        .unwrap_or(0),
+                })
+            }
+            "Replace" => {
+                let (pattern, regex) = replace_pattern_from_json(value.get("pattern"))?;
+                if regex {
+                    return Err(RuntimeError::NativeDecoderTokenizerInvalid {
+                        reason: "decoder Replace regex patterns are not supported".to_string(),
+                    });
+                }
+                Ok(Self::Replace {
+                    pattern,
+                    content: value
+                        .get("content")
+                        .and_then(serde_json::Value::as_str)
+                        .ok_or_else(|| RuntimeError::NativeDecoderTokenizerInvalid {
+                            reason: "decoder Replace requires string content".to_string(),
+                        })?
+                        .to_string(),
+                })
+            }
+            "Sequence" => {
+                let decoders = value
+                    .get("decoders")
+                    .and_then(serde_json::Value::as_array)
+                    .ok_or_else(|| RuntimeError::NativeDecoderTokenizerInvalid {
+                        reason: "decoder Sequence requires a decoders array".to_string(),
+                    })?
+                    .iter()
+                    .map(|decoder| Self::from_json(Some(decoder)))
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(Self::Sequence(decoders))
+            }
+            other => Err(RuntimeError::NativeDecoderTokenizerInvalid {
+                reason: format!("unsupported decoder {other}"),
+            }),
+        }
+    }
+
+    pub(crate) fn decode(&self, tokens: &[String], special_tokens: &[String]) -> Result<String> {
+        match self {
+            Self::None => Ok(tokens.join("")),
+            Self::WordPiece { prefix, cleanup } => {
+                Ok(decode_wordpiece_tokens(tokens, prefix, *cleanup))
+            }
+            Self::ByteLevel => Ok(decode_bpe_tokens(tokens)),
+            Self::Metaspace { replacement, .. } => {
+                Ok(decode_sentencepiece_tokens(tokens, *replacement))
+            }
+            Self::Bpe { suffix } => Ok(tokens
+                .iter()
+                .map(|token| token.strip_suffix(suffix).unwrap_or(token))
+                .collect::<Vec<_>>()
+                .join(" ")),
+            Self::Fuse => Ok(tokens
+                .iter()
+                .filter(|token| !special_tokens.contains(token))
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("")),
+            Self::Strip {
+                content,
+                start,
+                stop,
+            } => {
+                let mut decoded = tokens.join("");
+                for _ in 0..*start {
+                    decoded = decoded
+                        .strip_prefix(*content)
+                        .unwrap_or(&decoded)
+                        .to_string();
+                }
+                for _ in 0..*stop {
+                    decoded = decoded
+                        .strip_suffix(*content)
+                        .unwrap_or(&decoded)
+                        .to_string();
+                }
+                Ok(decoded)
+            }
+            Self::Replace { pattern, content } => Ok(tokens.join("").replace(pattern, content)),
+            Self::Sequence(decoders) => {
+                let mut pieces = tokens.to_vec();
+                for decoder in decoders {
+                    pieces = vec![decoder.decode(&pieces, special_tokens)?];
+                }
+                Ok(pieces.join(""))
+            }
+        }
+    }
 }
 
 impl NativeDecoderPreTokenizer {
     pub(crate) fn from_json(value: Option<&serde_json::Value>) -> Result<Self> {
         let Some(value) = value else {
-            return Ok(Self::Whitespace);
+            return Ok(Self::WhitespaceSplit);
         };
         if value.is_null() {
-            return Ok(Self::Whitespace);
+            return Ok(Self::WhitespaceSplit);
         }
         let Some(kind) = value.get("type").and_then(serde_json::Value::as_str) else {
             return Err(RuntimeError::NativeDecoderTokenizerInvalid {
@@ -606,12 +1309,17 @@ impl NativeDecoderPreTokenizer {
             });
         };
         match kind {
-            "Whitespace" | "WhitespaceSplit" => Ok(Self::Whitespace),
+            "Whitespace" => Ok(Self::Whitespace),
+            "WhitespaceSplit" => Ok(Self::WhitespaceSplit),
             "ByteLevel" => Ok(Self::ByteLevel {
                 add_prefix_space: value
                     .get("add_prefix_space")
                     .and_then(serde_json::Value::as_bool)
                     .unwrap_or(false),
+                use_regex: value
+                    .get("use_regex")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(true),
             }),
             "Metaspace" => {
                 let replacement = value
@@ -630,13 +1338,84 @@ impl NativeDecoderPreTokenizer {
                             .to_string(),
                     });
                 }
+                let add_prefix_space = if let Some(add_prefix_space) = value
+                    .get("add_prefix_space")
+                    .and_then(serde_json::Value::as_bool)
+                {
+                    add_prefix_space
+                } else {
+                    match value
+                        .get("prepend_scheme")
+                        .and_then(serde_json::Value::as_str)
+                    {
+                        Some("always") => true,
+                        Some("never") => false,
+                        _ => true,
+                    }
+                };
                 Ok(Self::Metaspace {
                     replacement,
-                    add_prefix_space: value
-                        .get("add_prefix_space")
-                        .and_then(serde_json::Value::as_bool)
-                        .unwrap_or(true),
+                    add_prefix_space,
                 })
+            }
+            "Punctuation" => Ok(Self::Punctuation),
+            "Digits" => Ok(Self::Digits {
+                individual_digits: value
+                    .get("individual_digits")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
+            }),
+            "CharDelimiterSplit" => {
+                let delimiter = value
+                    .get("delimiter")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| RuntimeError::NativeDecoderTokenizerInvalid {
+                        reason: "pre_tokenizer CharDelimiterSplit requires delimiter".to_string(),
+                    })?;
+                let mut chars = delimiter.chars();
+                let Some(delimiter) = chars.next() else {
+                    return Err(RuntimeError::NativeDecoderTokenizerInvalid {
+                        reason: "pre_tokenizer CharDelimiterSplit delimiter must not be empty"
+                            .to_string(),
+                    });
+                };
+                if chars.next().is_some() {
+                    return Err(RuntimeError::NativeDecoderTokenizerInvalid {
+                        reason: "pre_tokenizer CharDelimiterSplit delimiter must be one character"
+                            .to_string(),
+                    });
+                }
+                Ok(Self::CharDelimiterSplit(delimiter))
+            }
+            "Split" => {
+                let (pattern, regex) = replace_pattern_from_json(value.get("pattern"))?;
+                if regex {
+                    Regex::new(&pattern).map_err(|error| {
+                        RuntimeError::NativeDecoderTokenizerInvalid {
+                            reason: format!("pre_tokenizer Split regex is unsupported: {error}"),
+                        }
+                    })?;
+                }
+                Ok(Self::Split {
+                    pattern,
+                    invert: value
+                        .get("invert")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false),
+                })
+            }
+            "Sequence" => {
+                let pre_tokenizers = value
+                    .get("pretokenizers")
+                    .or_else(|| value.get("pre_tokenizers"))
+                    .and_then(serde_json::Value::as_array)
+                    .ok_or_else(|| RuntimeError::NativeDecoderTokenizerInvalid {
+                        reason: "pre_tokenizer Sequence requires a pretokenizers array".to_string(),
+                    })?
+                    .iter()
+                    .map(|pre_tokenizer| Self::from_json(Some(pre_tokenizer)))
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(Self::Sequence(pre_tokenizers))
             }
             other => Err(RuntimeError::NativeDecoderTokenizerInvalid {
                 reason: format!("unsupported pre_tokenizer {other}"),
@@ -644,13 +1423,16 @@ impl NativeDecoderPreTokenizer {
         }
     }
 
-    pub(crate) fn pieces(self, text: &str) -> Vec<String> {
+    pub(crate) fn pieces(&self, text: &str) -> Vec<String> {
         match self {
-            Self::Whitespace => text.split_whitespace().map(ToString::to_string).collect(),
-            Self::ByteLevel { add_prefix_space } => {
+            Self::Whitespace => split_whitespace_and_punctuation(text),
+            Self::WhitespaceSplit => text.split_whitespace().map(ToString::to_string).collect(),
+            Self::ByteLevel {
+                add_prefix_space, ..
+            } => {
                 let mut pieces = Vec::new();
                 for (index, piece) in text.split_whitespace().enumerate() {
-                    if index == 0 && !add_prefix_space {
+                    if index == 0 && !*add_prefix_space {
                         pieces.push(piece.to_string());
                     } else {
                         pieces.push(format!("Ġ{piece}"));
@@ -664,15 +1446,128 @@ impl NativeDecoderPreTokenizer {
             } => {
                 let mut piece = text
                     .chars()
-                    .map(|ch| if ch.is_whitespace() { replacement } else { ch })
+                    .map(|ch| if ch.is_whitespace() { *replacement } else { ch })
                     .collect::<String>();
-                if add_prefix_space && !piece.starts_with(replacement) {
-                    piece.insert(0, replacement);
+                if *add_prefix_space && !piece.starts_with(*replacement) {
+                    piece.insert(0, *replacement);
                 }
                 vec![piece]
             }
+            Self::Punctuation => split_punctuation(text),
+            Self::Digits { individual_digits } => split_digits(text, *individual_digits),
+            Self::CharDelimiterSplit(delimiter) => text
+                .split(*delimiter)
+                .filter(|piece| !piece.is_empty())
+                .map(ToString::to_string)
+                .collect(),
+            Self::Split { pattern, invert } => split_by_pattern(text, pattern, *invert),
+            Self::Sequence(pre_tokenizers) => {
+                let mut pieces = vec![text.to_string()];
+                for pre_tokenizer in pre_tokenizers {
+                    pieces = pieces
+                        .into_iter()
+                        .flat_map(|piece| pre_tokenizer.pieces(&piece))
+                        .collect();
+                }
+                pieces
+            }
         }
     }
+}
+
+pub(crate) fn split_whitespace_and_punctuation(text: &str) -> Vec<String> {
+    text.split_whitespace()
+        .flat_map(split_punctuation)
+        .collect()
+}
+
+pub(crate) fn split_punctuation(text: &str) -> Vec<String> {
+    split_by_char_class(text, is_tokenizer_punctuation)
+}
+
+pub(crate) fn split_digits(text: &str, individual_digits: bool) -> Vec<String> {
+    if individual_digits {
+        split_by_char_class(text, |ch| ch.is_ascii_digit())
+    } else {
+        split_runs_by_class(text, |ch| ch.is_ascii_digit())
+    }
+}
+
+pub(crate) fn split_by_pattern(text: &str, pattern: &str, invert: bool) -> Vec<String> {
+    let Ok(regex) = Regex::new(pattern) else {
+        if pattern.is_empty() {
+            return vec![text.to_string()];
+        }
+        return text
+            .split(pattern)
+            .filter(|piece| !piece.is_empty())
+            .map(ToString::to_string)
+            .collect();
+    };
+    if invert {
+        regex
+            .find_iter(text)
+            .map(|matched| matched.as_str().to_string())
+            .collect()
+    } else {
+        regex
+            .split(text)
+            .filter(|piece| !piece.is_empty())
+            .map(ToString::to_string)
+            .collect()
+    }
+}
+
+pub(crate) fn split_by_char_class(
+    text: &str,
+    mut is_boundary_token: impl FnMut(char) -> bool,
+) -> Vec<String> {
+    let mut pieces = Vec::new();
+    let mut buffer = String::new();
+    for ch in text.chars() {
+        if is_boundary_token(ch) {
+            if !buffer.is_empty() {
+                pieces.push(std::mem::take(&mut buffer));
+            }
+            pieces.push(ch.to_string());
+        } else {
+            buffer.push(ch);
+        }
+    }
+    if !buffer.is_empty() {
+        pieces.push(buffer);
+    }
+    pieces
+}
+
+pub(crate) fn split_runs_by_class(
+    text: &str,
+    mut classify: impl FnMut(char) -> bool,
+) -> Vec<String> {
+    let mut pieces = Vec::new();
+    let mut buffer = String::new();
+    let mut active_class = None;
+    for ch in text.chars() {
+        let class = classify(ch);
+        if active_class.is_some_and(|active| active != class) && !buffer.is_empty() {
+            pieces.push(std::mem::take(&mut buffer));
+        }
+        active_class = Some(class);
+        buffer.push(ch);
+    }
+    if !buffer.is_empty() {
+        pieces.push(buffer);
+    }
+    pieces
+}
+
+pub(crate) fn is_tokenizer_punctuation(ch: char) -> bool {
+    let code = ch as u32;
+    (33..=47).contains(&code)
+        || (58..=64).contains(&code)
+        || (91..=96).contains(&code)
+        || (123..=126).contains(&code)
+        || ch.is_ascii_punctuation()
 }
 
 #[derive(Debug, Deserialize)]
@@ -684,6 +1579,8 @@ pub(crate) struct NativeDecoderTokenizerJson {
     pre_tokenizer: Option<serde_json::Value>,
     #[serde(default)]
     post_processor: Option<serde_json::Value>,
+    #[serde(default)]
+    decoder: Option<serde_json::Value>,
     #[serde(default)]
     added_tokens: Vec<NativeDecoderAddedTokenJson>,
 }
@@ -702,6 +1599,10 @@ pub(crate) struct NativeDecoderTokenizerModelJson {
     merges: Vec<NativeDecoderBpeMergeJson>,
     #[serde(default)]
     byte_fallback: bool,
+    #[serde(default)]
+    continuing_subword_prefix: Option<String>,
+    #[serde(default)]
+    max_input_chars_per_word: Option<usize>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -822,6 +1723,9 @@ pub(crate) fn template_piece_from_json(
     value: &serde_json::Value,
     special_tokens: &HashMap<String, Vec<i64>>,
 ) -> Result<NativeDecoderTemplatePiece> {
+    if let Some(piece) = value.as_str() {
+        return template_piece_from_string(piece, special_tokens);
+    }
     if let Some(sequence) = value.get("Sequence") {
         let id = sequence
             .get("id")
@@ -873,22 +1777,83 @@ pub(crate) fn template_piece_from_json(
     })
 }
 
+pub(crate) fn template_piece_from_string(
+    value: &str,
+    special_tokens: &HashMap<String, Vec<i64>>,
+) -> Result<NativeDecoderTemplatePiece> {
+    let piece = value.trim();
+    if piece.starts_with("$A") || piece.starts_with("$0") {
+        return Ok(NativeDecoderTemplatePiece::SequenceA);
+    }
+    if piece.starts_with("$B") || piece.starts_with("$1") {
+        return Ok(NativeDecoderTemplatePiece::SequenceB);
+    }
+    let token = piece
+        .split_once(':')
+        .map_or(piece, |(token, _)| token)
+        .trim()
+        .to_string();
+    let ids = special_tokens.get(&token).cloned().unwrap_or_default();
+    if ids.is_empty() {
+        return Err(RuntimeError::NativeDecoderTokenizerInvalid {
+            reason: format!("TemplateProcessing string piece {value:?} requires special token ids"),
+        });
+    }
+    Ok(NativeDecoderTemplatePiece::SpecialToken { token, ids })
+}
+
+pub(crate) fn post_processor_special_pair(
+    value: &serde_json::Value,
+    field_name: &str,
+) -> Result<NativeDecoderTemplatePiece> {
+    let pair = value
+        .get(field_name)
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| RuntimeError::NativeDecoderTokenizerInvalid {
+            reason: format!("post_processor {field_name} must be [token, id]"),
+        })?;
+    if pair.len() != 2 {
+        return Err(RuntimeError::NativeDecoderTokenizerInvalid {
+            reason: format!("post_processor {field_name} must be [token, id]"),
+        });
+    }
+    let token = pair[0]
+        .as_str()
+        .ok_or_else(|| RuntimeError::NativeDecoderTokenizerInvalid {
+            reason: format!("post_processor {field_name} token must be a string"),
+        })?
+        .to_string();
+    let id = pair[1]
+        .as_i64()
+        .ok_or_else(|| RuntimeError::NativeDecoderTokenizerInvalid {
+            reason: format!("post_processor {field_name} id must be an integer"),
+        })?;
+    Ok(NativeDecoderTemplatePiece::SpecialToken {
+        token,
+        ids: vec![id],
+    })
+}
+
 pub(crate) fn apply_template_pieces(
     pieces: &[NativeDecoderTemplatePiece],
-    first: &[i64],
-    second: &[i64],
-) -> Result<Vec<i64>> {
+    first: &NativeDecoderEncoding,
+    second: &NativeDecoderEncoding,
+) -> Result<NativeDecoderEncoding> {
     if pieces.is_empty() {
-        let mut ids = first.to_vec();
-        ids.extend_from_slice(second);
-        return Ok(ids);
+        let mut output = first.clone();
+        output.extend(second);
+        return Ok(output);
     }
-    let mut output = Vec::new();
+    let mut output = NativeDecoderEncoding::new();
     for piece in pieces {
         match piece {
-            NativeDecoderTemplatePiece::SequenceA => output.extend_from_slice(first),
-            NativeDecoderTemplatePiece::SequenceB => output.extend_from_slice(second),
-            NativeDecoderTemplatePiece::SpecialToken { ids, .. } => output.extend_from_slice(ids),
+            NativeDecoderTemplatePiece::SequenceA => output.extend(first),
+            NativeDecoderTemplatePiece::SequenceB => output.extend(second),
+            NativeDecoderTemplatePiece::SpecialToken { token, ids } => {
+                for token_id in ids {
+                    output.push(*token_id, token.clone(), None, 0, true, None);
+                }
+            }
         }
     }
     Ok(output)
@@ -936,6 +1901,7 @@ pub(crate) fn isolate_special_token_segments(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct NativeDecoderChatTemplate {
     template: String,
+    globals: HashMap<String, serde_json::Value>,
 }
 
 impl NativeDecoderChatTemplate {
@@ -943,14 +1909,23 @@ impl NativeDecoderChatTemplate {
         tokenizer_config: Option<&[u8]>,
         chat_template_asset: Option<&[u8]>,
     ) -> Result<Option<Self>> {
-        let template = if let Some(bytes) = chat_template_asset {
-            Some(chat_template_from_asset(bytes)?)
+        let config = if let Some(bytes) = chat_template_asset {
+            Some(NativeDecoderChatTemplateConfig {
+                template: chat_template_from_asset(bytes)?,
+                globals: tokenizer_config
+                    .map(chat_template_globals_from_tokenizer_config)
+                    .transpose()?
+                    .unwrap_or_default(),
+            })
         } else if let Some(bytes) = tokenizer_config {
             chat_template_from_tokenizer_config(bytes)?
         } else {
             None
         };
-        Ok(template.map(|template| Self { template }))
+        Ok(config.map(|config| Self {
+            template: config.template,
+            globals: config.globals,
+        }))
     }
 
     pub(crate) fn render(
@@ -963,11 +1938,24 @@ impl NativeDecoderChatTemplate {
                 reason: "chat template requires at least one message".to_string(),
             });
         }
-        render_chat_template(&self.template, messages, add_generation_prompt)
+        render_chat_template(
+            &self.template,
+            &self.globals,
+            messages,
+            add_generation_prompt,
+        )
     }
 }
 
-pub(crate) fn chat_template_from_tokenizer_config(bytes: &[u8]) -> Result<Option<String>> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NativeDecoderChatTemplateConfig {
+    template: String,
+    globals: HashMap<String, serde_json::Value>,
+}
+
+pub(crate) fn chat_template_from_tokenizer_config(
+    bytes: &[u8],
+) -> Result<Option<NativeDecoderChatTemplateConfig>> {
     let value: serde_json::Value = serde_json::from_slice(bytes).map_err(|error| {
         RuntimeError::NativeDecoderTokenizerInvalid {
             reason: format!("tokenizer_config.json is not valid JSON: {error}"),
@@ -981,10 +1969,23 @@ pub(crate) fn chat_template_from_tokenizer_config(bytes: &[u8]) -> Result<Option
             reason: "tokenizer_config.json chat_template must be a string".to_string(),
         });
     };
-    Ok(Some(template.to_string()))
+    validate_chat_template_size(template)?;
+    Ok(Some(NativeDecoderChatTemplateConfig {
+        template: template.to_string(),
+        globals: chat_template_globals_from_value(&value),
+    }))
 }
 
 pub(crate) fn chat_template_from_asset(bytes: &[u8]) -> Result<String> {
+    if bytes.len() > MAX_CHAT_TEMPLATE_BYTES {
+        return Err(RuntimeError::NativeDecoderTokenizerInvalid {
+            reason: format!(
+                "chat template asset is too large: {} bytes exceeds {}",
+                bytes.len(),
+                MAX_CHAT_TEMPLATE_BYTES
+            ),
+        });
+    }
     let text = std::str::from_utf8(bytes).map_err(|error| {
         RuntimeError::NativeDecoderTokenizerInvalid {
             reason: format!("chat_template.json is not UTF-8: {error}"),
@@ -992,12 +1993,14 @@ pub(crate) fn chat_template_from_asset(bytes: &[u8]) -> Result<String> {
     })?;
     if let Ok(value) = serde_json::from_str::<serde_json::Value>(text) {
         if let Some(template) = value.as_str() {
+            validate_chat_template_size(template)?;
             return Ok(template.to_string());
         }
         if let Some(template) = value
             .get("chat_template")
             .and_then(serde_json::Value::as_str)
         {
+            validate_chat_template_size(template)?;
             return Ok(template.to_string());
         }
         return Err(RuntimeError::NativeDecoderTokenizerInvalid {
@@ -1005,10 +2008,84 @@ pub(crate) fn chat_template_from_asset(bytes: &[u8]) -> Result<String> {
                 .to_string(),
         });
     }
+    validate_chat_template_size(text)?;
     Ok(text.to_string())
 }
 
 pub(crate) fn render_chat_template(
+    template: &str,
+    globals: &HashMap<String, serde_json::Value>,
+    messages: &[NativeDecoderChatMessage],
+    add_generation_prompt: bool,
+) -> Result<String> {
+    match render_chat_template_jinja(template, globals, messages, add_generation_prompt) {
+        Ok(rendered) => Ok(rendered),
+        Err(jinja_error) => {
+            if let Ok(rendered) =
+                render_chat_template_legacy(template, messages, add_generation_prompt)
+            {
+                return Ok(rendered);
+            }
+            Err(jinja_error)
+        }
+    }
+}
+
+pub(crate) fn render_chat_template_jinja(
+    template: &str,
+    globals: &HashMap<String, serde_json::Value>,
+    messages: &[NativeDecoderChatMessage],
+    add_generation_prompt: bool,
+) -> Result<String> {
+    validate_chat_template_size(template)?;
+    let mut env = Environment::new();
+    env.set_fuel(Some(CHAT_TEMPLATE_FUEL));
+    env.add_function(
+        "raise_exception",
+        |message: String| -> std::result::Result<String, minijinja::Error> {
+            Err(minijinja::Error::new(
+                JinjaErrorKind::InvalidOperation,
+                message,
+            ))
+        },
+    );
+    let messages = messages
+        .iter()
+        .map(|message| json!({ "role": message.role, "content": message.content }))
+        .collect::<Vec<_>>();
+    let mut context = serde_json::Map::new();
+    context.insert("messages".to_string(), serde_json::Value::Array(messages));
+    context.insert(
+        "add_generation_prompt".to_string(),
+        serde_json::Value::Bool(add_generation_prompt),
+    );
+    context.insert("tools".to_string(), serde_json::Value::Array(Vec::new()));
+    context.insert(
+        "documents".to_string(),
+        serde_json::Value::Array(Vec::new()),
+    );
+    for (key, value) in globals {
+        context.insert(key.clone(), value.clone());
+    }
+    let rendered = env
+        .template_from_str(template)
+        .and_then(|template| template.render(JinjaValue::from_serialize(&context)))
+        .map_err(|error| RuntimeError::NativeDecoderTokenizerInvalid {
+            reason: format!("chat template render failed: {error}"),
+        })?;
+    if rendered.len() > MAX_CHAT_RENDERED_BYTES {
+        return Err(RuntimeError::NativeDecoderTokenizerInvalid {
+            reason: format!(
+                "chat template rendered {} bytes, maximum supported is {}",
+                rendered.len(),
+                MAX_CHAT_RENDERED_BYTES
+            ),
+        });
+    }
+    Ok(rendered)
+}
+
+pub(crate) fn render_chat_template_legacy(
     template: &str,
     messages: &[NativeDecoderChatMessage],
     add_generation_prompt: bool,
@@ -1030,6 +2107,50 @@ pub(crate) fn render_chat_template(
         add_generation_prompt,
     )?);
     Ok(rendered)
+}
+
+pub(crate) fn validate_chat_template_size(template: &str) -> Result<()> {
+    if template.len() > MAX_CHAT_TEMPLATE_BYTES {
+        return Err(RuntimeError::NativeDecoderTokenizerInvalid {
+            reason: format!(
+                "chat template is too large: {} bytes exceeds {}",
+                template.len(),
+                MAX_CHAT_TEMPLATE_BYTES
+            ),
+        });
+    }
+    Ok(())
+}
+
+pub(crate) fn chat_template_globals_from_tokenizer_config(
+    bytes: &[u8],
+) -> Result<HashMap<String, serde_json::Value>> {
+    let value: serde_json::Value = serde_json::from_slice(bytes).map_err(|error| {
+        RuntimeError::NativeDecoderTokenizerInvalid {
+            reason: format!("tokenizer_config.json is not valid JSON: {error}"),
+        }
+    })?;
+    Ok(chat_template_globals_from_value(&value))
+}
+
+pub(crate) fn chat_template_globals_from_value(
+    value: &serde_json::Value,
+) -> HashMap<String, serde_json::Value> {
+    let mut globals = HashMap::new();
+    for key in [
+        "bos_token",
+        "eos_token",
+        "unk_token",
+        "sep_token",
+        "pad_token",
+        "cls_token",
+        "mask_token",
+    ] {
+        if let Some(value) = value.get(key) {
+            globals.insert(key.to_string(), value.clone());
+        }
+    }
+    globals
 }
 
 pub(crate) fn split_jinja_for_messages(template: &str) -> Result<Option<(&str, &str, &str)>> {
@@ -1413,9 +2534,65 @@ pub(crate) fn decode_bpe_tokens(tokens: &[String]) -> String {
     text
 }
 
-pub(crate) fn decode_sentencepiece_tokens(tokens: &[String]) -> String {
+pub(crate) fn decode_sentencepiece_tokens(tokens: &[String], replacement: char) -> String {
     let text = tokens.join("");
-    text.replace('▁', " ").trim_start().to_string()
+    text.replace(replacement, " ").trim_start().to_string()
+}
+
+pub(crate) fn decode_wordpiece_tokens(tokens: &[String], prefix: &str, cleanup: bool) -> String {
+    let mut text = String::new();
+    for token in tokens {
+        if let Some(rest) = token.strip_prefix(prefix) {
+            text.push_str(rest);
+        } else {
+            if !text.is_empty() {
+                text.push(' ');
+            }
+            text.push_str(token);
+        }
+    }
+    if cleanup {
+        cleanup_wordpiece_text(&text)
+    } else {
+        text
+    }
+}
+
+pub(crate) fn cleanup_wordpiece_text(text: &str) -> String {
+    text.replace(" .", ".")
+        .replace(" ?", "?")
+        .replace(" !", "!")
+        .replace(" ,", ",")
+        .replace(" ' ", "'")
+        .replace(" n't", "n't")
+        .replace(" 'm", "'m")
+        .replace(" 's", "'s")
+        .replace(" 've", "'ve")
+        .replace(" 're", "'re")
+}
+
+pub(crate) fn char_boundaries_with_end(text: &str) -> Vec<usize> {
+    let mut boundaries = text.char_indices().map(|(idx, _)| idx).collect::<Vec<_>>();
+    if boundaries.first().copied() != Some(0) {
+        boundaries.insert(0, 0);
+    }
+    if boundaries.last().copied() != Some(text.len()) {
+        boundaries.push(text.len());
+    }
+    boundaries
+}
+
+pub(crate) fn validate_tokenizer_token(token: &str) -> Result<()> {
+    if token.chars().count() > MAX_TOKENIZER_TOKEN_CHARS {
+        return Err(RuntimeError::NativeDecoderTokenizerInvalid {
+            reason: format!(
+                "tokenizer token has {} chars, maximum supported is {}",
+                token.chars().count(),
+                MAX_TOKENIZER_TOKEN_CHARS
+            ),
+        });
+    }
+    Ok(())
 }
 
 pub(crate) fn parse_byte_fallback_token(token: &str) -> Option<u8> {

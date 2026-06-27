@@ -57,6 +57,8 @@ toml = "1.1"
 tempfile = "3.27"
 hex = "0.4"
 unicode-normalization = "0.1"
+regex = "1.12"
+minijinja = { version = "2.21", default-features = false, features = ["builtins", "fuel", "json", "serde", "std_collections"] }
 
 # Bench.
 criterion = { version = "0.7", default-features = false, features = ["html_reports"] }

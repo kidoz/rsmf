@@ -178,10 +178,10 @@ fn engine_native_decoder_tokenizer_encodes_and_decodes_wordlevel_text() {
 #[test]
 fn engine_native_decoder_tokenizer_rejects_unsupported_model_type() {
     let err =
-        NativeDecoderTokenizer::from_json(br#"{"model": {"type": "WordPiece"}}"#).unwrap_err();
+        NativeDecoderTokenizer::from_json(br#"{"model": {"type": "SentencePiece"}}"#).unwrap_err();
 
     assert!(
-        matches!(err, RuntimeError::NativeDecoderTokenizerInvalid { reason } if reason.contains("only WordLevel, BPE, and Unigram"))
+        matches!(err, RuntimeError::NativeDecoderTokenizerInvalid { reason } if reason.contains("only WordLevel, BPE, Unigram, and WordPiece"))
     );
 }
 
@@ -326,6 +326,85 @@ fn native_decoder_unigram_tokenizer_uses_unk_for_unmatched_chars() {
 }
 
 #[test]
+fn native_decoder_wordpiece_tokenizer_matches_bert_style_flow() {
+    let tokenizer = NativeDecoderTokenizer::from_json(
+        serde_json::json!({
+            "normalizer": {
+                "type": "BertNormalizer",
+                "lowercase": true,
+                "strip_accents": true,
+                "handle_chinese_chars": true,
+                "clean_text": true
+            },
+            "pre_tokenizer": { "type": "Whitespace" },
+            "model": {
+                "type": "WordPiece",
+                "vocab": {
+                    "[UNK]": 0,
+                    "[CLS]": 1,
+                    "[SEP]": 2,
+                    "hello": 3,
+                    "world": 4,
+                    "!": 5,
+                    "un": 6,
+                    "##aff": 7,
+                    "##able": 8
+                },
+                "unk_token": "[UNK]",
+                "continuing_subword_prefix": "##",
+                "max_input_chars_per_word": 12
+            },
+            "post_processor": {
+                "type": "BertProcessing",
+                "sep": ["[SEP]", 2],
+                "cls": ["[CLS]", 1]
+            },
+            "decoder": {
+                "type": "WordPiece",
+                "prefix": "##",
+                "cleanup": true
+            }
+        })
+        .to_string()
+        .as_bytes(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        tokenizer.encode("Héllo unaffable world!").unwrap(),
+        vec![1, 3, 6, 7, 8, 4, 5, 2]
+    );
+    assert_eq!(
+        tokenizer.encode_pair("hello", "world").unwrap(),
+        vec![1, 3, 2, 4, 2]
+    );
+    assert_eq!(
+        tokenizer.decode(&[3, 6, 7, 8, 4, 5]).unwrap(),
+        "hello unaffable world!"
+    );
+}
+
+#[test]
+fn native_decoder_wordpiece_tokenizer_uses_unk_for_overlong_or_unmatched_words() {
+    let tokenizer = NativeDecoderTokenizer::from_json(
+        serde_json::json!({
+            "model": {
+                "type": "WordPiece",
+                "vocab": { "[UNK]": 0, "ok": 1 },
+                "unk_token": "[UNK]",
+                "max_input_chars_per_word": 2
+            }
+        })
+        .to_string()
+        .as_bytes(),
+    )
+    .unwrap();
+
+    assert_eq!(tokenizer.encode("missing").unwrap(), vec![0]);
+    assert_eq!(tokenizer.encode("toolong").unwrap(), vec![0]);
+}
+
+#[test]
 fn native_decoder_tokenizer_applies_lowercase_normalizer() {
     let tokenizer = NativeDecoderTokenizer::from_json(
         serde_json::json!({
@@ -390,7 +469,7 @@ fn native_decoder_tokenizer_applies_nfc_normalizer() {
 fn native_decoder_tokenizer_rejects_unsupported_normalizer() {
     let err = NativeDecoderTokenizer::from_json(
         serde_json::json!({
-            "normalizer": { "type": "StripAccents" },
+            "normalizer": { "type": "Precompiled" },
             "model": {
                 "type": "BPE",
                 "vocab": { "hello": 0 },
@@ -405,6 +484,85 @@ fn native_decoder_tokenizer_rejects_unsupported_normalizer() {
     assert!(
         matches!(err, RuntimeError::NativeDecoderTokenizerInvalid { reason } if reason.contains("unsupported normalizer"))
     );
+}
+
+#[test]
+fn native_decoder_tokenizer_applies_strip_replace_and_split_components() {
+    let tokenizer = NativeDecoderTokenizer::from_json(
+        serde_json::json!({
+            "normalizer": {
+                "type": "Sequence",
+                "normalizers": [
+                    { "type": "Strip", "strip_left": true, "strip_right": true },
+                    { "type": "Replace", "pattern": { "String": "-" }, "content": " " },
+                    { "type": "Lowercase" }
+                ]
+            },
+            "pre_tokenizer": {
+                "type": "Sequence",
+                "pretokenizers": [
+                    { "type": "WhitespaceSplit" },
+                    { "type": "Punctuation" },
+                    { "type": "Digits", "individual_digits": true }
+                ]
+            },
+            "model": {
+                "type": "WordLevel",
+                "vocab": {
+                    "hello": 0,
+                    "world": 1,
+                    "!": 2,
+                    "2": 3,
+                    "0": 4
+                }
+            }
+        })
+        .to_string()
+        .as_bytes(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        tokenizer.encode("  HELLO-world!20  ").unwrap(),
+        vec![0, 1, 2, 3, 4]
+    );
+}
+
+#[test]
+fn native_decoder_tokenizer_applies_roberta_processing_and_bpe_decoder() {
+    let tokenizer = NativeDecoderTokenizer::from_json(
+        serde_json::json!({
+            "model": {
+                "type": "BPE",
+                "vocab": {
+                    "<s>": 0,
+                    "</s>": 1,
+                    "low</w>": 2,
+                    "er</w>": 3
+                },
+                "merges": []
+            },
+            "pre_tokenizer": { "type": "WhitespaceSplit" },
+            "post_processor": {
+                "type": "RobertaProcessing",
+                "sep": ["</s>", 1],
+                "cls": ["<s>", 0]
+            },
+            "decoder": {
+                "type": "BPEDecoder",
+                "suffix": "</w>"
+            }
+        })
+        .to_string()
+        .as_bytes(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        tokenizer.encode_pair("low</w>", "er</w>").unwrap(),
+        vec![0, 2, 1, 1, 3, 1]
+    );
+    assert_eq!(tokenizer.decode(&[2, 3]).unwrap(), "low er");
 }
 
 #[test]
@@ -566,6 +724,53 @@ fn native_decoder_tokenizer_renders_chat_template_role_conditionals() {
         tokenizer.encode_chat(&messages, false).unwrap(),
         vec![0, 1, 2, 3]
     );
+}
+
+#[test]
+fn native_decoder_tokenizer_renders_nested_minijinja_chat_template() {
+    let template = concat!(
+        "{{ bos_token }}",
+        "{% for message in messages %}",
+        "{% if message.role == 'user' %}",
+        "{{ '<|user|>' + message.content|trim }}",
+        "{% elif message.role == 'assistant' %}",
+        "{{ '<|assistant|>' + message.content }}",
+        "{% endif %}",
+        "{% endfor %}",
+        "{% for tool in tools %}{{ tool.name }}{% endfor %}",
+        "{% if add_generation_prompt %}{{ '<|assistant|>' }}{% endif %}"
+    );
+    let tokenizer_config = serde_json::json!({
+        "bos_token": "<s>",
+        "chat_template": template
+    })
+    .to_string();
+    let tokenizer = NativeDecoderTokenizer::from_json_with_assets(
+        serde_json::json!({
+            "model": {
+                "type": "WordLevel",
+                "vocab": {
+                    "<s><|user|>hello<|assistant|>hi<|assistant|>": 0
+                }
+            }
+        })
+        .to_string()
+        .as_bytes(),
+        Some(tokenizer_config.as_bytes()),
+        None,
+    )
+    .unwrap();
+
+    let messages = vec![
+        NativeDecoderChatMessage::new("user", " hello "),
+        NativeDecoderChatMessage::new("assistant", "hi"),
+    ];
+
+    assert_eq!(
+        tokenizer.apply_chat_template(&messages, true).unwrap(),
+        "<s><|user|>hello<|assistant|>hi<|assistant|>"
+    );
+    assert_eq!(tokenizer.encode_chat(&messages, true).unwrap(), vec![0]);
 }
 
 #[test]
