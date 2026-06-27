@@ -76,10 +76,13 @@ rsmf-core  (library)           ← format, reader, writer, validator, selection
   generation length, stop-token overrides, and optional prompt logits.
   `Engine::native_decoder_tokenizer()` and `Engine::native_decoder_generate_text()`
   add text-level native decoding for `WordLevel` and limited BPE tokenizer
-  assets. The BPE path supports vocab/merges, simple whitespace or ByteLevel
-  pre-tokenization, added special-token ids, and explicit unsupported
-  normalizer/post-processor errors. The first performance slices add real paged
-  KV-cache attention reads, chunked prefill scheduling, threaded final
+  assets. The tokenizer path supports vocab/merges, simple whitespace or
+  ByteLevel pre-tokenization, added special-token ids, adjacent special-token
+  matching, byte fallback through `<0xXX>` vocab entries, NFC/NFD/NFKC/NFKD
+  normalizers, `TemplateProcessing` single/pair post-processors, and a small
+  ChatML-style chat-template renderer for `tokenizer_config.json` /
+  `chat_template.json` assets. Unsupported tokenizer constructs fail with typed
+  errors. The first performance slices add real paged KV-cache attention reads, chunked prefill scheduling, threaded final
   projection, optional Apple Accelerate f32 linear projections, and Criterion
   benches without adding GPU dependencies. Metal/WGPU and CoreML native decoder
   backend selectors currently return typed unavailable errors.
