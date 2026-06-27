@@ -7,6 +7,8 @@
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
 use std::fmt::{self, Debug};
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering as AtomicOrdering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
@@ -21,6 +23,7 @@ use ort::value::{DynValue, Outlet, Tensor, TensorElementType};
 use rsmf_core::manifest::GraphKind;
 use rsmf_core::tensor::variant::{EncodingKind, LayoutTag};
 use rsmf_core::{LogicalDtype, RsmfError, RsmfFile, StorageDtype, TensorView};
+use serde::{Deserialize, Serialize};
 
 #[cfg(feature = "tracing")]
 use tracing::info_span;
@@ -119,6 +122,32 @@ pub enum RuntimeError {
         /// Caller-provided request identifier.
         request_id: String,
     },
+    /// A network serving operation failed.
+    #[error("runtime network I/O error during {operation}: {message}")]
+    NetworkIo {
+        /// Operation that failed.
+        operation: &'static str,
+        /// Original I/O error text.
+        message: String,
+    },
+    /// A network request was malformed or unsupported.
+    #[error("invalid runtime network request: {reason}")]
+    NetworkProtocol {
+        /// Human-readable protocol error.
+        reason: String,
+    },
+    /// A network request id is already active.
+    #[error("runtime network request {request_id} is already active")]
+    NetworkRequestAlreadyActive {
+        /// Caller-provided request identifier.
+        request_id: String,
+    },
+    /// A network request id is not currently active.
+    #[error("runtime network request {request_id} is not active")]
+    NetworkRequestNotFound {
+        /// Caller-provided request identifier.
+        request_id: String,
+    },
 }
 
 /// Dynamic batching policy for [`RuntimeExecutor`].
@@ -149,7 +178,8 @@ pub struct RuntimeAdmissionConfig {
 }
 
 /// ONNX Runtime graph optimization level.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum GraphOptimizationLevel {
     /// Disable all graph optimizations.
     Disable,
@@ -177,7 +207,7 @@ impl From<GraphOptimizationLevel> for OrtGraphOptimizationLevel {
 }
 
 /// Execution provider selection for R1.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ExecutionProvider {
     /// Portable CPU execution provider. This is always available in ORT.
     Cpu {
@@ -198,7 +228,7 @@ impl Default for ExecutionProvider {
 /// session build time. This keeps graph payloads from needing embedded weight
 /// bytes. The initial CPU implementation materializes the RSMF tensor into an
 /// ORT-owned value; true mmap/device zero-copy remains a later residency step.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct InitializerBinding {
     /// Name of the initializer as referenced by the ONNX / ORT graph.
     pub initializer_name: String,
@@ -231,7 +261,7 @@ impl InitializerBinding {
 }
 
 /// Options used to create and cache an ONNX Runtime session.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SessionOptions {
     /// Graph optimization level.
     pub graph_optimization: GraphOptimizationLevel,
@@ -302,7 +332,8 @@ impl ValueInfo {
 }
 
 /// Owned tensor value accepted by and returned from `rsmf-runtime`.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "dtype", rename_all = "snake_case")]
 pub enum RuntimeTensor {
     /// F32 tensor.
     F32 { shape: Vec<usize>, data: Vec<f32> },
@@ -1305,6 +1336,614 @@ impl Drop for RuntimeExecutor {
         for worker in self.workers.drain(..) {
             let _ = worker.join();
         }
+    }
+}
+
+/// Configuration for the dependency-light HTTP/1.1 network serving API.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeNetworkServerConfig {
+    /// Address to bind. Use port `0` to request an OS-assigned port.
+    pub bind_addr: SocketAddr,
+    /// Maximum accepted request body size in bytes.
+    pub max_body_bytes: usize,
+}
+
+impl Default for RuntimeNetworkServerConfig {
+    fn default() -> Self {
+        Self {
+            bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            max_body_bytes: 16 * 1024 * 1024,
+        }
+    }
+}
+
+/// JSON request accepted by `POST /v1/run`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RuntimeNetworkRunRequest {
+    /// Caller-provided request identifier.
+    pub request_id: String,
+    /// Graph payload index.
+    pub graph_idx: usize,
+    /// Optional full session options. Defaults to [`SessionOptions::default`]
+    /// when omitted.
+    pub options: Option<SessionOptions>,
+    /// Owned runtime inputs.
+    pub inputs: RuntimeInputs,
+    /// Optional request priority. Higher values run first.
+    pub priority: Option<i32>,
+    /// Optional timeout in milliseconds.
+    pub timeout_ms: Option<u64>,
+}
+
+impl RuntimeNetworkRunRequest {
+    fn into_runtime_request(self) -> RuntimeRequest {
+        let mut request = RuntimeRequest::new(self.request_id, self.graph_idx, self.inputs)
+            .with_options(self.options.unwrap_or_default());
+        if let Some(priority) = self.priority {
+            request = request.with_priority(priority);
+        }
+        if let Some(timeout_ms) = self.timeout_ms {
+            request = request.with_timeout(Duration::from_millis(timeout_ms));
+        }
+        request
+    }
+}
+
+/// Duration-only timings returned by the network serving API.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeNetworkTimings {
+    /// Time spent waiting in the executor queue, in milliseconds.
+    pub queue_time_ms: u128,
+    /// Time spent inside graph runtime execution, in milliseconds.
+    pub run_time_ms: u128,
+}
+
+impl RuntimeNetworkTimings {
+    fn from_timings(timings: &RuntimeRequestTimings) -> Self {
+        Self {
+            queue_time_ms: timings.queue_time.as_millis(),
+            run_time_ms: timings.run_time.as_millis(),
+        }
+    }
+}
+
+/// JSON response returned by `POST /v1/run`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RuntimeNetworkRunResponse {
+    /// Caller-provided request identifier.
+    pub request_id: String,
+    /// Owned graph outputs.
+    pub outputs: RuntimeOutputs,
+    /// Duration-only request timing metadata.
+    pub timings: RuntimeNetworkTimings,
+}
+
+impl RuntimeNetworkRunResponse {
+    fn from_response(response: RuntimeResponse) -> Self {
+        Self {
+            request_id: response.request_id,
+            outputs: response.outputs,
+            timings: RuntimeNetworkTimings::from_timings(&response.timings),
+        }
+    }
+}
+
+/// JSON metrics snapshot returned by `GET /metrics`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeNetworkMetrics {
+    /// Requests accepted into the queue.
+    pub submitted: u64,
+    /// Requests completed successfully.
+    pub completed: u64,
+    /// Requests completed with an error.
+    pub failed: u64,
+    /// Requests rejected because their deadline expired before dispatch.
+    pub deadline_expired: u64,
+    /// Requests cancelled before dispatch.
+    pub cancelled: u64,
+    /// Requests rejected because the request queue was full.
+    pub rejected_by_capacity: u64,
+    /// Requests rejected because queued tensor bytes would exceed the configured
+    /// budget.
+    pub rejected_by_memory: u64,
+    /// Requests currently waiting in the queue.
+    pub current_queue_depth: usize,
+    /// Maximum queue depth observed by this executor.
+    pub max_observed_queue_depth: usize,
+    /// Owned input tensor bytes currently waiting in the queue.
+    pub current_queued_tensor_bytes: usize,
+    /// Maximum queued owned input tensor bytes observed by this executor.
+    pub max_observed_queued_tensor_bytes: usize,
+    /// Requests currently executing inside graph runtime calls.
+    pub active_requests: usize,
+    /// Maximum concurrently active runtime requests observed by this executor.
+    pub max_active_requests: usize,
+    /// Runtime invocations currently executing.
+    pub active_runtime_invocations: usize,
+    /// Maximum concurrent runtime invocations observed by this executor.
+    pub max_active_runtime_invocations: usize,
+    /// Total batch slots currently executing across active runtime invocations.
+    pub active_batch_size: usize,
+    /// Largest total active batch size observed by this executor.
+    pub max_active_batch_size: usize,
+    /// Runtime invocations issued to the graph engine.
+    pub runtime_invocations: u64,
+    /// Runtime invocations that carried more than one request.
+    pub batches_executed: u64,
+    /// Requests completed through a runtime invocation carrying more than one
+    /// request.
+    pub batched_requests: u64,
+    /// Attempted batches that fell back to individual request execution.
+    pub batch_fallbacks: u64,
+    /// Dynamic scheduler flushes because a batch reached configured capacity.
+    pub batch_flushes_full: u64,
+    /// Dynamic scheduler flushes because the max queue delay elapsed.
+    pub batch_flushes_delay: u64,
+    /// Dynamic scheduler flushes because queued input bytes reached the
+    /// configured admission pressure point.
+    pub batch_flushes_memory_pressure: u64,
+    /// Dynamic scheduler flushes triggered by manual dispatch.
+    pub batch_flushes_manual: u64,
+    /// Dynamic scheduler flushes triggered while closing the executor.
+    pub batch_flushes_shutdown: u64,
+    /// Cumulative queue time, in milliseconds.
+    pub total_queue_time_ms: u128,
+    /// Cumulative run time, in milliseconds.
+    pub total_run_time_ms: u128,
+}
+
+impl From<RuntimeExecutorMetrics> for RuntimeNetworkMetrics {
+    fn from(metrics: RuntimeExecutorMetrics) -> Self {
+        Self {
+            submitted: metrics.submitted,
+            completed: metrics.completed,
+            failed: metrics.failed,
+            deadline_expired: metrics.deadline_expired,
+            cancelled: metrics.cancelled,
+            rejected_by_capacity: metrics.rejected_by_capacity,
+            rejected_by_memory: metrics.rejected_by_memory,
+            current_queue_depth: metrics.current_queue_depth,
+            max_observed_queue_depth: metrics.max_observed_queue_depth,
+            current_queued_tensor_bytes: metrics.current_queued_tensor_bytes,
+            max_observed_queued_tensor_bytes: metrics.max_observed_queued_tensor_bytes,
+            active_requests: metrics.active_requests,
+            max_active_requests: metrics.max_active_requests,
+            active_runtime_invocations: metrics.active_runtime_invocations,
+            max_active_runtime_invocations: metrics.max_active_runtime_invocations,
+            active_batch_size: metrics.active_batch_size,
+            max_active_batch_size: metrics.max_active_batch_size,
+            runtime_invocations: metrics.runtime_invocations,
+            batches_executed: metrics.batches_executed,
+            batched_requests: metrics.batched_requests,
+            batch_fallbacks: metrics.batch_fallbacks,
+            batch_flushes_full: metrics.batch_flushes_full,
+            batch_flushes_delay: metrics.batch_flushes_delay,
+            batch_flushes_memory_pressure: metrics.batch_flushes_memory_pressure,
+            batch_flushes_manual: metrics.batch_flushes_manual,
+            batch_flushes_shutdown: metrics.batch_flushes_shutdown,
+            total_queue_time_ms: metrics.total_queue_time.as_millis(),
+            total_run_time_ms: metrics.total_run_time.as_millis(),
+        }
+    }
+}
+
+/// Handle for a background network serving loop.
+#[derive(Debug)]
+pub struct RuntimeNetworkServerHandle {
+    local_addr: SocketAddr,
+    shutdown: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl RuntimeNetworkServerHandle {
+    /// Address the server is bound to.
+    #[must_use]
+    pub fn local_addr(&self) -> SocketAddr {
+        self.local_addr
+    }
+
+    /// Ask the serving loop to stop and wait for its listener thread.
+    pub fn shutdown(mut self) -> Result<()> {
+        self.shutdown.store(true, AtomicOrdering::Release);
+        let _ = TcpStream::connect(self.local_addr);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+        Ok(())
+    }
+}
+
+impl Drop for RuntimeNetworkServerHandle {
+    fn drop(&mut self) {
+        self.shutdown.store(true, AtomicOrdering::Release);
+        let _ = TcpStream::connect(self.local_addr);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// Dependency-light HTTP/1.1 JSON server for [`RuntimeExecutor`].
+pub struct RuntimeNetworkServer {
+    executor: Arc<RuntimeExecutor>,
+    config: RuntimeNetworkServerConfig,
+}
+
+impl RuntimeNetworkServer {
+    /// Create a network server wrapper around an executor.
+    #[must_use]
+    pub fn new(executor: RuntimeExecutor, config: RuntimeNetworkServerConfig) -> Self {
+        Self::from_shared(Arc::new(executor), config)
+    }
+
+    /// Create a network server wrapper around a shared executor.
+    #[must_use]
+    pub fn from_shared(executor: Arc<RuntimeExecutor>, config: RuntimeNetworkServerConfig) -> Self {
+        Self { executor, config }
+    }
+
+    /// Bind and start the background serving loop.
+    pub fn start(self) -> Result<RuntimeNetworkServerHandle> {
+        let listener = TcpListener::bind(self.config.bind_addr)
+            .map_err(|e| network_io_error("bind network server", e))?;
+        listener
+            .set_nonblocking(true)
+            .map_err(|e| network_io_error("configure network listener", e))?;
+        let local_addr = listener
+            .local_addr()
+            .map_err(|e| network_io_error("read network listener address", e))?;
+        let state = Arc::new(RuntimeNetworkServerState::default());
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let thread_shutdown = Arc::clone(&shutdown);
+        let executor = Arc::clone(&self.executor);
+        let max_body_bytes = self.config.max_body_bytes;
+        let thread = std::thread::spawn(move || {
+            network_accept_loop(listener, executor, state, thread_shutdown, max_body_bytes);
+        });
+        Ok(RuntimeNetworkServerHandle {
+            local_addr,
+            shutdown,
+            thread: Some(thread),
+        })
+    }
+}
+
+#[derive(Default)]
+struct RuntimeNetworkServerState {
+    inflight: Mutex<HashMap<String, Option<RuntimeCancellationToken>>>,
+}
+
+impl RuntimeNetworkServerState {
+    fn reserve(&self, request_id: &str) -> Result<()> {
+        let mut inflight = self
+            .inflight
+            .lock()
+            .map_err(|_| RuntimeError::ExecutorPoisoned)?;
+        if inflight.contains_key(request_id) {
+            return Err(RuntimeError::NetworkRequestAlreadyActive {
+                request_id: request_id.to_string(),
+            });
+        }
+        inflight.insert(request_id.to_string(), None);
+        Ok(())
+    }
+
+    fn attach(&self, request_id: &str, cancellation: RuntimeCancellationToken) -> Result<()> {
+        let mut inflight = self
+            .inflight
+            .lock()
+            .map_err(|_| RuntimeError::ExecutorPoisoned)?;
+        inflight.insert(request_id.to_string(), Some(cancellation));
+        Ok(())
+    }
+
+    fn remove(&self, request_id: &str) {
+        if let Ok(mut inflight) = self.inflight.lock() {
+            inflight.remove(request_id);
+        }
+    }
+
+    fn cancellation(&self, request_id: &str) -> Result<Option<RuntimeCancellationToken>> {
+        let inflight = self
+            .inflight
+            .lock()
+            .map_err(|_| RuntimeError::ExecutorPoisoned)?;
+        inflight
+            .get(request_id)
+            .cloned()
+            .ok_or_else(|| RuntimeError::NetworkRequestNotFound {
+                request_id: request_id.to_string(),
+            })
+    }
+}
+
+#[derive(Debug)]
+struct RuntimeHttpRequest {
+    method: String,
+    path: String,
+    body: Vec<u8>,
+}
+
+fn network_accept_loop(
+    listener: TcpListener,
+    executor: Arc<RuntimeExecutor>,
+    state: Arc<RuntimeNetworkServerState>,
+    shutdown: Arc<AtomicBool>,
+    max_body_bytes: usize,
+) {
+    while !shutdown.load(AtomicOrdering::Acquire) {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                let executor = Arc::clone(&executor);
+                let state = Arc::clone(&state);
+                std::thread::spawn(move || {
+                    handle_network_connection(stream, executor, state, max_body_bytes);
+                });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(_) => break,
+        }
+    }
+}
+
+fn handle_network_connection(
+    mut stream: TcpStream,
+    executor: Arc<RuntimeExecutor>,
+    state: Arc<RuntimeNetworkServerState>,
+    max_body_bytes: usize,
+) {
+    let response = read_http_request(&mut stream, max_body_bytes)
+        .and_then(|request| route_network_request(request, &executor, &state));
+    match response {
+        Ok(body) => {
+            let _ = write_json_response(&mut stream, 200, "OK", &body);
+        }
+        Err(error) => {
+            let (status, reason, code) = network_error_status(&error);
+            let body = serde_json::json!({
+                "error": {
+                    "code": code,
+                    "message": error.to_string()
+                }
+            });
+            let _ = write_json_response(&mut stream, status, reason, &body);
+        }
+    }
+}
+
+fn route_network_request(
+    request: RuntimeHttpRequest,
+    executor: &RuntimeExecutor,
+    state: &RuntimeNetworkServerState,
+) -> Result<serde_json::Value> {
+    match (request.method.as_str(), request.path.as_str()) {
+        ("GET", "/health") => Ok(serde_json::json!({ "status": "ok" })),
+        ("GET", "/metrics") => {
+            let metrics = RuntimeNetworkMetrics::from(executor.metrics()?);
+            serde_json::to_value(metrics).map_err(network_json_error)
+        }
+        ("POST", "/v1/run") => handle_network_run(request.body, executor, state),
+        _ if request.method == "GET" && request.path.starts_with("/v1/requests/") => {
+            let request_id = network_request_id_from_path(&request.path)?;
+            let cancellation = state.cancellation(request_id)?;
+            let status = if let Some(cancellation) = cancellation {
+                if cancellation.is_cancellation_requested() {
+                    "cancellation_requested"
+                } else {
+                    "inflight"
+                }
+            } else {
+                "submitting"
+            };
+            Ok(serde_json::json!({
+                "request_id": request_id,
+                "status": status
+            }))
+        }
+        _ if request.method == "DELETE" && request.path.starts_with("/v1/requests/") => {
+            let request_id = network_request_id_from_path(&request.path)?;
+            let cancellation = state.cancellation(request_id)?;
+            let Some(cancellation) = cancellation else {
+                return Ok(serde_json::json!({
+                    "request_id": request_id,
+                    "cancellation": "submitting"
+                }));
+            };
+            Ok(serde_json::json!({
+                "request_id": request_id,
+                "cancellation": format!("{:?}", cancellation.cancel())
+            }))
+        }
+        _ => Err(RuntimeError::NetworkProtocol {
+            reason: format!("unsupported route {} {}", request.method, request.path),
+        }),
+    }
+}
+
+fn handle_network_run(
+    body: Vec<u8>,
+    executor: &RuntimeExecutor,
+    state: &RuntimeNetworkServerState,
+) -> Result<serde_json::Value> {
+    let request: RuntimeNetworkRunRequest =
+        serde_json::from_slice(&body).map_err(network_json_error)?;
+    let request_id = request.request_id.clone();
+    state.reserve(&request_id)?;
+    let runtime_request = request.into_runtime_request();
+    let handle = match executor.submit(runtime_request) {
+        Ok(handle) => handle,
+        Err(error) => {
+            state.remove(&request_id);
+            return Err(error);
+        }
+    };
+    state.attach(&request_id, handle.cancellation_token())?;
+    let response = handle.wait();
+    state.remove(&request_id);
+    response
+        .map(RuntimeNetworkRunResponse::from_response)
+        .and_then(|response| serde_json::to_value(response).map_err(network_json_error))
+}
+
+fn network_request_id_from_path(path: &str) -> Result<&str> {
+    let request_id =
+        path.strip_prefix("/v1/requests/")
+            .ok_or_else(|| RuntimeError::NetworkProtocol {
+                reason: format!("invalid request path {path}"),
+            })?;
+    if request_id.is_empty() || request_id.contains('/') {
+        return Err(RuntimeError::NetworkProtocol {
+            reason: format!("invalid request id path {path}"),
+        });
+    }
+    Ok(request_id)
+}
+
+fn read_http_request(stream: &mut TcpStream, max_body_bytes: usize) -> Result<RuntimeHttpRequest> {
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .map_err(|e| network_io_error("configure connection read timeout", e))?;
+    let mut buffer = Vec::new();
+    let header_end = loop {
+        if let Some(header_end) = find_header_end(&buffer) {
+            break header_end;
+        }
+        if buffer.len() > 16 * 1024 {
+            return Err(RuntimeError::NetworkProtocol {
+                reason: "HTTP request headers exceed 16 KiB".to_string(),
+            });
+        }
+        let mut chunk = [0u8; 1024];
+        let read = stream
+            .read(&mut chunk)
+            .map_err(|e| network_io_error("read network request", e))?;
+        if read == 0 {
+            return Err(RuntimeError::NetworkProtocol {
+                reason: "connection closed before HTTP headers completed".to_string(),
+            });
+        }
+        buffer.extend_from_slice(&chunk[..read]);
+    };
+
+    let header_bytes = &buffer[..header_end];
+    let headers =
+        std::str::from_utf8(header_bytes).map_err(|error| RuntimeError::NetworkProtocol {
+            reason: format!("HTTP headers are not UTF-8: {error}"),
+        })?;
+    let mut lines = headers.split("\r\n");
+    let request_line = lines.next().ok_or_else(|| RuntimeError::NetworkProtocol {
+        reason: "missing HTTP request line".to_string(),
+    })?;
+    let mut request_parts = request_line.split_whitespace();
+    let method = request_parts
+        .next()
+        .ok_or_else(|| RuntimeError::NetworkProtocol {
+            reason: "missing HTTP method".to_string(),
+        })?
+        .to_string();
+    let path = request_parts
+        .next()
+        .ok_or_else(|| RuntimeError::NetworkProtocol {
+            reason: "missing HTTP path".to_string(),
+        })?
+        .to_string();
+    let _version = request_parts
+        .next()
+        .ok_or_else(|| RuntimeError::NetworkProtocol {
+            reason: "missing HTTP version".to_string(),
+        })?;
+
+    let mut content_length = 0usize;
+    for line in lines {
+        if let Some((name, value)) = line.split_once(':')
+            && name.trim().eq_ignore_ascii_case("content-length")
+        {
+            content_length =
+                value
+                    .trim()
+                    .parse::<usize>()
+                    .map_err(|error| RuntimeError::NetworkProtocol {
+                        reason: format!("invalid content-length: {error}"),
+                    })?;
+        }
+    }
+    if content_length > max_body_bytes {
+        return Err(RuntimeError::NetworkProtocol {
+            reason: format!("request body is {content_length} bytes, limit is {max_body_bytes}"),
+        });
+    }
+
+    let body_start = header_end + 4;
+    while buffer.len() < body_start + content_length {
+        let mut chunk = [0u8; 8192];
+        let read = stream
+            .read(&mut chunk)
+            .map_err(|e| network_io_error("read network request body", e))?;
+        if read == 0 {
+            return Err(RuntimeError::NetworkProtocol {
+                reason: "connection closed before HTTP body completed".to_string(),
+            });
+        }
+        buffer.extend_from_slice(&chunk[..read]);
+    }
+
+    Ok(RuntimeHttpRequest {
+        method,
+        path,
+        body: buffer[body_start..body_start + content_length].to_vec(),
+    })
+}
+
+fn find_header_end(buffer: &[u8]) -> Option<usize> {
+    buffer.windows(4).position(|window| window == b"\r\n\r\n")
+}
+
+fn write_json_response(
+    stream: &mut TcpStream,
+    status: u16,
+    reason: &str,
+    body: &serde_json::Value,
+) -> Result<()> {
+    let body = serde_json::to_vec(body).map_err(network_json_error)?;
+    let header = format!(
+        "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+        body.len()
+    );
+    stream
+        .write_all(header.as_bytes())
+        .and_then(|()| stream.write_all(&body))
+        .map_err(|e| network_io_error("write network response", e))
+}
+
+fn network_error_status(error: &RuntimeError) -> (u16, &'static str, &'static str) {
+    match error {
+        RuntimeError::NetworkRequestNotFound { .. } => (404, "Not Found", "not_found"),
+        RuntimeError::NetworkRequestAlreadyActive { .. } => (409, "Conflict", "conflict"),
+        RuntimeError::ExecutorQueueFull { .. }
+        | RuntimeError::ExecutorQueueBytesExceeded { .. } => {
+            (429, "Too Many Requests", "admission_rejected")
+        }
+        RuntimeError::NetworkProtocol { .. } => (400, "Bad Request", "bad_request"),
+        RuntimeError::RequestDeadlineExceeded { .. } => {
+            (408, "Request Timeout", "deadline_expired")
+        }
+        RuntimeError::RequestCancelled { .. } => (499, "Client Closed Request", "cancelled"),
+        _ => (500, "Internal Server Error", "runtime_error"),
+    }
+}
+
+fn network_io_error(operation: &'static str, error: std::io::Error) -> RuntimeError {
+    RuntimeError::NetworkIo {
+        operation,
+        message: error.to_string(),
+    }
+}
+
+fn network_json_error(error: serde_json::Error) -> RuntimeError {
+    RuntimeError::NetworkProtocol {
+        reason: error.to_string(),
     }
 }
 
@@ -3833,6 +4472,154 @@ mod tests {
         assert_eq!(metrics.batch_flushes_memory_pressure, 1);
         assert_eq!(metrics.batch_flushes_manual, 0);
         assert_eq!(metrics.batch_flushes_shutdown, 0);
+    }
+
+    #[test]
+    fn network_server_reports_health_and_metrics() {
+        let dir = tempdir().unwrap();
+        let engine = add_graph_engine(dir.path().join("network-health.rsmf"));
+        let server = start_test_network_server(engine, RuntimeExecutorConfig::default());
+
+        let (status, body) = http_json(server.local_addr(), "GET", "/health", None);
+        assert_eq!(status, 200);
+        assert_eq!(body["status"], "ok");
+
+        let (status, body) = http_json(server.local_addr(), "GET", "/metrics", None);
+        assert_eq!(status, 200);
+        assert_eq!(body["submitted"], 0);
+        assert_eq!(body["runtime_invocations"], 0);
+
+        server.shutdown().unwrap();
+    }
+
+    #[test]
+    fn network_server_runs_json_inference_request() {
+        let dir = tempdir().unwrap();
+        let engine = add_graph_engine(dir.path().join("network-run.rsmf"));
+        let server = start_test_network_server(engine, RuntimeExecutorConfig::default());
+        let request = serde_json::json!({
+            "request_id": "net-run",
+            "graph_idx": 0,
+            "inputs": {
+                "x": { "dtype": "f32", "shape": [2], "data": [1.0, 2.0] },
+                "y": { "dtype": "f32", "shape": [2], "data": [10.0, 20.0] }
+            }
+        });
+
+        let (status, body) = http_json(server.local_addr(), "POST", "/v1/run", Some(&request));
+        assert_eq!(status, 200);
+        assert_eq!(body["request_id"], "net-run");
+        assert_eq!(body["outputs"]["z"]["dtype"], "f32");
+        assert_eq!(body["outputs"]["z"]["shape"], serde_json::json!([2]));
+        assert_eq!(
+            body["outputs"]["z"]["data"],
+            serde_json::json!([11.0, 22.0])
+        );
+
+        let (status, metrics) = http_json(server.local_addr(), "GET", "/metrics", None);
+        assert_eq!(status, 200);
+        assert_eq!(metrics["submitted"], 1);
+        assert_eq!(metrics["completed"], 1);
+        assert_eq!(metrics["runtime_invocations"], 1);
+
+        server.shutdown().unwrap();
+    }
+
+    #[test]
+    fn network_server_cancels_inflight_request() {
+        let dir = tempdir().unwrap();
+        let engine = dynamic_add_graph_engine(dir.path().join("network-cancel.rsmf"));
+        let server = start_test_network_server(
+            engine,
+            RuntimeExecutorConfig {
+                worker_threads: 1,
+                queue_capacity: 8,
+                dynamic_batching: Some(DynamicBatchingConfig {
+                    max_batch_size: 4,
+                    max_queue_delay: Duration::from_millis(100),
+                }),
+                admission: RuntimeAdmissionConfig::default(),
+            },
+        );
+        let addr = server.local_addr();
+        let request = serde_json::json!({
+            "request_id": "net-cancel",
+            "graph_idx": 0,
+            "inputs": {
+                "x": { "dtype": "f32", "shape": [1, 2], "data": [1.0, 2.0] },
+                "y": { "dtype": "f32", "shape": [1, 2], "data": [10.0, 20.0] }
+            }
+        });
+        let request_thread =
+            std::thread::spawn(move || http_json(addr, "POST", "/v1/run", Some(&request)));
+        std::thread::sleep(Duration::from_millis(20));
+
+        let (status, body) = http_json(server.local_addr(), "GET", "/v1/requests/net-cancel", None);
+        assert_eq!(status, 200);
+        assert_eq!(body["status"], "inflight");
+
+        let (status, body) = http_json(
+            server.local_addr(),
+            "DELETE",
+            "/v1/requests/net-cancel",
+            None,
+        );
+        assert_eq!(status, 200);
+        assert_eq!(body["cancellation"], "Cancelled");
+
+        let (status, body) = request_thread.join().unwrap();
+        assert_eq!(status, 499);
+        assert_eq!(body["error"]["code"], "cancelled");
+
+        let (status, metrics) = http_json(server.local_addr(), "GET", "/metrics", None);
+        assert_eq!(status, 200);
+        assert_eq!(metrics["cancelled"], 1);
+
+        server.shutdown().unwrap();
+    }
+
+    fn start_test_network_server(
+        engine: Engine,
+        executor_config: RuntimeExecutorConfig,
+    ) -> RuntimeNetworkServerHandle {
+        RuntimeNetworkServer::new(
+            RuntimeExecutor::new(engine, executor_config),
+            RuntimeNetworkServerConfig::default(),
+        )
+        .start()
+        .unwrap()
+    }
+
+    fn http_json(
+        addr: SocketAddr,
+        method: &str,
+        path: &str,
+        body: Option<&serde_json::Value>,
+    ) -> (u16, serde_json::Value) {
+        let body = body
+            .map(serde_json::to_string)
+            .transpose()
+            .unwrap()
+            .unwrap_or_default();
+        let request = format!(
+            "{method} {path} HTTP/1.1\r\nhost: {addr}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let mut stream = TcpStream::connect(addr).unwrap();
+        stream.write_all(request.as_bytes()).unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        let (headers, body) = response.split_once("\r\n\r\n").unwrap();
+        let status = headers
+            .lines()
+            .next()
+            .unwrap()
+            .split_whitespace()
+            .nth(1)
+            .unwrap()
+            .parse::<u16>()
+            .unwrap();
+        (status, serde_json::from_str(body).unwrap())
     }
 
     fn tiny_add_onnx_model() -> Vec<u8> {
