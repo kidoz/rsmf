@@ -3,8 +3,11 @@ use super::onnx::{add_graph_engine, dynamic_add_graph_engine};
 use super::{f32_output, f32_output_shape};
 
 use std::collections::HashMap;
-use std::time::Duration;
+use std::sync::Arc;
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
+use ort::session::RunOptions;
 use tempfile::tempdir;
 
 #[test]

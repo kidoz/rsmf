@@ -3,6 +3,7 @@ use super::onnx::{add_graph_engine, dynamic_add_graph_engine};
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
+use std::time::Duration;
 
 use tempfile::tempdir;
 

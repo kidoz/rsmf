@@ -1,5 +1,10 @@
 use super::super::*;
 
+use std::collections::HashMap;
+
+use ndarray::ArrayD;
+use rsmf_core::RsmfFile;
+use rsmf_core::tensor::variant::EncodingKind;
 use rsmf_core::writer::{RsmfWriter, TensorInput, VariantInput};
 use rsmf_core::{GraphInput, LayoutTag, LogicalDtype, StorageDtype, TargetTag, VariantMeta};
 use tempfile::tempdir;

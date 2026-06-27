@@ -3,6 +3,7 @@ use super::super::*;
 use super::assert_close_slice;
 
 use rsmf_core::LogicalDtype;
+use rsmf_core::RsmfFile;
 use rsmf_core::writer::{AssetInput, RsmfWriter, TensorInput, VariantInput};
 use serde::Deserialize;
 use tempfile::tempdir;
