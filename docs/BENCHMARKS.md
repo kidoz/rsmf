@@ -90,6 +90,21 @@ fixture's expert dimensions and whether shard bytes fault from storage.
 
 Source: `crates/rsmf-bench/benches/moe_dispatch.rs`.
 
+### Native decoder CPU path
+
+The native decoder path in `crates/rsmf-runtime` is currently validated by
+unit tests rather than Criterion benches. Covered behavior includes deterministic
+sampling, reference-logit checks, page-sized KV-cache allocation accounting, and
+threaded CPU final-projection equivalence:
+
+```sh
+cargo test -p rsmf-runtime native_decoder
+```
+
+Add a Criterion bench before making performance claims about threaded logits,
+prompt length scaling, cache allocation behavior, or future paged-attention
+kernels.
+
 ## Methodology
 
 - **Cache effects:** the fixture is 1 MiB. On M-series Apple Silicon it

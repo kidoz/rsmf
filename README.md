@@ -247,8 +247,18 @@ expected RSMF tensor names, shapes, and F32/F16/BF16 weight dtypes. It does not
 parse tokenizer internals yet. CPU reference tensor ops cover one
 LLaMA-style decoder block: RMSNorm, row-major linear projection, RoPE, causal
 grouped-query attention, SwiGLU MLP, and residual additions over supplied f32
-buffers. Weight loading, KV cache, logits, and token generation remain later
-slices.
+buffers. `Engine::native_decoder_weights()` decodes validated RSMF tensor
+variants into owned f32 weights, and `Engine::native_decoder_greedy_decode()`
+adds a correctness-oriented KV cache, logits, EOS-aware token generation,
+sampling controls (`temperature`, `top_k`, `top_p`, deterministic `seed`), and a
+backend selector. `auto` resolves to the CPU reference backend; `accelerated`
+currently dispatches to an in-tree threaded CPU path for the final LM-head
+projection. Native decoder verification also exposes
+`Engine::native_decoder_check_reference_logits()` for comparing local or
+exported tiny-model logits within an absolute tolerance. Performance work has
+started with page-sized KV-cache allocation and threaded CPU logits; tokenizer
+parsing, text-level generation, paged attention kernels, and GPU/vendor kernels
+remain future milestones.
 
 ### Minimal MoE runtime PoC
 

@@ -59,8 +59,15 @@ rsmf-core  (library)           ← format, reader, writer, validator, selection
   and the expected ordinary RSMF tensor names, shapes, and weight dtypes without
   adding a graph IR. The CPU reference decoder block path implements RMSNorm,
   row-major projections, RoPE, causal grouped-query attention, SwiGLU MLP, and
-  residual additions over supplied f32 buffers; weight loading, KV cache, logits,
-  and generation remain separate slices.
+  residual additions over supplied f32 buffers. `Engine::native_decoder_weights()`
+  loads validated RSMF tensor variants into owned f32 buffers, and
+  `Engine::native_decoder_greedy_decode()` provides an owned KV cache, logits,
+  EOS-aware generation, deterministic sampling controls, and a backend selector.
+  `auto` resolves to CPU reference, while `accelerated` currently dispatches to
+  the in-tree threaded CPU logits path. `Engine::native_decoder_check_reference_logits()`
+  compares runtime logits against local or exported references, and the first
+  performance slice adds page-sized KV-cache allocation accounting plus threaded
+  final projection without adding GPU dependencies.
 - `rsmf-moe-runtime` is a proof-of-concept runtime for one MoE layer: host-side
   top-1 gating, token batching by destination expert, placement-aware expert
   shard lookup, WGPU expert matmuls when available, and a CPU reference path.
