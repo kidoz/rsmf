@@ -257,6 +257,36 @@ pub type RuntimeInputs = HashMap<String, RuntimeTensor>;
 /// Named output tensor map.
 pub type RuntimeOutputs = HashMap<String, RuntimeTensor>;
 
+/// Per-initializer memory materialization report.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InitializerMemoryReport {
+    /// ONNX initializer name.
+    pub initializer_name: String,
+    /// RSMF tensor name used as the initializer source.
+    pub tensor_name: String,
+    /// Bytes materialized into an ORT-owned initializer value.
+    pub materialized_bytes: usize,
+}
+
+/// Memory accounting captured when a session is built.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionMemoryReport {
+    /// Embedded graph payload size in bytes.
+    pub graph_payload_bytes: usize,
+    /// Per-initializer materialization records.
+    pub initializers: Vec<InitializerMemoryReport>,
+    /// Total initializer bytes materialized into ORT-owned values.
+    pub initializer_materialized_bytes: usize,
+}
+
+impl SessionMemoryReport {
+    /// Number of initializer bindings materialized for this session.
+    #[must_use]
+    pub fn initializer_count(&self) -> usize {
+        self.initializers.len()
+    }
+}
+
 /// Cached ORT session handle.
 #[derive(Clone, Debug)]
 pub struct SessionHandle {
@@ -264,6 +294,7 @@ pub struct SessionHandle {
     session: Arc<Mutex<Session>>,
     inputs: Vec<ValueInfo>,
     outputs: Vec<ValueInfo>,
+    memory_report: SessionMemoryReport,
 }
 
 impl SessionHandle {
@@ -283,6 +314,12 @@ impl SessionHandle {
     #[must_use]
     pub fn outputs(&self) -> &[ValueInfo] {
         &self.outputs
+    }
+
+    /// Memory accounting captured when this session was built.
+    #[must_use]
+    pub fn memory_report(&self) -> &SessionMemoryReport {
+        &self.memory_report
     }
 
     /// Run this cached session with owned runtime tensors.
@@ -311,6 +348,16 @@ pub struct Engine {
     cache: Mutex<HashMap<SessionKey, SessionHandle>>,
 }
 
+struct BuiltSession {
+    session: Session,
+    memory_report: SessionMemoryReport,
+}
+
+struct InitializerValue {
+    value: Arc<DynValue>,
+    memory_report: InitializerMemoryReport,
+}
+
 impl Engine {
     /// Create a new engine from an opened RSMF file.
     pub fn new(file: RsmfFile) -> Result<Self> {
@@ -336,6 +383,7 @@ impl Engine {
         let _span = info_span!("Engine::session", graph_idx).entered();
 
         self.build_session(graph_idx, &SessionOptions::default())
+            .map(|built| built.session)
     }
 
     /// Return a cached session handle for `graph_idx` and `options`.
@@ -353,7 +401,8 @@ impl Engine {
             return Ok(handle.clone());
         }
 
-        let session = self.build_session(key.graph_idx, &key.options)?;
+        let built = self.build_session(key.graph_idx, &key.options)?;
+        let session = built.session;
         let handle = SessionHandle {
             inputs: session
                 .inputs()
@@ -366,6 +415,7 @@ impl Engine {
                 .map(ValueInfo::from_outlet)
                 .collect(),
             session: Arc::new(Mutex::new(session)),
+            memory_report: built.memory_report,
             key: key.clone(),
         };
         cache.insert(key, handle.clone());
@@ -427,7 +477,7 @@ impl Engine {
             .collect()
     }
 
-    fn build_session(&self, graph_idx: usize, options: &SessionOptions) -> Result<Session> {
+    fn build_session(&self, graph_idx: usize, options: &SessionOptions) -> Result<BuiltSession> {
         let payloads = self.file.graph_payloads();
         let payload = payloads.get(graph_idx).ok_or(RuntimeError::GraphNotFound {
             graph_idx,
@@ -475,19 +525,36 @@ impl Engine {
                 .map_err(|e| ort_error("register execution providers", e))?;
         }
 
+        let mut initializer_reports = Vec::with_capacity(options.initializers.len());
         for binding in &options.initializers {
             let initializer = self.initializer_value(binding)?;
             builder = builder
-                .with_external_initializer(&binding.initializer_name, initializer)
+                .with_external_initializer(&binding.initializer_name, initializer.value)
                 .map_err(|e| ort_error("register external initializer", e))?;
+            initializer_reports.push(initializer.memory_report);
         }
 
-        builder
+        let initializer_materialized_bytes =
+            initializer_reports.iter().try_fold(0usize, |acc, report| {
+                acc.checked_add(report.materialized_bytes).ok_or_else(|| {
+                    RuntimeError::Shape("initializer materialized byte count overflow".to_string())
+                })
+            })?;
+        let memory_report = SessionMemoryReport {
+            graph_payload_bytes: payload.bytes.len(),
+            initializer_materialized_bytes,
+            initializers: initializer_reports,
+        };
+        let session = builder
             .commit_from_memory(payload.bytes)
-            .map_err(|e| ort_error("session creation", e))
+            .map_err(|e| ort_error("session creation", e))?;
+        Ok(BuiltSession {
+            session,
+            memory_report,
+        })
     }
 
-    fn initializer_value(&self, binding: &InitializerBinding) -> Result<Arc<DynValue>> {
+    fn initializer_value(&self, binding: &InitializerBinding) -> Result<InitializerValue> {
         let view = self
             .file
             .tensor_view(&binding.tensor_name)
@@ -513,7 +580,23 @@ impl Engine {
                 tensor_name: binding.tensor_name.clone(),
                 reason: error.to_string(),
             })?;
-        tensor_from_vec(shape, data).map(Arc::new)
+        let materialized_bytes = data
+            .len()
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| RuntimeError::UnsupportedInitializer {
+                initializer_name: binding.initializer_name.clone(),
+                tensor_name: binding.tensor_name.clone(),
+                reason: "initializer materialized byte count overflow".to_string(),
+            })?;
+        let value = tensor_from_vec(shape, data).map(Arc::new)?;
+        Ok(InitializerValue {
+            value,
+            memory_report: InitializerMemoryReport {
+                initializer_name: binding.initializer_name.clone(),
+                tensor_name: binding.tensor_name.clone(),
+                materialized_bytes,
+            },
+        })
     }
 
     fn validate_initializer_bindings(
@@ -1107,6 +1190,7 @@ mod tests {
     fn runs_embedded_onnx_add_graph_from_rsmf() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("add.onnx.rsmf");
+        let graph = tiny_add_onnx_model();
         RsmfWriter::new()
             .with_tensor(TensorInput {
                 name: "fixture.weight".to_string(),
@@ -1117,12 +1201,15 @@ mod tests {
                 canonical: VariantInput::canonical_raw(0.0f32.to_le_bytes().to_vec()),
                 packed: Vec::new(),
             })
-            .with_graph(GraphInput::onnx(tiny_add_onnx_model()))
+            .with_graph(GraphInput::onnx(graph.clone()))
             .write_to_path(&path)
             .unwrap();
 
         let engine = Engine::new(RsmfFile::open(path).unwrap()).unwrap();
         let handle = engine.session_handle(0, SessionOptions::default()).unwrap();
+        assert_eq!(handle.memory_report().graph_payload_bytes, graph.len());
+        assert_eq!(handle.memory_report().initializer_count(), 0);
+        assert_eq!(handle.memory_report().initializer_materialized_bytes, 0);
         let input_names = handle
             .inputs()
             .iter()
@@ -1161,6 +1248,7 @@ mod tests {
     fn runs_onnx_graph_with_rsmf_external_initializer() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("add-initializer.onnx.rsmf");
+        let graph = tiny_add_external_initializer_onnx_model();
         RsmfWriter::new()
             .with_tensor(TensorInput {
                 name: "bias.tensor".to_string(),
@@ -1171,7 +1259,7 @@ mod tests {
                 canonical: VariantInput::canonical_raw(f32_bytes(&[10.0, -4.0])),
                 packed: Vec::new(),
             })
-            .with_graph(GraphInput::onnx(tiny_add_external_initializer_onnx_model()))
+            .with_graph(GraphInput::onnx(graph.clone()))
             .write_to_path(&path)
             .unwrap();
 
@@ -1181,6 +1269,20 @@ mod tests {
             ..SessionOptions::default()
         };
         let handle = engine.session_handle(0, options.clone()).unwrap();
+        let memory_report = handle.memory_report().clone();
+        assert_eq!(memory_report.graph_payload_bytes, graph.len());
+        assert_eq!(memory_report.initializer_count(), 1);
+        assert_eq!(memory_report.initializer_materialized_bytes, 8);
+        assert_eq!(
+            memory_report.initializers,
+            vec![InitializerMemoryReport {
+                initializer_name: "bias".to_string(),
+                tensor_name: "bias.tensor".to_string(),
+                materialized_bytes: 8,
+            }]
+        );
+        let cached_handle = engine.session_handle(0, options.clone()).unwrap();
+        assert_eq!(cached_handle.memory_report(), &memory_report);
         let input_names = handle
             .inputs()
             .iter()
