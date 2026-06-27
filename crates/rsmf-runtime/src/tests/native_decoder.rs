@@ -177,10 +177,11 @@ fn engine_native_decoder_tokenizer_encodes_and_decodes_wordlevel_text() {
 
 #[test]
 fn engine_native_decoder_tokenizer_rejects_unsupported_model_type() {
-    let err = NativeDecoderTokenizer::from_json(br#"{"model": {"type": "Unigram"}}"#).unwrap_err();
+    let err =
+        NativeDecoderTokenizer::from_json(br#"{"model": {"type": "WordPiece"}}"#).unwrap_err();
 
     assert!(
-        matches!(err, RuntimeError::NativeDecoderTokenizerInvalid { reason } if reason.contains("only WordLevel and BPE"))
+        matches!(err, RuntimeError::NativeDecoderTokenizerInvalid { reason } if reason.contains("only WordLevel, BPE, and Unigram"))
     );
 }
 
@@ -270,6 +271,58 @@ fn native_decoder_bpe_tokenizer_supports_byte_fallback() {
 
     assert_eq!(tokenizer.encode("é").unwrap(), vec![0, 1]);
     assert_eq!(tokenizer.decode(&[0, 1]).unwrap(), "é");
+}
+
+#[test]
+fn native_decoder_unigram_tokenizer_segments_with_scores_and_metaspace() {
+    let tokenizer = NativeDecoderTokenizer::from_json(
+        serde_json::json!({
+            "model": {
+                "type": "Unigram",
+                "vocab": [
+                    ["<unk>", 0.0],
+                    ["▁hello", -0.1],
+                    ["▁world", -0.1],
+                    ["▁", -3.0],
+                    ["hello", -1.0],
+                    ["world", -1.0],
+                    ["wor", -2.0],
+                    ["ld", -2.0]
+                ],
+                "unk_id": 0
+            },
+            "pre_tokenizer": { "type": "Metaspace", "replacement": "▁", "add_prefix_space": true }
+        })
+        .to_string()
+        .as_bytes(),
+    )
+    .unwrap();
+
+    assert_eq!(tokenizer.model_type, "Unigram");
+    assert_eq!(tokenizer.encode("hello world").unwrap(), vec![1, 2]);
+    assert_eq!(tokenizer.decode(&[1, 2]).unwrap(), "hello world");
+}
+
+#[test]
+fn native_decoder_unigram_tokenizer_uses_unk_for_unmatched_chars() {
+    let tokenizer = NativeDecoderTokenizer::from_json(
+        serde_json::json!({
+            "model": {
+                "type": "Unigram",
+                "vocab": [
+                    ["<unk>", 0.0],
+                    ["▁hello", -0.1]
+                ],
+                "unk_id": 0
+            },
+            "pre_tokenizer": { "type": "Metaspace", "replacement": "▁", "add_prefix_space": true }
+        })
+        .to_string()
+        .as_bytes(),
+    )
+    .unwrap();
+
+    assert_eq!(tokenizer.encode("hello!").unwrap(), vec![1, 0]);
 }
 
 #[test]
@@ -465,6 +518,53 @@ fn native_decoder_tokenizer_renders_chat_template_from_tokenizer_config() {
     assert_eq!(
         tokenizer.encode_chat(&messages, true).unwrap(),
         vec![0, 1, 2]
+    );
+}
+
+#[test]
+fn native_decoder_tokenizer_renders_chat_template_role_conditionals() {
+    let template = concat!(
+        "{% for message in messages %}",
+        "{% if message['role'] == 'user' %}",
+        "{{ '[INST] ' + message['content'] + ' [/INST] ' }}",
+        "{% elif message['role'] == 'assistant' %}",
+        "{{ message['content'] + ' ' }}",
+        "{% else %}",
+        "{{ message['content'] + ' ' }}",
+        "{% endif %}",
+        "{% endfor %}"
+    );
+    let tokenizer_config = serde_json::json!({ "chat_template": template }).to_string();
+    let tokenizer = NativeDecoderTokenizer::from_json_with_assets(
+        serde_json::json!({
+            "model": {
+                "type": "WordLevel",
+                "vocab": {
+                    "[INST]": 0,
+                    "hello": 1,
+                    "[/INST]": 2,
+                    "hi": 3
+                }
+            }
+        })
+        .to_string()
+        .as_bytes(),
+        Some(tokenizer_config.as_bytes()),
+        None,
+    )
+    .unwrap();
+
+    let messages = vec![
+        NativeDecoderChatMessage::new("user", "hello"),
+        NativeDecoderChatMessage::new("assistant", "hi"),
+    ];
+    assert_eq!(
+        tokenizer.apply_chat_template(&messages, false).unwrap(),
+        "[INST] hello [/INST] hi "
+    );
+    assert_eq!(
+        tokenizer.encode_chat(&messages, false).unwrap(),
+        vec![0, 1, 2, 3]
     );
 }
 

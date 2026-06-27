@@ -35,6 +35,7 @@ pub struct NativeDecoderTokenizer {
     pre_tokenizer: NativeDecoderPreTokenizer,
     post_processor: NativeDecoderPostProcessor,
     bpe_ranks: HashMap<(String, String), usize>,
+    unigram_scores: HashMap<String, i64>,
     byte_fallback: bool,
     special_tokens: Vec<String>,
     chat_template: Option<NativeDecoderChatTemplate>,
@@ -62,10 +63,11 @@ impl NativeDecoderTokenizer {
         let mode = match raw.model.tokenizer_type.as_str() {
             "WordLevel" => NativeDecoderTokenizerMode::WordLevel,
             "BPE" => NativeDecoderTokenizerMode::Bpe,
+            "Unigram" => NativeDecoderTokenizerMode::Unigram,
             other => {
                 return Err(RuntimeError::NativeDecoderTokenizerInvalid {
                     reason: format!(
-                        "only WordLevel and BPE tokenizer.json assets are supported, got {other}"
+                        "only WordLevel, BPE, and Unigram tokenizer.json assets are supported, got {other}"
                     ),
                 });
             }
@@ -75,8 +77,20 @@ impl NativeDecoderTokenizer {
         } else {
             HashMap::new()
         };
-        let unk_token = raw.model.unk_token;
-        let mut vocab = raw.model.vocab;
+        let (mut vocab, unigram_scores) = raw.model.vocab.to_vocab_and_scores(mode)?;
+        let mut unk_token = raw.model.unk_token;
+        if unk_token.is_none() {
+            if let Some(unk_id) = raw.model.unk_id {
+                let token_id = i64::try_from(unk_id).map_err(|_| {
+                    RuntimeError::NativeDecoderTokenizerInvalid {
+                        reason: format!("unk_id {unk_id} cannot convert to i64"),
+                    }
+                })?;
+                unk_token = vocab
+                    .iter()
+                    .find_map(|(token, id)| (*id == token_id).then(|| token.clone()));
+            }
+        }
         let mut special_tokens = Vec::new();
         for added in raw.added_tokens {
             if added.special {
@@ -117,6 +131,7 @@ impl NativeDecoderTokenizer {
             pre_tokenizer,
             post_processor,
             bpe_ranks,
+            unigram_scores,
             byte_fallback: raw.model.byte_fallback,
             special_tokens,
             chat_template: NativeDecoderChatTemplate::from_assets(
@@ -186,6 +201,9 @@ impl NativeDecoderTokenizer {
                             NativeDecoderTokenizerMode::Bpe => {
                                 token_ids.extend(self.encode_bpe_piece(&token)?);
                             }
+                            NativeDecoderTokenizerMode::Unigram => {
+                                token_ids.extend(self.encode_unigram_piece(&token)?);
+                            }
                         }
                     }
                 }
@@ -212,6 +230,7 @@ impl NativeDecoderTokenizer {
         match self.mode {
             NativeDecoderTokenizerMode::WordLevel => Ok(tokens.join(" ")),
             NativeDecoderTokenizerMode::Bpe => Ok(self.decode_bpe_tokens(&tokens)?),
+            NativeDecoderTokenizerMode::Unigram => Ok(decode_sentencepiece_tokens(&tokens)),
         }
     }
 
@@ -295,12 +314,120 @@ impl NativeDecoderTokenizer {
         flush_byte_fallback_buffer(&mut byte_buffer, &mut decoded_tokens)?;
         Ok(decode_bpe_tokens(&decoded_tokens))
     }
+
+    pub(crate) fn encode_unigram_piece(&self, piece: &str) -> Result<Vec<i64>> {
+        if self.vocab.contains_key(piece) {
+            return self.lookup_token_id(piece).map(|token_id| vec![token_id]);
+        }
+        let mut boundaries = piece.char_indices().map(|(idx, _)| idx).collect::<Vec<_>>();
+        if boundaries.first().copied() != Some(0) {
+            boundaries.insert(0, 0);
+        }
+        if boundaries.last().copied() != Some(piece.len()) {
+            boundaries.push(piece.len());
+        }
+        let mut boundary_index = HashMap::with_capacity(boundaries.len());
+        for (index, boundary) in boundaries.iter().enumerate() {
+            boundary_index.insert(*boundary, index);
+        }
+        let mut dp: Vec<Option<NativeDecoderUnigramPath>> = vec![None; boundaries.len()];
+        dp[0] = Some(NativeDecoderUnigramPath {
+            score: 0,
+            previous: 0,
+            token: String::new(),
+        });
+        for start_index in 0..boundaries.len().saturating_sub(1) {
+            let Some(start_path) = dp[start_index].clone() else {
+                continue;
+            };
+            let start = boundaries[start_index];
+            let mut matched = false;
+            for end_index in start_index + 1..boundaries.len() {
+                let end = boundaries[end_index];
+                let candidate = &piece[start..end];
+                let Some(score) = self.unigram_scores.get(candidate).copied() else {
+                    continue;
+                };
+                matched = true;
+                update_unigram_path(
+                    &mut dp[end_index],
+                    NativeDecoderUnigramPath {
+                        score: start_path.score + score,
+                        previous: start_index,
+                        token: candidate.to_string(),
+                    },
+                );
+            }
+            if !matched {
+                if let Some(unk_token) = &self.unk_token {
+                    let end = boundaries[start_index + 1];
+                    let end_index = *boundary_index.get(&end).ok_or_else(|| {
+                        RuntimeError::NativeDecoderTokenizerInvalid {
+                            reason: "internal Unigram boundary lookup failed".to_string(),
+                        }
+                    })?;
+                    update_unigram_path(
+                        &mut dp[end_index],
+                        NativeDecoderUnigramPath {
+                            score: start_path.score - 1_000_000_000,
+                            previous: start_index,
+                            token: unk_token.clone(),
+                        },
+                    );
+                }
+            }
+        }
+        let Some(mut cursor) = dp.len().checked_sub(1) else {
+            return Err(RuntimeError::NativeDecoderPromptEmpty);
+        };
+        if dp[cursor].is_none() {
+            return Err(RuntimeError::NativeDecoderTokenizerTokenUnknown {
+                token: piece.to_string(),
+            });
+        }
+        let mut tokens = Vec::new();
+        while cursor > 0 {
+            let Some(path) = &dp[cursor] else {
+                return Err(RuntimeError::NativeDecoderTokenizerTokenUnknown {
+                    token: piece.to_string(),
+                });
+            };
+            tokens.push(path.token.clone());
+            cursor = path.previous;
+        }
+        tokens.reverse();
+        tokens
+            .into_iter()
+            .map(|token| self.lookup_token_id(&token))
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NativeDecoderTokenizerMode {
     WordLevel,
     Bpe,
+    Unigram,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NativeDecoderUnigramPath {
+    score: i64,
+    previous: usize,
+    token: String,
+}
+
+pub(crate) fn update_unigram_path(
+    slot: &mut Option<NativeDecoderUnigramPath>,
+    candidate: NativeDecoderUnigramPath,
+) {
+    let replace = slot.as_ref().is_none_or(|current| {
+        candidate.score > current.score
+            || (candidate.score == current.score && candidate.token.len() > current.token.len())
+    });
+    if replace {
+        *slot = Some(candidate);
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -456,7 +583,13 @@ pub(crate) enum NativeDecoderTemplatePiece {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NativeDecoderPreTokenizer {
     Whitespace,
-    ByteLevel { add_prefix_space: bool },
+    ByteLevel {
+        add_prefix_space: bool,
+    },
+    Metaspace {
+        replacement: char,
+        add_prefix_space: bool,
+    },
 }
 
 impl NativeDecoderPreTokenizer {
@@ -480,6 +613,31 @@ impl NativeDecoderPreTokenizer {
                     .and_then(serde_json::Value::as_bool)
                     .unwrap_or(false),
             }),
+            "Metaspace" => {
+                let replacement = value
+                    .get("replacement")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("▁");
+                let mut chars = replacement.chars();
+                let Some(replacement) = chars.next() else {
+                    return Err(RuntimeError::NativeDecoderTokenizerInvalid {
+                        reason: "pre_tokenizer Metaspace replacement must not be empty".to_string(),
+                    });
+                };
+                if chars.next().is_some() {
+                    return Err(RuntimeError::NativeDecoderTokenizerInvalid {
+                        reason: "pre_tokenizer Metaspace replacement must be one character"
+                            .to_string(),
+                    });
+                }
+                Ok(Self::Metaspace {
+                    replacement,
+                    add_prefix_space: value
+                        .get("add_prefix_space")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(true),
+                })
+            }
             other => Err(RuntimeError::NativeDecoderTokenizerInvalid {
                 reason: format!("unsupported pre_tokenizer {other}"),
             }),
@@ -499,6 +657,19 @@ impl NativeDecoderPreTokenizer {
                     }
                 }
                 pieces
+            }
+            Self::Metaspace {
+                replacement,
+                add_prefix_space,
+            } => {
+                let mut piece = text
+                    .chars()
+                    .map(|ch| if ch.is_whitespace() { replacement } else { ch })
+                    .collect::<String>();
+                if add_prefix_space && !piece.starts_with(replacement) {
+                    piece.insert(0, replacement);
+                }
+                vec![piece]
             }
         }
     }
@@ -522,13 +693,56 @@ pub(crate) struct NativeDecoderTokenizerModelJson {
     #[serde(rename = "type")]
     tokenizer_type: String,
     #[serde(default)]
-    vocab: HashMap<String, i64>,
+    vocab: NativeDecoderTokenizerVocabJson,
     #[serde(default)]
     unk_token: Option<String>,
+    #[serde(default)]
+    unk_id: Option<usize>,
     #[serde(default)]
     merges: Vec<NativeDecoderBpeMergeJson>,
     #[serde(default)]
     byte_fallback: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub(crate) enum NativeDecoderTokenizerVocabJson {
+    Map(HashMap<String, i64>),
+    Unigram(Vec<(String, f64)>),
+}
+
+impl Default for NativeDecoderTokenizerVocabJson {
+    fn default() -> Self {
+        Self::Map(HashMap::new())
+    }
+}
+
+impl NativeDecoderTokenizerVocabJson {
+    pub(crate) fn to_vocab_and_scores(
+        &self,
+        mode: NativeDecoderTokenizerMode,
+    ) -> Result<(HashMap<String, i64>, HashMap<String, i64>)> {
+        match (mode, self) {
+            (_, Self::Map(vocab)) => Ok((vocab.clone(), HashMap::new())),
+            (NativeDecoderTokenizerMode::Unigram, Self::Unigram(entries)) => {
+                let mut vocab = HashMap::with_capacity(entries.len());
+                let mut scores = HashMap::with_capacity(entries.len());
+                for (idx, (token, score)) in entries.iter().enumerate() {
+                    let token_id = i64::try_from(idx).map_err(|_| {
+                        RuntimeError::NativeDecoderTokenizerInvalid {
+                            reason: format!("Unigram token index {idx} cannot convert to i64"),
+                        }
+                    })?;
+                    vocab.insert(token.clone(), token_id);
+                    scores.insert(token.clone(), (score * 1_000_000.0).round() as i64);
+                }
+                Ok((vocab, scores))
+            }
+            (_, Self::Unigram(_)) => Err(RuntimeError::NativeDecoderTokenizerInvalid {
+                reason: "array vocab is supported only for Unigram tokenizers".to_string(),
+            }),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -870,28 +1084,17 @@ pub(crate) fn render_chat_template_segment(
                         reason: "chat template block is missing %}".to_string(),
                     })?;
             let tag = rest[2..end].trim().trim_matches('-').trim();
-            if tag == "if add_generation_prompt" {
+            if let Some(condition) = tag.strip_prefix("if ") {
                 let body_start = end + 2;
-                let Some((endif_start, endif_end, endif_tag)) =
-                    find_jinja_tag(rest, body_start, "endif")
-                else {
-                    return Err(RuntimeError::NativeDecoderTokenizerInvalid {
-                        reason: "chat template if block is missing endif".to_string(),
-                    });
-                };
-                if endif_tag != "endif" {
-                    return Err(RuntimeError::NativeDecoderTokenizerInvalid {
-                        reason: format!("unsupported chat template if end block {endif_tag:?}"),
-                    });
-                }
-                if add_generation_prompt {
-                    rendered.push_str(&render_chat_template_segment(
-                        &rest[body_start..endif_start],
-                        message,
-                        add_generation_prompt,
-                    )?);
-                }
-                rest = &rest[endif_end..];
+                let (branch, next_index) = render_chat_if_block(
+                    rest,
+                    body_start,
+                    condition,
+                    message,
+                    add_generation_prompt,
+                )?;
+                rendered.push_str(&branch);
+                rest = &rest[next_index..];
             } else {
                 return Err(RuntimeError::NativeDecoderTokenizerInvalid {
                     reason: format!("unsupported chat template block {tag:?}"),
@@ -904,6 +1107,138 @@ pub(crate) fn render_chat_template_segment(
     }
     rendered.push_str(rest);
     Ok(rendered)
+}
+
+pub(crate) fn render_chat_if_block(
+    rest: &str,
+    body_start: usize,
+    first_condition: &str,
+    message: Option<&NativeDecoderChatMessage>,
+    add_generation_prompt: bool,
+) -> Result<(String, usize)> {
+    let mut branches = Vec::new();
+    let mut current_condition = Some(first_condition.trim());
+    let mut current_body_start = body_start;
+    loop {
+        let Some((tag_start, tag_end, tag)) = find_next_jinja_control_tag(rest, current_body_start)
+        else {
+            return Err(RuntimeError::NativeDecoderTokenizerInvalid {
+                reason: "chat template if block is missing endif".to_string(),
+            });
+        };
+        if let Some(condition) = tag.strip_prefix("elif ") {
+            branches.push((current_condition, current_body_start, tag_start));
+            current_condition = Some(condition.trim());
+            current_body_start = tag_end;
+        } else if tag == "else" {
+            branches.push((current_condition, current_body_start, tag_start));
+            current_condition = None;
+            current_body_start = tag_end;
+        } else if tag == "endif" {
+            branches.push((current_condition, current_body_start, tag_start));
+            for (condition, start, end) in branches {
+                let selected = match condition {
+                    Some(condition) => {
+                        eval_chat_condition(condition, message, add_generation_prompt)?
+                    }
+                    None => true,
+                };
+                if selected {
+                    return Ok((
+                        render_chat_template_segment(
+                            &rest[start..end],
+                            message,
+                            add_generation_prompt,
+                        )?,
+                        tag_end,
+                    ));
+                }
+            }
+            return Ok((String::new(), tag_end));
+        } else {
+            return Err(RuntimeError::NativeDecoderTokenizerInvalid {
+                reason: format!("unsupported chat template if control block {tag:?}"),
+            });
+        }
+    }
+}
+
+pub(crate) fn find_next_jinja_control_tag(
+    template: &str,
+    start: usize,
+) -> Option<(usize, usize, &str)> {
+    let mut search_start = start;
+    while let Some(relative_start) = template[search_start..].find("{%") {
+        let tag_start = search_start + relative_start;
+        let tag_body_start = tag_start + 2;
+        let relative_end = template[tag_body_start..].find("%}")?;
+        let tag_end = tag_body_start + relative_end + 2;
+        let tag = template[tag_body_start..tag_body_start + relative_end]
+            .trim()
+            .trim_matches('-')
+            .trim();
+        if tag.starts_with("elif ") || tag == "else" || tag == "endif" {
+            return Some((tag_start, tag_end, tag));
+        }
+        search_start = tag_end;
+    }
+    None
+}
+
+pub(crate) fn eval_chat_condition(
+    condition: &str,
+    message: Option<&NativeDecoderChatMessage>,
+    add_generation_prompt: bool,
+) -> Result<bool> {
+    match condition {
+        "add_generation_prompt" => return Ok(add_generation_prompt),
+        "not add_generation_prompt" => return Ok(!add_generation_prompt),
+        _ => {}
+    }
+    if let Some((left, right)) = condition.split_once("==") {
+        return Ok(eval_chat_condition_value(left.trim(), message)?
+            == eval_chat_condition_literal(right.trim())?);
+    }
+    if let Some((left, right)) = condition.split_once("!=") {
+        return Ok(eval_chat_condition_value(left.trim(), message)?
+            != eval_chat_condition_literal(right.trim())?);
+    }
+    Err(RuntimeError::NativeDecoderTokenizerInvalid {
+        reason: format!("unsupported chat template condition {condition:?}"),
+    })
+}
+
+pub(crate) fn eval_chat_condition_value(
+    expression: &str,
+    message: Option<&NativeDecoderChatMessage>,
+) -> Result<String> {
+    match expression {
+        "message['role']" | "message[\"role\"]" | "message.role" => message
+            .map(|message| message.role.clone())
+            .ok_or_else(|| RuntimeError::NativeDecoderTokenizerInvalid {
+                reason: "chat template message role used outside message loop".to_string(),
+            }),
+        "message['content']" | "message[\"content\"]" | "message.content" => message
+            .map(|message| message.content.clone())
+            .ok_or_else(|| RuntimeError::NativeDecoderTokenizerInvalid {
+                reason: "chat template message content used outside message loop".to_string(),
+            }),
+        other => Err(RuntimeError::NativeDecoderTokenizerInvalid {
+            reason: format!("unsupported chat template condition value {other:?}"),
+        }),
+    }
+}
+
+pub(crate) fn eval_chat_condition_literal(value: &str) -> Result<String> {
+    if (value.starts_with('\'') && value.ends_with('\''))
+        || (value.starts_with('"') && value.ends_with('"'))
+    {
+        Ok(unescape_chat_literal(&value[1..value.len() - 1]))
+    } else {
+        Err(RuntimeError::NativeDecoderTokenizerInvalid {
+            reason: format!("unsupported chat template condition literal {value:?}"),
+        })
+    }
 }
 
 pub(crate) fn find_jinja_tag<'a>(
@@ -1076,6 +1411,11 @@ pub(crate) fn decode_bpe_tokens(tokens: &[String]) -> String {
         }
     }
     text
+}
+
+pub(crate) fn decode_sentencepiece_tokens(tokens: &[String]) -> String {
+    let text = tokens.join("");
+    text.replace('▁', " ").trim_start().to_string()
 }
 
 pub(crate) fn parse_byte_fallback_token(token: &str) -> Option<u8> {
