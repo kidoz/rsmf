@@ -38,9 +38,11 @@ rsmf-core  (library)           ← format, reader, writer, validator, selection
   materializes an ORT-owned value at session build time; mmap/device zero-copy
   remains future work. `RuntimeExecutor` adds the first runtime-server control
   layer: a bounded in-process priority queue around `Engine::run`, with FIFO
-  ordering within a priority level, pre-dispatch deadline expiry, typed error
-  propagation, per-request queue/run timings, and cumulative metrics. It stays
-  graph-runtime agnostic for later batching and native decoder paths.
+  ordering within a priority level, pre-dispatch deadline expiry, timeout
+  helpers, queued cancellation, typed error propagation, per-request queue/run
+  timings, and cumulative metrics. Already-running ORT calls are not interrupted
+  yet. It stays graph-runtime agnostic for later batching and native decoder
+  paths.
 - `rsmf-moe-runtime` is a proof-of-concept runtime for one MoE layer: host-side
   top-1 gating, token batching by destination expert, placement-aware expert
   shard lookup, WGPU expert matmuls when available, and a CPU reference path.
