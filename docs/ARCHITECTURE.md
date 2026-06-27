@@ -75,15 +75,18 @@ rsmf-core  (library)           ← format, reader, writer, validator, selection
   temperature, top-k, top-p, deterministic seeds, repetition penalty, minimum
   generation length, stop-token overrides, and optional prompt logits.
   `Engine::native_decoder_tokenizer()` and `Engine::native_decoder_generate_text()`
-  add text-level native decoding for `WordLevel`, limited BPE, and limited
-  Unigram tokenizer assets. The tokenizer path supports vocab/merges, simple
-  whitespace, ByteLevel, or Metaspace pre-tokenization, added special-token ids,
-  adjacent special-token matching, byte fallback through `<0xXX>` vocab
-  entries, NFC/NFD/NFKC/NFKD normalizers, `TemplateProcessing` single/pair
-  post-processors, score-based Unigram segmentation with `unk_id`, and a small
-  ChatML-style chat-template renderer for `tokenizer_config.json` /
-  `chat_template.json` assets. Unsupported tokenizer constructs fail with typed
-  errors. The first performance slices add real paged KV-cache attention reads, chunked prefill scheduling, threaded final
+  add text-level native decoding for `WordLevel`, limited BPE, limited
+  Unigram, and BERT-style WordPiece tokenizer assets. The tokenizer path
+  supports vocab/merges, simple whitespace, ByteLevel, Metaspace, punctuation,
+  digit, delimiter, split, and sequence pre-tokenization; added special-token
+  ids; adjacent special-token matching; byte fallback through `<0xXX>` vocab
+  entries; NFC/NFD/NFKC/NFKD, Strip, StripAccents, Replace, and BertNormalizer
+  normalizers; `TemplateProcessing`, `BertProcessing`, `RobertaProcessing`,
+  ByteLevel, and Sequence post-processors; score-based Unigram segmentation
+  with `unk_id`; common decoders; and MiniJinja-backed chat templates for
+  `tokenizer_config.json` / `chat_template.json` assets with bounded rendering.
+  Direct SentencePiece `.model` protobuf parsing remains future work.
+  Unsupported tokenizer constructs fail with typed errors. The first performance slices add real paged KV-cache attention reads, chunked prefill scheduling, threaded final
   projection, optional Apple Accelerate f32 linear projections, and Criterion
   benches without adding GPU dependencies. Metal/WGPU and CoreML native decoder
   backend selectors currently return typed unavailable errors.
