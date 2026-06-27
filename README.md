@@ -243,8 +243,21 @@ a temp directory and run without downloading model weights:
 ```sh
 cargo run -p rsmf-runtime --example tiny_onnx_add
 cargo run -p rsmf-runtime --example tiny_native_decoder
+cargo run -p rsmf-runtime --example tiny_native_decoder --features apple-accelerate -- --accelerated
 cargo run -p rsmf-runtime --example tiny_issue_classifier
 ```
+
+Acceleration support is path-specific:
+
+| Path | Example | Default backend | Feature-gated acceleration |
+|---|---|---|---|
+| Native decoder | `tiny_native_decoder` | `CpuReference` | `apple-accelerate` enables `AppleCpuAccelerate` when `--accelerated` is requested on macOS. |
+| ONNX / ORT graph runtime | `tiny_onnx_add`, `tiny_issue_classifier` | ORT CPU execution provider | Not wired to `apple-accelerate`; future ORT CoreML / provider work should use a separate feature. |
+
+`tiny_native_decoder` prints bundle creation, resident-session load, generation
+timings, requested backend, and resolved backend. The tiny examples are for
+correctness and API demonstration; they are too small for meaningful speedup
+claims.
 
 Provider-specific device I/O binding and true mmap/device zero-copy residency
 are future runtime milestones.
