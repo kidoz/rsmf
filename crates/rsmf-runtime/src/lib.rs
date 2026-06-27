@@ -835,6 +835,9 @@ pub struct NativeDecoderSamplingOptions {
     /// Optional deterministic sampler seed. A fixed internal seed is used when
     /// sampling is enabled and this is omitted.
     pub seed: Option<u64>,
+    /// Optional repetition penalty applied to prompt and generated tokens before
+    /// selecting the next token. Values must be finite and at least `1.0`.
+    pub repetition_penalty: Option<f32>,
 }
 
 /// Performance controls for native decoder execution.
@@ -845,6 +848,10 @@ pub struct NativeDecoderPerformanceOptions {
     pub kv_cache_page_size_tokens: Option<usize>,
     /// Optional CPU worker count for threaded CPU paths.
     pub cpu_threads: Option<usize>,
+    /// Optional prompt prefill chunk size. The current CPU path still executes
+    /// token steps serially inside each chunk, but this bounds the scheduling
+    /// unit for longer prompts and future chunked kernels.
+    pub prefill_chunk_size: Option<usize>,
 }
 
 /// Options for native decoder greedy generation.
@@ -863,6 +870,13 @@ pub struct NativeDecoderRunOptions {
     pub sampling: NativeDecoderSamplingOptions,
     /// Performance controls for cache allocation and CPU dispatch.
     pub performance: NativeDecoderPerformanceOptions,
+    /// Minimum number of new tokens to emit before stop-token checks apply.
+    pub min_new_tokens: usize,
+    /// Optional stop-token override. When empty, [`Self::eos_token_ids`] and
+    /// then [`NativeDecoderConfig::eos_token_ids`] are used.
+    pub stop_token_ids: Vec<i64>,
+    /// Whether to retain prompt-step logits in [`NativeDecoderGenerateOutput`].
+    pub return_prompt_logits: bool,
 }
 
 impl Default for NativeDecoderRunOptions {
@@ -874,6 +888,9 @@ impl Default for NativeDecoderRunOptions {
             weight_options: NativeDecoderWeightOptions::default(),
             sampling: NativeDecoderSamplingOptions::default(),
             performance: NativeDecoderPerformanceOptions::default(),
+            min_new_tokens: 0,
+            stop_token_ids: Vec::new(),
+            return_prompt_logits: false,
         }
     }
 }
@@ -919,6 +936,9 @@ pub struct NativeDecoderTokenizer {
     pub vocab: HashMap<String, i64>,
     id_to_token: HashMap<i64, String>,
     unk_token: Option<String>,
+    mode: NativeDecoderTokenizerMode,
+    pre_tokenizer: NativeDecoderPreTokenizer,
+    bpe_ranks: HashMap<(String, String), usize>,
 }
 
 impl NativeDecoderTokenizer {
@@ -928,29 +948,45 @@ impl NativeDecoderTokenizer {
                 reason: error.to_string(),
             }
         })?;
-        if raw.model.tokenizer_type != "WordLevel" {
-            return Err(RuntimeError::NativeDecoderTokenizerInvalid {
-                reason: format!(
-                    "only WordLevel tokenizer.json assets are supported, got {}",
-                    raw.model.tokenizer_type
-                ),
-            });
+        reject_supported_tokenizer_component("normalizer", raw.normalizer.as_ref())?;
+        reject_supported_tokenizer_component("post_processor", raw.post_processor.as_ref())?;
+        let pre_tokenizer = NativeDecoderPreTokenizer::from_json(raw.pre_tokenizer.as_ref())?;
+        let mode = match raw.model.tokenizer_type.as_str() {
+            "WordLevel" => NativeDecoderTokenizerMode::WordLevel,
+            "BPE" => NativeDecoderTokenizerMode::Bpe,
+            other => {
+                return Err(RuntimeError::NativeDecoderTokenizerInvalid {
+                    reason: format!(
+                        "only WordLevel and BPE tokenizer.json assets are supported, got {other}"
+                    ),
+                });
+            }
+        };
+        let bpe_ranks = if mode == NativeDecoderTokenizerMode::Bpe {
+            bpe_ranks_from_merges(&raw.model.merges)?
+        } else {
+            HashMap::new()
+        };
+        let unk_token = raw.model.unk_token;
+        let mut vocab = raw.model.vocab;
+        for added in raw.added_tokens {
+            vocab.entry(added.content).or_insert(added.id);
         }
-        if raw.model.vocab.is_empty() {
+        if vocab.is_empty() {
             return Err(RuntimeError::NativeDecoderTokenizerInvalid {
                 reason: "tokenizer vocab must not be empty".to_string(),
             });
         }
-        let mut id_to_token = HashMap::with_capacity(raw.model.vocab.len());
-        for (token, token_id) in &raw.model.vocab {
+        let mut id_to_token = HashMap::with_capacity(vocab.len());
+        for (token, token_id) in &vocab {
             if id_to_token.insert(*token_id, token.clone()).is_some() {
                 return Err(RuntimeError::NativeDecoderTokenizerInvalid {
                     reason: format!("duplicate tokenizer id {token_id}"),
                 });
             }
         }
-        if let Some(unk_token) = &raw.model.unk_token {
-            if !raw.model.vocab.contains_key(unk_token) {
+        if let Some(unk_token) = &unk_token {
+            if !vocab.contains_key(unk_token) {
                 return Err(RuntimeError::NativeDecoderTokenizerInvalid {
                     reason: format!("unk_token {unk_token} is not present in vocab"),
                 });
@@ -958,33 +994,31 @@ impl NativeDecoderTokenizer {
         }
         Ok(Self {
             model_type: raw.model.tokenizer_type,
-            vocab: raw.model.vocab,
+            vocab,
             id_to_token,
-            unk_token: raw.model.unk_token,
+            unk_token,
+            mode,
+            pre_tokenizer,
+            bpe_ranks,
         })
     }
 
-    /// Encode text by whitespace token lookup.
+    /// Encode text to token ids.
     ///
-    /// This R4.7 tokenizer slice intentionally supports only simple WordLevel
-    /// tokenizers. Unknown tokens use `unk_token` when configured; otherwise a
-    /// typed error is returned.
+    /// WordLevel tokenizers use whitespace token lookup. BPE tokenizers support
+    /// simple whitespace or ByteLevel-style pre-tokenization, vocab/merges, and
+    /// exact special-token lookup. Unsupported tokenizer components fail at
+    /// load time with typed errors.
     pub fn encode(&self, text: &str) -> Result<Vec<i64>> {
         let mut token_ids = Vec::new();
-        for token in text.split_whitespace() {
-            if let Some(token_id) = self.vocab.get(token) {
-                token_ids.push(*token_id);
-            } else if let Some(unk_token) = &self.unk_token {
-                let token_id = self.vocab.get(unk_token).copied().ok_or_else(|| {
-                    RuntimeError::NativeDecoderTokenizerTokenUnknown {
-                        token: token.to_string(),
-                    }
-                })?;
-                token_ids.push(token_id);
-            } else {
-                return Err(RuntimeError::NativeDecoderTokenizerTokenUnknown {
-                    token: token.to_string(),
-                });
+        for token in self.pre_tokenizer.pieces(text) {
+            match self.mode {
+                NativeDecoderTokenizerMode::WordLevel => {
+                    token_ids.push(self.lookup_token_id(&token)?);
+                }
+                NativeDecoderTokenizerMode::Bpe => {
+                    token_ids.extend(self.encode_bpe_piece(&token)?);
+                }
             }
         }
         if token_ids.is_empty() {
@@ -993,9 +1027,9 @@ impl NativeDecoderTokenizer {
         Ok(token_ids)
     }
 
-    /// Decode token ids by joining WordLevel tokens with spaces.
+    /// Decode token ids back to text.
     pub fn decode(&self, token_ids: &[i64]) -> Result<String> {
-        token_ids
+        let tokens = token_ids
             .iter()
             .map(|token_id| {
                 self.id_to_token.get(token_id).cloned().ok_or_else(|| {
@@ -1004,8 +1038,111 @@ impl NativeDecoderTokenizer {
                     }
                 })
             })
-            .collect::<Result<Vec<_>>>()
-            .map(|tokens| tokens.join(" "))
+            .collect::<Result<Vec<_>>>()?;
+        match self.mode {
+            NativeDecoderTokenizerMode::WordLevel => Ok(tokens.join(" ")),
+            NativeDecoderTokenizerMode::Bpe => Ok(decode_bpe_tokens(&tokens)),
+        }
+    }
+
+    fn lookup_token_id(&self, token: &str) -> Result<i64> {
+        if let Some(token_id) = self.vocab.get(token) {
+            Ok(*token_id)
+        } else if let Some(unk_token) = &self.unk_token {
+            self.vocab.get(unk_token).copied().ok_or_else(|| {
+                RuntimeError::NativeDecoderTokenizerTokenUnknown {
+                    token: token.to_string(),
+                }
+            })
+        } else {
+            Err(RuntimeError::NativeDecoderTokenizerTokenUnknown {
+                token: token.to_string(),
+            })
+        }
+    }
+
+    fn encode_bpe_piece(&self, piece: &str) -> Result<Vec<i64>> {
+        if self.vocab.contains_key(piece) {
+            return self.lookup_token_id(piece).map(|token_id| vec![token_id]);
+        }
+        let mut symbols = piece.chars().map(|c| c.to_string()).collect::<Vec<_>>();
+        while symbols.len() > 1 {
+            let Some((best_index, _)) = symbols
+                .windows(2)
+                .enumerate()
+                .filter_map(|(index, pair)| {
+                    self.bpe_ranks
+                        .get(&(pair[0].clone(), pair[1].clone()))
+                        .map(|rank| (index, *rank))
+                })
+                .min_by_key(|(_, rank)| *rank)
+            else {
+                break;
+            };
+            let merged = format!("{}{}", symbols[best_index], symbols[best_index + 1]);
+            symbols.splice(best_index..=best_index + 1, [merged]);
+        }
+        symbols
+            .into_iter()
+            .map(|symbol| self.lookup_token_id(&symbol))
+            .collect()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NativeDecoderTokenizerMode {
+    WordLevel,
+    Bpe,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NativeDecoderPreTokenizer {
+    Whitespace,
+    ByteLevel { add_prefix_space: bool },
+}
+
+impl NativeDecoderPreTokenizer {
+    fn from_json(value: Option<&serde_json::Value>) -> Result<Self> {
+        let Some(value) = value else {
+            return Ok(Self::Whitespace);
+        };
+        if value.is_null() {
+            return Ok(Self::Whitespace);
+        }
+        let Some(kind) = value.get("type").and_then(serde_json::Value::as_str) else {
+            return Err(RuntimeError::NativeDecoderTokenizerInvalid {
+                reason: "pre_tokenizer.type is required when pre_tokenizer is present".to_string(),
+            });
+        };
+        match kind {
+            "Whitespace" | "WhitespaceSplit" => Ok(Self::Whitespace),
+            "ByteLevel" => Ok(Self::ByteLevel {
+                add_prefix_space: value
+                    .get("add_prefix_space")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
+            }),
+            other => Err(RuntimeError::NativeDecoderTokenizerInvalid {
+                reason: format!("unsupported pre_tokenizer {other}"),
+            }),
+        }
+    }
+
+    fn pieces(self, text: &str) -> Vec<String> {
+        match self {
+            Self::Whitespace => text.split_whitespace().map(ToString::to_string).collect(),
+            Self::ByteLevel { add_prefix_space } => {
+                let mut pieces = Vec::new();
+                for (index, piece) in text.split_whitespace().enumerate() {
+                    if index == 0 && !add_prefix_space {
+                        pieces.push(piece.to_string());
+                    } else {
+                        pieces.push(format!("Ġ{piece}"));
+                    }
+                }
+                pieces
+            }
+        }
     }
 }
 
@@ -1024,6 +1161,9 @@ pub struct NativeDecoderTextGenerateOutput {
     pub text: String,
     /// Per-generation-step logits, one row per generated token.
     pub logits: Vec<Vec<f32>>,
+    /// Optional per-prompt-token logits. Empty unless
+    /// [`NativeDecoderRunOptions::return_prompt_logits`] is enabled.
+    pub prompt_logits: Vec<Vec<f32>>,
     /// Backend actually used by this run.
     pub backend: NativeDecoderBackend,
 }
@@ -1031,6 +1171,14 @@ pub struct NativeDecoderTextGenerateOutput {
 #[derive(Debug, Deserialize)]
 struct NativeDecoderTokenizerJson {
     model: NativeDecoderTokenizerModelJson,
+    #[serde(default)]
+    normalizer: Option<serde_json::Value>,
+    #[serde(default)]
+    pre_tokenizer: Option<serde_json::Value>,
+    #[serde(default)]
+    post_processor: Option<serde_json::Value>,
+    #[serde(default)]
+    added_tokens: Vec<NativeDecoderAddedTokenJson>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1041,6 +1189,81 @@ struct NativeDecoderTokenizerModelJson {
     vocab: HashMap<String, i64>,
     #[serde(default)]
     unk_token: Option<String>,
+    #[serde(default)]
+    merges: Vec<NativeDecoderBpeMergeJson>,
+}
+
+#[derive(Debug, Deserialize)]
+struct NativeDecoderAddedTokenJson {
+    id: i64,
+    content: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum NativeDecoderBpeMergeJson {
+    Text(String),
+    Pair([String; 2]),
+}
+
+fn reject_supported_tokenizer_component(
+    name: &str,
+    value: Option<&serde_json::Value>,
+) -> Result<()> {
+    if value.is_some_and(|value| !value.is_null()) {
+        return Err(RuntimeError::NativeDecoderTokenizerInvalid {
+            reason: format!("{name} is not supported by the native tokenizer yet"),
+        });
+    }
+    Ok(())
+}
+
+fn bpe_ranks_from_merges(
+    merges: &[NativeDecoderBpeMergeJson],
+) -> Result<HashMap<(String, String), usize>> {
+    let mut ranks = HashMap::with_capacity(merges.len());
+    for (rank, merge) in merges.iter().enumerate() {
+        let (left, right) =
+            match merge {
+                NativeDecoderBpeMergeJson::Text(value) => {
+                    let mut parts = value.split_whitespace();
+                    let left = parts.next().ok_or_else(|| {
+                        RuntimeError::NativeDecoderTokenizerInvalid {
+                            reason: format!("invalid BPE merge {value:?}"),
+                        }
+                    })?;
+                    let right = parts.next().ok_or_else(|| {
+                        RuntimeError::NativeDecoderTokenizerInvalid {
+                            reason: format!("invalid BPE merge {value:?}"),
+                        }
+                    })?;
+                    if parts.next().is_some() {
+                        return Err(RuntimeError::NativeDecoderTokenizerInvalid {
+                            reason: format!("invalid BPE merge {value:?}"),
+                        });
+                    }
+                    (left.to_string(), right.to_string())
+                }
+                NativeDecoderBpeMergeJson::Pair([left, right]) => (left.clone(), right.clone()),
+            };
+        ranks.insert((left, right), rank);
+    }
+    Ok(ranks)
+}
+
+fn decode_bpe_tokens(tokens: &[String]) -> String {
+    let mut text = String::new();
+    for token in tokens {
+        if let Some(rest) = token.strip_prefix('Ġ') {
+            if !text.is_empty() {
+                text.push(' ');
+            }
+            text.push_str(rest);
+        } else {
+            text.push_str(token);
+        }
+    }
+    text
 }
 
 /// Owned LLaMA-style layer weights decoded for native decoder execution.
@@ -1132,6 +1355,8 @@ impl NativeDecoderKvCache {
                 .map(|_| NativeDecoderLayerKvCache {
                     keys: Vec::new(),
                     values: Vec::new(),
+                    key_pages: Vec::new(),
+                    value_pages: Vec::new(),
                 })
                 .collect(),
             position: 0,
@@ -1165,6 +1390,8 @@ impl NativeDecoderKvCache {
 struct NativeDecoderLayerKvCache {
     keys: Vec<f32>,
     values: Vec<f32>,
+    key_pages: Vec<Vec<f32>>,
+    value_pages: Vec<Vec<f32>>,
 }
 
 /// Output from one native decoder step.
@@ -1185,6 +1412,9 @@ pub struct NativeDecoderGenerateOutput {
     pub generated_token_ids: Vec<i64>,
     /// Per-generation-step logits, one row per generated token.
     pub logits: Vec<Vec<f32>>,
+    /// Optional per-prompt-token logits. Empty unless
+    /// [`NativeDecoderRunOptions::return_prompt_logits`] is enabled.
+    pub prompt_logits: Vec<Vec<f32>>,
     /// Backend actually used by this run.
     pub backend: NativeDecoderBackend,
 }
@@ -2171,28 +2401,47 @@ fn native_decoder_cpu_greedy_decode(
             token_ids,
             generated_token_ids: Vec::new(),
             logits: Vec::new(),
+            prompt_logits: Vec::new(),
             backend,
         });
     }
 
     let mut sampler_rng =
         NativeDecoderSamplerRng::new(options.sampling.seed.unwrap_or(0x9E37_79B9_7F4A_7C15));
-    let eos_token_ids = if options.eos_token_ids.is_empty() {
-        weights.config.eos_token_ids.clone()
+    if options.min_new_tokens > options.max_new_tokens {
+        return Err(RuntimeError::NativeDecoderConfigInvalid {
+            reason: "min_new_tokens must be less than or equal to max_new_tokens".to_string(),
+        });
+    }
+    let stop_token_ids = if !options.stop_token_ids.is_empty() {
+        options.stop_token_ids.clone()
+    } else if !options.eos_token_ids.is_empty() {
+        options.eos_token_ids.clone()
     } else {
-        options.eos_token_ids
+        weights.config.eos_token_ids.clone()
     };
     let mut cache =
         native_decoder_kv_cache_with_performance(&weights.config, &options.performance)?;
     let mut last_step = None;
-    for &token_id in input_token_ids {
-        last_step = Some(native_decoder_cpu_step(
-            weights,
-            &mut cache,
-            token_id,
-            backend,
-            &options.performance,
-        )?);
+    let mut prompt_logits = Vec::new();
+    let prefill_chunk_size = options
+        .performance
+        .prefill_chunk_size
+        .unwrap_or(input_token_ids.len().max(1));
+    for chunk in input_token_ids.chunks(prefill_chunk_size) {
+        for &token_id in chunk {
+            let step = native_decoder_cpu_step(
+                weights,
+                &mut cache,
+                token_id,
+                backend,
+                &options.performance,
+            )?;
+            if options.return_prompt_logits {
+                prompt_logits.push(step.logits.clone());
+            }
+            last_step = Some(step);
+        }
     }
 
     let mut generated_token_ids = Vec::with_capacity(options.max_new_tokens);
@@ -2201,12 +2450,14 @@ fn native_decoder_cpu_greedy_decode(
         let step = last_step
             .take()
             .ok_or(RuntimeError::NativeDecoderPromptEmpty)?;
+        let adjusted_logits =
+            apply_native_decoder_repetition_penalty(&step.logits, &token_ids, &options.sampling)?;
         let next_token_id =
-            select_native_decoder_token(&step.logits, &options.sampling, &mut sampler_rng)?;
+            select_native_decoder_token(&adjusted_logits, &options.sampling, &mut sampler_rng)?;
         logits.push(step.logits);
         generated_token_ids.push(next_token_id);
         token_ids.push(next_token_id);
-        if eos_token_ids.contains(&next_token_id) {
+        if step_index + 1 >= options.min_new_tokens && stop_token_ids.contains(&next_token_id) {
             break;
         }
         if step_index + 1 < options.max_new_tokens {
@@ -2224,6 +2475,7 @@ fn native_decoder_cpu_greedy_decode(
         token_ids,
         generated_token_ids,
         logits,
+        prompt_logits,
         backend,
     })
 }
@@ -2316,12 +2568,22 @@ fn append_native_decoder_layer_cache(
     if let Some(page_size) = page_size_tokens {
         let page_width = cpu_element_count("kv_cache", "page", page_size, kv_width)?;
         if position % page_size == 0 {
-            cache.keys.reserve(page_width);
-            cache.values.reserve(page_width);
+            cache.key_pages.push(Vec::with_capacity(page_width));
+            cache.value_pages.push(Vec::with_capacity(page_width));
         }
+        let page_index = position / page_size;
+        let key_page = cache.key_pages.get_mut(page_index).ok_or_else(|| {
+            native_decoder_cpu_shape_error("kv_cache", format!("missing key page {page_index}"))
+        })?;
+        let value_page = cache.value_pages.get_mut(page_index).ok_or_else(|| {
+            native_decoder_cpu_shape_error("kv_cache", format!("missing value page {page_index}"))
+        })?;
+        key_page.extend_from_slice(key);
+        value_page.extend_from_slice(value);
+    } else {
+        cache.keys.extend_from_slice(key);
+        cache.values.extend_from_slice(value);
     }
-    cache.keys.extend_from_slice(key);
-    cache.values.extend_from_slice(value);
     Ok(())
 }
 
@@ -2345,6 +2607,13 @@ fn validate_native_decoder_sampling_options(options: &NativeDecoderSamplingOptio
             });
         }
     }
+    if let Some(repetition_penalty) = options.repetition_penalty {
+        if !repetition_penalty.is_finite() || repetition_penalty < 1.0 {
+            return Err(RuntimeError::NativeDecoderSamplingInvalid {
+                reason: "repetition_penalty must be finite and at least 1.0".to_string(),
+            });
+        }
+    }
     Ok(())
 }
 
@@ -2361,7 +2630,38 @@ fn validate_native_decoder_performance_options(
             reason: "cpu_threads must be positive".to_string(),
         });
     }
+    if matches!(options.prefill_chunk_size, Some(0)) {
+        return Err(RuntimeError::NativeDecoderConfigInvalid {
+            reason: "prefill_chunk_size must be positive".to_string(),
+        });
+    }
     Ok(())
+}
+
+fn apply_native_decoder_repetition_penalty(
+    logits: &[f32],
+    token_ids: &[i64],
+    sampling: &NativeDecoderSamplingOptions,
+) -> Result<Vec<f32>> {
+    let Some(penalty) = sampling.repetition_penalty else {
+        return Ok(logits.to_vec());
+    };
+    let mut adjusted = logits.to_vec();
+    for &token_id in token_ids {
+        let token_index =
+            usize::try_from(token_id).map_err(|_| RuntimeError::NativeDecoderTokenOutOfRange {
+                token_id,
+                vocab_size: logits.len(),
+            })?;
+        if let Some(logit) = adjusted.get_mut(token_index) {
+            if *logit < 0.0 {
+                *logit *= penalty;
+            } else {
+                *logit /= penalty;
+            }
+        }
+    }
+    Ok(adjusted)
 }
 
 fn select_native_decoder_token(
@@ -2526,6 +2826,7 @@ fn native_decoder_cpu_step(
             &hidden_states,
             cache.position,
             layer_cache,
+            cache.page_size_tokens,
             layer_weights.as_cpu(),
         )?;
         hidden_states = step.hidden_states;
@@ -2577,6 +2878,7 @@ fn native_decoder_cpu_llama_cached_step(
     hidden_states: &[f32],
     position: usize,
     cache: &NativeDecoderLayerKvCache,
+    page_size_tokens: Option<usize>,
     weights: NativeDecoderCpuLayerWeights<'_>,
 ) -> Result<NativeDecoderCpuCachedBlockOutput> {
     if config.family != NativeDecoderFamily::Llama {
@@ -2589,25 +2891,13 @@ fn native_decoder_cpu_llama_cached_step(
     let intermediate_size = config.intermediate_size;
     let head_dim = config.head_dim();
     let kv_width = config.key_value_width();
-    let expected_cache_len = cpu_element_count("llama_cached_step", "cache", position, kv_width)?;
     validate_cpu_vector_len(
         "llama_cached_step",
         "hidden_states",
         hidden_states.len(),
         hidden_size,
     )?;
-    validate_cpu_vector_len(
-        "llama_cached_step",
-        "key_cache",
-        cache.keys.len(),
-        expected_cache_len,
-    )?;
-    validate_cpu_vector_len(
-        "llama_cached_step",
-        "value_cache",
-        cache.values.len(),
-        expected_cache_len,
-    )?;
+    validate_native_decoder_layer_cache(cache, position, kv_width, page_size_tokens)?;
 
     let normalized = native_decoder_cpu_rms_norm(
         hidden_states,
@@ -2637,19 +2927,17 @@ fn native_decoder_cpu_llama_cached_step(
         config.rope_theta,
     )?;
 
-    let mut key_context = cache.keys.clone();
-    key_context.extend_from_slice(&key);
-    let mut value_context = cache.values.clone();
-    value_context.extend_from_slice(&value);
-    let attention = native_decoder_cpu_cached_attention(
-        &query,
-        &key_context,
-        &value_context,
-        position + 1,
-        config.num_attention_heads,
-        config.num_key_value_heads,
+    let attention = native_decoder_cpu_layer_cached_attention(NativeDecoderLayerAttentionInput {
+        query: &query,
+        cache,
+        current_key: &key,
+        current_value: &value,
+        page_size_tokens,
+        cache_len: position + 1,
+        num_attention_heads: config.num_attention_heads,
+        num_key_value_heads: config.num_key_value_heads,
         head_dim,
-    )?;
+    })?;
     let attention_projected =
         native_decoder_cpu_linear(&attention, 1, hidden_size, weights.o_proj, hidden_size)?;
     let attention_residual = add_same_shape(
@@ -2703,6 +2991,256 @@ fn native_decoder_cpu_llama_cached_step(
         key,
         value,
     })
+}
+
+fn validate_native_decoder_layer_cache(
+    cache: &NativeDecoderLayerKvCache,
+    position: usize,
+    kv_width: usize,
+    page_size_tokens: Option<usize>,
+) -> Result<()> {
+    let expected_cache_len = cpu_element_count("llama_cached_step", "cache", position, kv_width)?;
+    if let Some(page_size) = page_size_tokens {
+        let expected_pages = position.div_ceil(page_size);
+        if cache.key_pages.len() != expected_pages || cache.value_pages.len() != expected_pages {
+            return Err(native_decoder_cpu_shape_error(
+                "llama_cached_step",
+                format!(
+                    "paged cache has {}/{} key/value pages, expected {expected_pages}",
+                    cache.key_pages.len(),
+                    cache.value_pages.len()
+                ),
+            ));
+        }
+        let mut key_len = 0usize;
+        let mut value_len = 0usize;
+        for page in &cache.key_pages {
+            key_len = key_len.checked_add(page.len()).ok_or_else(|| {
+                native_decoder_cpu_shape_error("llama_cached_step", "key page length overflow")
+            })?;
+        }
+        for page in &cache.value_pages {
+            value_len = value_len.checked_add(page.len()).ok_or_else(|| {
+                native_decoder_cpu_shape_error("llama_cached_step", "value page length overflow")
+            })?;
+        }
+        validate_cpu_vector_len(
+            "llama_cached_step",
+            "key_pages",
+            key_len,
+            expected_cache_len,
+        )?;
+        validate_cpu_vector_len(
+            "llama_cached_step",
+            "value_pages",
+            value_len,
+            expected_cache_len,
+        )?;
+        Ok(())
+    } else {
+        validate_cpu_vector_len(
+            "llama_cached_step",
+            "key_cache",
+            cache.keys.len(),
+            expected_cache_len,
+        )?;
+        validate_cpu_vector_len(
+            "llama_cached_step",
+            "value_cache",
+            cache.values.len(),
+            expected_cache_len,
+        )
+    }
+}
+
+struct NativeDecoderLayerAttentionInput<'a> {
+    query: &'a [f32],
+    cache: &'a NativeDecoderLayerKvCache,
+    current_key: &'a [f32],
+    current_value: &'a [f32],
+    page_size_tokens: Option<usize>,
+    cache_len: usize,
+    num_attention_heads: usize,
+    num_key_value_heads: usize,
+    head_dim: usize,
+}
+
+fn native_decoder_cpu_layer_cached_attention(
+    input: NativeDecoderLayerAttentionInput<'_>,
+) -> Result<Vec<f32>> {
+    validate_cpu_positive("layer_cached_attention", "cache_len", input.cache_len)?;
+    validate_cpu_positive(
+        "layer_cached_attention",
+        "num_attention_heads",
+        input.num_attention_heads,
+    )?;
+    validate_cpu_positive(
+        "layer_cached_attention",
+        "num_key_value_heads",
+        input.num_key_value_heads,
+    )?;
+    validate_cpu_positive("layer_cached_attention", "head_dim", input.head_dim)?;
+    if input.num_attention_heads % input.num_key_value_heads != 0 {
+        return Err(native_decoder_cpu_shape_error(
+            "layer_cached_attention",
+            "num_attention_heads must be divisible by num_key_value_heads",
+        ));
+    }
+    let query_width = cpu_element_count(
+        "layer_cached_attention",
+        "query width",
+        input.num_attention_heads,
+        input.head_dim,
+    )?;
+    let kv_width = cpu_element_count(
+        "layer_cached_attention",
+        "key/value width",
+        input.num_key_value_heads,
+        input.head_dim,
+    )?;
+    validate_cpu_vector_len(
+        "layer_cached_attention",
+        "query",
+        input.query.len(),
+        query_width,
+    )?;
+    validate_cpu_vector_len(
+        "layer_cached_attention",
+        "current_key",
+        input.current_key.len(),
+        kv_width,
+    )?;
+    validate_cpu_vector_len(
+        "layer_cached_attention",
+        "current_value",
+        input.current_value.len(),
+        kv_width,
+    )?;
+
+    let groups = input.num_attention_heads / input.num_key_value_heads;
+    let scale = 1.0 / (input.head_dim as f32).sqrt();
+    let mut output = vec![0.0f32; query_width];
+    for head in 0..input.num_attention_heads {
+        let kv_head = head / groups;
+        let query_offset = head * input.head_dim;
+        let mut scores = vec![0.0f32; input.cache_len];
+        for (key_token, score) in scores.iter_mut().enumerate() {
+            let key_values = native_decoder_cache_kv_slice(NativeDecoderCacheSliceRequest {
+                cache: input.cache,
+                current: input.current_key,
+                page_size_tokens: input.page_size_tokens,
+                token: key_token,
+                current_position: input.cache_len - 1,
+                kv_width,
+                kv_head,
+                head_dim: input.head_dim,
+                key: true,
+            })?;
+            *score = dot_product(
+                &input.query[query_offset..query_offset + input.head_dim],
+                key_values,
+            ) * scale;
+        }
+        let max_score = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let mut weight_sum = 0.0f32;
+        for score in &mut scores {
+            *score = (*score - max_score).exp();
+            weight_sum += *score;
+        }
+        let output_offset = head * input.head_dim;
+        for (key_token, score) in scores.iter().enumerate() {
+            let attention_weight = *score / weight_sum;
+            let value_values = native_decoder_cache_kv_slice(NativeDecoderCacheSliceRequest {
+                cache: input.cache,
+                current: input.current_value,
+                page_size_tokens: input.page_size_tokens,
+                token: key_token,
+                current_position: input.cache_len - 1,
+                kv_width,
+                kv_head,
+                head_dim: input.head_dim,
+                key: false,
+            })?;
+            for dim in 0..input.head_dim {
+                output[output_offset + dim] += attention_weight * value_values[dim];
+            }
+        }
+    }
+    Ok(output)
+}
+
+struct NativeDecoderCacheSliceRequest<'a> {
+    cache: &'a NativeDecoderLayerKvCache,
+    current: &'a [f32],
+    page_size_tokens: Option<usize>,
+    token: usize,
+    current_position: usize,
+    kv_width: usize,
+    kv_head: usize,
+    head_dim: usize,
+    key: bool,
+}
+
+fn native_decoder_cache_kv_slice<'a>(
+    request: NativeDecoderCacheSliceRequest<'a>,
+) -> Result<&'a [f32]> {
+    let offset_in_token = request
+        .kv_head
+        .checked_mul(request.head_dim)
+        .ok_or_else(|| {
+            native_decoder_cpu_shape_error("layer_cached_attention", "head offset overflow")
+        })?;
+    if request.token == request.current_position {
+        return request
+            .current
+            .get(offset_in_token..offset_in_token + request.head_dim)
+            .ok_or_else(|| {
+                native_decoder_cpu_shape_error(
+                    "layer_cached_attention",
+                    "current kv slice out of range",
+                )
+            });
+    }
+    if let Some(page_size) = request.page_size_tokens {
+        let page_index = request.token / page_size;
+        let page_token = request.token % page_size;
+        let page = if request.key {
+            request.cache.key_pages.get(page_index)
+        } else {
+            request.cache.value_pages.get(page_index)
+        }
+        .ok_or_else(|| {
+            native_decoder_cpu_shape_error(
+                "layer_cached_attention",
+                format!("missing cache page {page_index}"),
+            )
+        })?;
+        let base = page_token
+            .checked_mul(request.kv_width)
+            .and_then(|base| base.checked_add(offset_in_token))
+            .ok_or_else(|| {
+                native_decoder_cpu_shape_error("layer_cached_attention", "page kv offset overflow")
+            })?;
+        page.get(base..base + request.head_dim).ok_or_else(|| {
+            native_decoder_cpu_shape_error("layer_cached_attention", "page kv slice out of range")
+        })
+    } else {
+        let base = request
+            .token
+            .checked_mul(request.kv_width)
+            .and_then(|base| base.checked_add(offset_in_token))
+            .ok_or_else(|| {
+                native_decoder_cpu_shape_error("layer_cached_attention", "flat kv offset overflow")
+            })?;
+        let values = if request.key {
+            &request.cache.keys
+        } else {
+            &request.cache.values
+        };
+        values.get(base..base + request.head_dim).ok_or_else(|| {
+            native_decoder_cpu_shape_error("layer_cached_attention", "flat kv slice out of range")
+        })
+    }
 }
 
 fn native_decoder_cpu_logits(
@@ -3486,6 +4024,7 @@ impl Engine {
             generated_text,
             text,
             logits: output.logits,
+            prompt_logits: output.prompt_logits,
             backend: output.backend,
         })
     }
@@ -6457,6 +6996,17 @@ mod tests {
     };
     use tempfile::tempdir;
 
+    #[derive(Debug, Deserialize)]
+    struct TinyHfNativeDecoderReference {
+        prompt: String,
+        prompt_token_ids: Vec<i64>,
+        max_new_tokens: usize,
+        expected_generated_token_ids: Vec<i64>,
+        expected_text: String,
+        expected_logits: Vec<Vec<f32>>,
+        tolerance_abs: f32,
+    }
+
     #[test]
     fn native_decoder_config_parses_llama_defaults() {
         let config = NativeDecoderConfig::from_hf_config_json(
@@ -6615,16 +7165,11 @@ mod tests {
 
     #[test]
     fn engine_native_decoder_tokenizer_rejects_unsupported_model_type() {
-        let dir = tempdir().unwrap();
-        let engine = tiny_native_decoder_engine(
-            dir.path().join("native-decoder-bpe-tokenizer.rsmf"),
-            NativeDecoderFixtureOptions::default(),
-        );
-
-        let err = engine.native_decoder_tokenizer().unwrap_err();
+        let err =
+            NativeDecoderTokenizer::from_json(br#"{"model": {"type": "Unigram"}}"#).unwrap_err();
 
         assert!(
-            matches!(err, RuntimeError::NativeDecoderTokenizerInvalid { reason } if reason.contains("only WordLevel"))
+            matches!(err, RuntimeError::NativeDecoderTokenizerInvalid { reason } if reason.contains("only WordLevel and BPE"))
         );
     }
 
@@ -6638,6 +7183,79 @@ mod tests {
 
         assert!(
             matches!(err, RuntimeError::NativeDecoderTokenizerTokenUnknown { token } if token == "missing")
+        );
+    }
+
+    #[test]
+    fn native_decoder_bpe_tokenizer_encodes_merges_and_bytelevel_space() {
+        let tokenizer = NativeDecoderTokenizer::from_json(
+            serde_json::json!({
+                "model": {
+                    "type": "BPE",
+                    "vocab": {
+                        "h": 0,
+                        "e": 1,
+                        "l": 2,
+                        "o": 3,
+                        "hello": 4,
+                        "Ġworld": 5,
+                        "<unk>": 6
+                    },
+                    "merges": ["h e", "he l", "hel l", "hell o"],
+                    "unk_token": "<unk>"
+                },
+                "pre_tokenizer": { "type": "ByteLevel", "add_prefix_space": false }
+            })
+            .to_string()
+            .as_bytes(),
+        )
+        .unwrap();
+
+        assert_eq!(tokenizer.encode("hello world").unwrap(), vec![4, 5]);
+        assert_eq!(tokenizer.decode(&[4, 5]).unwrap(), "hello world");
+    }
+
+    #[test]
+    fn native_decoder_bpe_tokenizer_accepts_added_special_tokens() {
+        let tokenizer = NativeDecoderTokenizer::from_json(
+            serde_json::json!({
+                "model": {
+                    "type": "BPE",
+                    "vocab": { "hello": 0, "<unk>": 1 },
+                    "merges": [],
+                    "unk_token": "<unk>"
+                },
+                "added_tokens": [
+                    { "id": 2, "content": "<eos>", "special": true }
+                ]
+            })
+            .to_string()
+            .as_bytes(),
+        )
+        .unwrap();
+
+        assert_eq!(tokenizer.encode("<eos>").unwrap(), vec![2]);
+        assert_eq!(tokenizer.decode(&[2]).unwrap(), "<eos>");
+    }
+
+    #[test]
+    fn native_decoder_tokenizer_rejects_unsupported_normalizer() {
+        let err = NativeDecoderTokenizer::from_json(
+            serde_json::json!({
+                "normalizer": { "type": "Lowercase" },
+                "model": {
+                    "type": "BPE",
+                    "vocab": { "hello": 0 },
+                    "merges": []
+                }
+            })
+            .to_string()
+            .as_bytes(),
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(err, RuntimeError::NativeDecoderTokenizerInvalid { reason } if reason.contains("normalizer"))
         );
     }
 
@@ -6687,6 +7305,125 @@ mod tests {
     }
 
     #[test]
+    fn engine_native_decoder_return_prompt_logits_reports_prefill_rows() {
+        let dir = tempdir().unwrap();
+        let engine = tiny_native_decoder_generation_engine(dir.path().join("native-decode.rsmf"));
+
+        let output = engine
+            .native_decoder_greedy_decode(
+                &[0, 1],
+                NativeDecoderRunOptions {
+                    max_new_tokens: 1,
+                    return_prompt_logits: true,
+                    performance: NativeDecoderPerformanceOptions {
+                        prefill_chunk_size: Some(1),
+                        ..NativeDecoderPerformanceOptions::default()
+                    },
+                    ..NativeDecoderRunOptions::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(output.prompt_logits.len(), 2);
+        assert_eq!(output.prompt_logits[0].len(), 4);
+        assert_eq!(output.generated_token_ids, vec![2]);
+    }
+
+    #[test]
+    fn engine_native_decoder_stop_token_override_stops_before_config_eos() {
+        let dir = tempdir().unwrap();
+        let engine = tiny_native_decoder_generation_engine(dir.path().join("native-decode.rsmf"));
+
+        let output = engine
+            .native_decoder_greedy_decode(
+                &[0],
+                NativeDecoderRunOptions {
+                    max_new_tokens: 3,
+                    stop_token_ids: vec![1],
+                    ..NativeDecoderRunOptions::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(output.generated_token_ids, vec![1]);
+    }
+
+    #[test]
+    fn engine_native_decoder_min_new_tokens_delays_stop_token() {
+        let dir = tempdir().unwrap();
+        let engine = tiny_native_decoder_generation_engine(dir.path().join("native-decode.rsmf"));
+
+        let output = engine
+            .native_decoder_greedy_decode(
+                &[1],
+                NativeDecoderRunOptions {
+                    max_new_tokens: 2,
+                    min_new_tokens: 2,
+                    ..NativeDecoderRunOptions::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(output.generated_token_ids.len(), 2);
+        assert_eq!(output.generated_token_ids[0], 2);
+    }
+
+    #[test]
+    fn native_decoder_repetition_penalty_can_change_argmax() {
+        let adjusted = apply_native_decoder_repetition_penalty(
+            &[10.0, 9.0],
+            &[0],
+            &NativeDecoderSamplingOptions {
+                repetition_penalty: Some(2.0),
+                ..NativeDecoderSamplingOptions::default()
+            },
+        )
+        .unwrap();
+        let token = select_native_decoder_token(
+            &adjusted,
+            &NativeDecoderSamplingOptions::default(),
+            &mut NativeDecoderSamplerRng::new(1),
+        )
+        .unwrap();
+
+        assert_eq!(token, 1);
+    }
+
+    #[test]
+    fn native_decoder_sampling_rejects_invalid_repetition_penalty() {
+        let err = validate_native_decoder_sampling_options(&NativeDecoderSamplingOptions {
+            repetition_penalty: Some(0.5),
+            ..NativeDecoderSamplingOptions::default()
+        })
+        .unwrap_err();
+
+        assert!(
+            matches!(err, RuntimeError::NativeDecoderSamplingInvalid { reason } if reason.contains("repetition_penalty"))
+        );
+    }
+
+    #[test]
+    fn engine_native_decoder_rejects_min_new_tokens_above_max() {
+        let dir = tempdir().unwrap();
+        let engine = tiny_native_decoder_generation_engine(dir.path().join("native-decode.rsmf"));
+
+        let err = engine
+            .native_decoder_greedy_decode(
+                &[0],
+                NativeDecoderRunOptions {
+                    max_new_tokens: 1,
+                    min_new_tokens: 2,
+                    ..NativeDecoderRunOptions::default()
+                },
+            )
+            .unwrap_err();
+
+        assert!(
+            matches!(err, RuntimeError::NativeDecoderConfigInvalid { reason } if reason.contains("min_new_tokens"))
+        );
+    }
+
+    #[test]
     fn engine_native_decoder_sampling_top_k_one_matches_greedy() {
         let dir = tempdir().unwrap();
         let engine = tiny_native_decoder_generation_engine(dir.path().join("native-decode.rsmf"));
@@ -6701,6 +7438,7 @@ mod tests {
                         top_k: Some(1),
                         top_p: Some(1.0),
                         seed: Some(42),
+                        ..NativeDecoderSamplingOptions::default()
                     },
                     ..NativeDecoderRunOptions::default()
                 },
@@ -6753,6 +7491,53 @@ mod tests {
         assert_eq!(report.compared_logits, 2);
         assert_eq!(report.compared_values, 8);
         assert!(report.max_abs_diff <= 1e-5);
+    }
+
+    #[test]
+    fn engine_native_decoder_matches_local_hf_reference_fixture() {
+        let fixture: TinyHfNativeDecoderReference = serde_json::from_str(include_str!(
+            "../tests/fixtures/tiny_hf_native_decoder_reference.json"
+        ))
+        .unwrap();
+        let dir = tempdir().unwrap();
+        let engine = tiny_native_decoder_generation_engine(dir.path().join("native-decode.rsmf"));
+        let tokenizer = engine.native_decoder_tokenizer().unwrap();
+
+        assert_eq!(
+            tokenizer.encode(&fixture.prompt).unwrap(),
+            fixture.prompt_token_ids
+        );
+        let report = engine
+            .native_decoder_check_reference_logits(NativeDecoderReferenceLogitCheck {
+                input_token_ids: fixture
+                    .prompt_token_ids
+                    .iter()
+                    .chain(fixture.expected_generated_token_ids.iter().take(1))
+                    .copied()
+                    .collect(),
+                expected_logits: fixture.expected_logits.clone(),
+                tolerance_abs: fixture.tolerance_abs,
+                backend: NativeDecoderBackend::CpuReference,
+                weight_options: NativeDecoderWeightOptions::default(),
+                performance: NativeDecoderPerformanceOptions::default(),
+            })
+            .unwrap();
+        assert_eq!(report.compared_logits, fixture.expected_logits.len());
+
+        let output = engine
+            .native_decoder_generate_text(
+                &fixture.prompt,
+                NativeDecoderRunOptions {
+                    max_new_tokens: fixture.max_new_tokens,
+                    ..NativeDecoderRunOptions::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            output.generated_token_ids,
+            fixture.expected_generated_token_ids
+        );
+        assert_eq!(output.text, fixture.expected_text);
     }
 
     #[test]
@@ -6894,6 +7679,40 @@ mod tests {
         .unwrap();
         assert_eq!(cache.position(), 3);
         assert_eq!(cache.allocated_pages(), 2);
+    }
+
+    #[test]
+    fn engine_native_decoder_paged_generation_matches_flat_cache() {
+        let dir = tempdir().unwrap();
+        let engine = tiny_native_decoder_generation_engine(dir.path().join("native-decode.rsmf"));
+        let flat = engine
+            .native_decoder_greedy_decode(
+                &[0, 1, 0],
+                NativeDecoderRunOptions {
+                    max_new_tokens: 2,
+                    stop_token_ids: vec![3],
+                    ..NativeDecoderRunOptions::default()
+                },
+            )
+            .unwrap();
+        let paged = engine
+            .native_decoder_greedy_decode(
+                &[0, 1, 0],
+                NativeDecoderRunOptions {
+                    max_new_tokens: 2,
+                    stop_token_ids: vec![3],
+                    performance: NativeDecoderPerformanceOptions {
+                        kv_cache_page_size_tokens: Some(1),
+                        prefill_chunk_size: Some(2),
+                        ..NativeDecoderPerformanceOptions::default()
+                    },
+                    ..NativeDecoderRunOptions::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(paged.generated_token_ids, flat.generated_token_ids);
+        assert_eq!(paged.logits, flat.logits);
     }
 
     #[test]

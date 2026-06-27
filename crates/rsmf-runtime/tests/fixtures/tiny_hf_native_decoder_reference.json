@@ -1,0 +1,13 @@
+{
+  "source": "synthetic-hf-compatible-tiny-llama-export",
+  "prompt": "zero",
+  "prompt_token_ids": [0],
+  "max_new_tokens": 2,
+  "expected_generated_token_ids": [1, 2],
+  "expected_text": "zero one two",
+  "expected_logits": [
+    [0.0, 1.4142121, 0.0, -1.4142121],
+    [0.0, 0.0, 1.4142121, -1.4142121]
+  ],
+  "tolerance_abs": 0.00001
+}
