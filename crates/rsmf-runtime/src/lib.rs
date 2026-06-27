@@ -809,6 +809,15 @@ pub enum NativeDecoderBackend {
     CpuReference,
     /// CPU backend with threaded output-logit projection.
     CpuThreaded,
+    /// macOS Accelerate / vecLib BLAS backend for f32 linear projections.
+    AppleCpuAccelerate,
+    /// Reserved Metal/WGPU backend for LM-head projection.
+    MetalWgpuLmHead,
+    /// Reserved Metal/WGPU backend for full native decoder kernels.
+    MetalWgpuFullDecoder,
+    /// Reserved ONNX Runtime CoreML execution-provider backend for graph
+    /// payloads, not the native decoder path.
+    OrtCoreMl,
     /// Select the best available accelerated backend in this build.
     Accelerated,
 }
@@ -1166,6 +1175,59 @@ pub struct NativeDecoderTextGenerateOutput {
     pub prompt_logits: Vec<Vec<f32>>,
     /// Backend actually used by this run.
     pub backend: NativeDecoderBackend,
+}
+
+/// Resident native decoder session with decoded weights and tokenizer cached in
+/// memory.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NativeDecoderSession {
+    /// Decoded native decoder weights.
+    pub weights: NativeDecoderWeights,
+    /// Decoded native decoder tokenizer.
+    pub tokenizer: NativeDecoderTokenizer,
+}
+
+impl NativeDecoderSession {
+    /// Generate token ids without reloading weights from the RSMF file.
+    pub fn generate_token_ids(
+        &self,
+        input_token_ids: &[i64],
+        options: NativeDecoderRunOptions,
+    ) -> Result<NativeDecoderGenerateOutput> {
+        let backend = resolve_native_decoder_backend(options.backend)?;
+        native_decoder_generate_with_backend(&self.weights, input_token_ids, options, backend)
+    }
+
+    /// Generate text without reloading weights or tokenizer from the RSMF file.
+    pub fn generate_text(
+        &self,
+        prompt: &str,
+        options: NativeDecoderRunOptions,
+    ) -> Result<NativeDecoderTextGenerateOutput> {
+        let prompt_token_ids = self.tokenizer.encode(prompt)?;
+        let output = self.generate_token_ids(&prompt_token_ids, options)?;
+        let generated_text = self.tokenizer.decode(&output.generated_token_ids)?;
+        let text = self.tokenizer.decode(&output.token_ids)?;
+        Ok(NativeDecoderTextGenerateOutput {
+            prompt: prompt.to_string(),
+            token_ids: output.token_ids,
+            generated_token_ids: output.generated_token_ids,
+            generated_text,
+            text,
+            logits: output.logits,
+            prompt_logits: output.prompt_logits,
+            backend: output.backend,
+        })
+    }
+
+    /// Compare logits against a supplied reference without reloading weights.
+    pub fn check_reference_logits(
+        &self,
+        check: NativeDecoderReferenceLogitCheck,
+    ) -> Result<NativeDecoderReferenceLogitReport> {
+        let backend = resolve_native_decoder_backend(check.backend)?;
+        native_decoder_check_reference_logits(&self.weights, check, backend)
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -2196,13 +2258,58 @@ fn add_same_shape(
 
 fn resolve_native_decoder_backend(backend: NativeDecoderBackend) -> Result<NativeDecoderBackend> {
     match backend {
-        NativeDecoderBackend::Auto | NativeDecoderBackend::CpuReference => {
-            Ok(NativeDecoderBackend::CpuReference)
+        NativeDecoderBackend::Auto | NativeDecoderBackend::CpuReference => Ok(NativeDecoderBackend::CpuReference),
+        NativeDecoderBackend::CpuThreaded => Ok(NativeDecoderBackend::CpuThreaded),
+        NativeDecoderBackend::AppleCpuAccelerate | NativeDecoderBackend::Accelerated => {
+            if apple_accelerate_available() {
+                Ok(NativeDecoderBackend::AppleCpuAccelerate)
+            } else {
+                Ok(NativeDecoderBackend::CpuReference)
+            }
         }
-        NativeDecoderBackend::CpuThreaded | NativeDecoderBackend::Accelerated => {
-            Ok(NativeDecoderBackend::CpuThreaded)
+        NativeDecoderBackend::MetalWgpuLmHead => Err(RuntimeError::NativeDecoderBackendUnavailable {
+            backend: "metal_wgpu_lm_head".to_string(),
+            reason: "Metal/WGPU LM-head projection kernels are not implemented yet".to_string(),
+        }),
+        NativeDecoderBackend::MetalWgpuFullDecoder => {
+            Err(RuntimeError::NativeDecoderBackendUnavailable {
+                backend: "metal_wgpu_full_decoder".to_string(),
+                reason: "Metal/WGPU full decoder kernels are not implemented yet".to_string(),
+            })
         }
+        NativeDecoderBackend::OrtCoreMl => Err(RuntimeError::NativeDecoderBackendUnavailable {
+            backend: "ort_core_ml".to_string(),
+            reason: "ORT CoreML execution provider applies to graph payloads, not the native decoder path yet".to_string(),
+        }),
     }
+}
+
+fn native_decoder_generate_with_backend(
+    weights: &NativeDecoderWeights,
+    input_token_ids: &[i64],
+    options: NativeDecoderRunOptions,
+    backend: NativeDecoderBackend,
+) -> Result<NativeDecoderGenerateOutput> {
+    match backend {
+        NativeDecoderBackend::CpuReference
+        | NativeDecoderBackend::CpuThreaded
+        | NativeDecoderBackend::AppleCpuAccelerate => {
+            native_decoder_cpu_greedy_decode(weights, input_token_ids, options, backend)
+        }
+        NativeDecoderBackend::Auto
+        | NativeDecoderBackend::Accelerated
+        | NativeDecoderBackend::MetalWgpuLmHead
+        | NativeDecoderBackend::MetalWgpuFullDecoder
+        | NativeDecoderBackend::OrtCoreMl => Err(RuntimeError::NativeDecoderBackendUnavailable {
+            backend: format!("{backend:?}"),
+            reason: "backend selector did not resolve to an executable native decoder backend"
+                .to_string(),
+        }),
+    }
+}
+
+fn apple_accelerate_available() -> bool {
+    cfg!(all(target_os = "macos", feature = "apple-accelerate"))
 }
 
 fn load_native_decoder_weights(
@@ -2827,6 +2934,10 @@ fn native_decoder_cpu_step(
             cache.position,
             layer_cache,
             cache.page_size_tokens,
+            NativeDecoderLinearBackend {
+                backend,
+                performance,
+            },
             layer_weights.as_cpu(),
         )?;
         hidden_states = step.hidden_states;
@@ -2873,12 +2984,19 @@ struct NativeDecoderCpuCachedBlockOutput {
     value: Vec<f32>,
 }
 
+#[derive(Clone, Copy)]
+struct NativeDecoderLinearBackend<'a> {
+    backend: NativeDecoderBackend,
+    performance: &'a NativeDecoderPerformanceOptions,
+}
+
 fn native_decoder_cpu_llama_cached_step(
     config: &NativeDecoderConfig,
     hidden_states: &[f32],
     position: usize,
     cache: &NativeDecoderLayerKvCache,
     page_size_tokens: Option<usize>,
+    linear_backend: NativeDecoderLinearBackend<'_>,
     weights: NativeDecoderCpuLayerWeights<'_>,
 ) -> Result<NativeDecoderCpuCachedBlockOutput> {
     if config.family != NativeDecoderFamily::Llama {
@@ -2906,10 +3024,33 @@ fn native_decoder_cpu_llama_cached_step(
         weights.input_layernorm,
         config.rms_norm_eps,
     )?;
-    let mut query =
-        native_decoder_cpu_linear(&normalized, 1, hidden_size, weights.q_proj, hidden_size)?;
-    let mut key = native_decoder_cpu_linear(&normalized, 1, hidden_size, weights.k_proj, kv_width)?;
-    let value = native_decoder_cpu_linear(&normalized, 1, hidden_size, weights.v_proj, kv_width)?;
+    let mut query = native_decoder_backend_linear(
+        &normalized,
+        1,
+        hidden_size,
+        weights.q_proj,
+        hidden_size,
+        linear_backend.backend,
+        linear_backend.performance,
+    )?;
+    let mut key = native_decoder_backend_linear(
+        &normalized,
+        1,
+        hidden_size,
+        weights.k_proj,
+        kv_width,
+        linear_backend.backend,
+        linear_backend.performance,
+    )?;
+    let value = native_decoder_backend_linear(
+        &normalized,
+        1,
+        hidden_size,
+        weights.v_proj,
+        kv_width,
+        linear_backend.backend,
+        linear_backend.performance,
+    )?;
     native_decoder_cpu_apply_llama_rope(
         &mut query,
         1,
@@ -2938,8 +3079,15 @@ fn native_decoder_cpu_llama_cached_step(
         num_key_value_heads: config.num_key_value_heads,
         head_dim,
     })?;
-    let attention_projected =
-        native_decoder_cpu_linear(&attention, 1, hidden_size, weights.o_proj, hidden_size)?;
+    let attention_projected = native_decoder_backend_linear(
+        &attention,
+        1,
+        hidden_size,
+        weights.o_proj,
+        hidden_size,
+        linear_backend.backend,
+        linear_backend.performance,
+    )?;
     let attention_residual = add_same_shape(
         "llama_cached_step",
         hidden_states,
@@ -2953,31 +3101,37 @@ fn native_decoder_cpu_llama_cached_step(
         weights.post_attention_layernorm,
         config.rms_norm_eps,
     )?;
-    let gate = native_decoder_cpu_linear(
+    let gate = native_decoder_backend_linear(
         &mlp_normalized,
         1,
         hidden_size,
         weights.gate_proj,
         intermediate_size,
+        linear_backend.backend,
+        linear_backend.performance,
     )?;
-    let up = native_decoder_cpu_linear(
+    let up = native_decoder_backend_linear(
         &mlp_normalized,
         1,
         hidden_size,
         weights.up_proj,
         intermediate_size,
+        linear_backend.backend,
+        linear_backend.performance,
     )?;
     let activated = gate
         .iter()
         .zip(up.iter())
         .map(|(gate, up)| native_decoder_cpu_silu(*gate) * up)
         .collect::<Vec<_>>();
-    let mlp_projected = native_decoder_cpu_linear(
+    let mlp_projected = native_decoder_backend_linear(
         &activated,
         1,
         intermediate_size,
         weights.down_proj,
         hidden_size,
+        linear_backend.backend,
+        linear_backend.performance,
     )?;
     let hidden_states = add_same_shape(
         "llama_cached_step",
@@ -3252,6 +3406,15 @@ fn native_decoder_cpu_logits(
     performance: &NativeDecoderPerformanceOptions,
 ) -> Result<Vec<f32>> {
     match backend {
+        NativeDecoderBackend::AppleCpuAccelerate => native_decoder_backend_linear(
+            normalized,
+            1,
+            hidden_size,
+            lm_head,
+            vocab_size,
+            backend,
+            performance,
+        ),
         NativeDecoderBackend::CpuThreaded => native_decoder_cpu_linear_threaded(
             normalized,
             1,
@@ -3266,9 +3429,175 @@ fn native_decoder_cpu_logits(
         ),
         NativeDecoderBackend::CpuReference
         | NativeDecoderBackend::Auto
-        | NativeDecoderBackend::Accelerated => {
+        | NativeDecoderBackend::Accelerated
+        | NativeDecoderBackend::MetalWgpuLmHead
+        | NativeDecoderBackend::MetalWgpuFullDecoder
+        | NativeDecoderBackend::OrtCoreMl => {
             native_decoder_cpu_linear(normalized, 1, hidden_size, lm_head, vocab_size)
         }
+    }
+}
+
+fn native_decoder_backend_linear(
+    input: &[f32],
+    rows: usize,
+    in_features: usize,
+    weight: &[f32],
+    out_features: usize,
+    backend: NativeDecoderBackend,
+    performance: &NativeDecoderPerformanceOptions,
+) -> Result<Vec<f32>> {
+    match backend {
+        NativeDecoderBackend::AppleCpuAccelerate => {
+            native_decoder_apple_accelerate_linear(input, rows, in_features, weight, out_features)
+        }
+        NativeDecoderBackend::CpuThreaded if rows > 1 => native_decoder_cpu_linear_threaded(
+            input,
+            rows,
+            in_features,
+            weight,
+            out_features,
+            performance.cpu_threads.unwrap_or_else(|| {
+                std::thread::available_parallelism()
+                    .map(usize::from)
+                    .unwrap_or(1)
+            }),
+        ),
+        _ => native_decoder_cpu_linear(input, rows, in_features, weight, out_features),
+    }
+}
+
+#[cfg(all(target_os = "macos", feature = "apple-accelerate"))]
+fn native_decoder_apple_accelerate_linear(
+    input: &[f32],
+    rows: usize,
+    in_features: usize,
+    weight: &[f32],
+    out_features: usize,
+) -> Result<Vec<f32>> {
+    validate_cpu_matrix_len(
+        "linear_apple_accelerate",
+        "input",
+        input.len(),
+        rows,
+        in_features,
+    )?;
+    validate_cpu_matrix_len(
+        "linear_apple_accelerate",
+        "weight",
+        weight.len(),
+        out_features,
+        in_features,
+    )?;
+    let output_len = cpu_element_count("linear_apple_accelerate", "output", rows, out_features)?;
+    let mut output = vec![0.0f32; output_len];
+    let rows_i32 = i32::try_from(rows).map_err(|_| {
+        native_decoder_cpu_shape_error("linear_apple_accelerate", "rows exceed i32")
+    })?;
+    let in_i32 = i32::try_from(in_features).map_err(|_| {
+        native_decoder_cpu_shape_error("linear_apple_accelerate", "in_features exceed i32")
+    })?;
+    let out_i32 = i32::try_from(out_features).map_err(|_| {
+        native_decoder_cpu_shape_error("linear_apple_accelerate", "out_features exceed i32")
+    })?;
+    if rows == 1 {
+        // SAFETY: All pointers are derived from validated Rust slices. Matrix
+        // dimensions and strides are checked above and converted to the CBLAS
+        // `i32` ABI before the call. Output is uniquely borrowed and sized for
+        // `out_features` elements.
+        unsafe {
+            apple_accelerate::cblas_sgemv(
+                apple_accelerate::CBLAS_ROW_MAJOR,
+                apple_accelerate::CBLAS_NO_TRANS,
+                out_i32,
+                in_i32,
+                1.0,
+                weight.as_ptr(),
+                in_i32,
+                input.as_ptr(),
+                1,
+                0.0,
+                output.as_mut_ptr(),
+                1,
+            );
+        }
+    } else {
+        // SAFETY: All pointers are derived from validated Rust slices. A is
+        // row-major `[rows, in_features]`, B is row-major
+        // `[out_features, in_features]` and is passed transposed, and C is
+        // row-major `[rows, out_features]` with non-overlapping output storage.
+        unsafe {
+            apple_accelerate::cblas_sgemm(
+                apple_accelerate::CBLAS_ROW_MAJOR,
+                apple_accelerate::CBLAS_NO_TRANS,
+                apple_accelerate::CBLAS_TRANS,
+                rows_i32,
+                out_i32,
+                in_i32,
+                1.0,
+                input.as_ptr(),
+                in_i32,
+                weight.as_ptr(),
+                in_i32,
+                0.0,
+                output.as_mut_ptr(),
+                out_i32,
+            );
+        }
+    }
+    Ok(output)
+}
+
+#[cfg(not(all(target_os = "macos", feature = "apple-accelerate")))]
+fn native_decoder_apple_accelerate_linear(
+    input: &[f32],
+    rows: usize,
+    in_features: usize,
+    weight: &[f32],
+    out_features: usize,
+) -> Result<Vec<f32>> {
+    native_decoder_cpu_linear(input, rows, in_features, weight, out_features)
+}
+
+#[cfg(all(target_os = "macos", feature = "apple-accelerate"))]
+mod apple_accelerate {
+    pub const CBLAS_ROW_MAJOR: i32 = 101;
+    pub const CBLAS_NO_TRANS: i32 = 111;
+    pub const CBLAS_TRANS: i32 = 112;
+
+    #[link(name = "Accelerate", kind = "framework")]
+    unsafe extern "C" {
+        pub fn cblas_sgemv(
+            layout: i32,
+            trans: i32,
+            m: i32,
+            n: i32,
+            alpha: f32,
+            a: *const f32,
+            lda: i32,
+            x: *const f32,
+            inc_x: i32,
+            beta: f32,
+            y: *mut f32,
+            inc_y: i32,
+        );
+
+        pub fn cblas_sgemm(
+            layout: i32,
+            trans_a: i32,
+            trans_b: i32,
+            m: i32,
+            n: i32,
+            k: i32,
+            alpha: f32,
+            a: *const f32,
+            lda: i32,
+            b: *const f32,
+            ldb: i32,
+            beta: f32,
+            c: *mut f32,
+            ldc: i32,
+        );
     }
 }
 
@@ -3963,6 +4292,27 @@ impl Engine {
         load_native_decoder_weights(&self.file, contract.config, options)
     }
 
+    /// Load a resident native decoder session with decoded weights and
+    /// tokenizer.
+    ///
+    /// Use this when issuing multiple generation calls so weight decoding is
+    /// paid once instead of on every request.
+    pub fn native_decoder_session(&self) -> Result<NativeDecoderSession> {
+        self.native_decoder_session_with_options(&NativeDecoderWeightOptions::default())
+    }
+
+    /// Load a resident native decoder session with selected RSMF tensor
+    /// variants.
+    pub fn native_decoder_session_with_options(
+        &self,
+        options: &NativeDecoderWeightOptions,
+    ) -> Result<NativeDecoderSession> {
+        Ok(NativeDecoderSession {
+            weights: self.native_decoder_weights_with_options(options)?,
+            tokenizer: self.native_decoder_tokenizer()?,
+        })
+    }
+
     /// Load the native decoder tokenizer from `tokenizer.json`.
     ///
     /// R4.7 supports simple `WordLevel` tokenizer JSON assets with a `vocab`
@@ -3980,8 +4330,9 @@ impl Engine {
     /// Run native decoder token-id generation.
     ///
     /// Defaults preserve greedy CPU-reference generation. Sampling options can
-    /// enable deterministic top-k/top-p sampling, and `Accelerated` resolves to
-    /// the in-tree threaded CPU backend in this build.
+    /// enable deterministic top-k/top-p sampling. `Accelerated` resolves to
+    /// Apple Accelerate on macOS when the `apple-accelerate` feature is enabled
+    /// and otherwise falls back to CPU reference.
     pub fn native_decoder_greedy_decode(
         &self,
         input_token_ids: &[i64],
@@ -3989,17 +4340,7 @@ impl Engine {
     ) -> Result<NativeDecoderGenerateOutput> {
         let backend = resolve_native_decoder_backend(options.backend)?;
         let weights = self.native_decoder_weights_with_options(&options.weight_options)?;
-        match backend {
-            NativeDecoderBackend::CpuReference | NativeDecoderBackend::CpuThreaded => {
-                native_decoder_cpu_greedy_decode(&weights, input_token_ids, options, backend)
-            }
-            NativeDecoderBackend::Auto | NativeDecoderBackend::Accelerated => {
-                Err(RuntimeError::NativeDecoderBackendUnavailable {
-                    backend: format!("{backend:?}"),
-                    reason: "backend selector did not resolve to an executable backend".to_string(),
-                })
-            }
-        }
+        native_decoder_generate_with_backend(&weights, input_token_ids, options, backend)
     }
 
     /// Generate text with the native decoder tokenizer and token-id runtime.
@@ -4012,21 +4353,9 @@ impl Engine {
         prompt: &str,
         options: NativeDecoderRunOptions,
     ) -> Result<NativeDecoderTextGenerateOutput> {
-        let tokenizer = self.native_decoder_tokenizer()?;
-        let prompt_token_ids = tokenizer.encode(prompt)?;
-        let output = self.native_decoder_greedy_decode(&prompt_token_ids, options)?;
-        let generated_text = tokenizer.decode(&output.generated_token_ids)?;
-        let text = tokenizer.decode(&output.token_ids)?;
-        Ok(NativeDecoderTextGenerateOutput {
-            prompt: prompt.to_string(),
-            token_ids: output.token_ids,
-            generated_token_ids: output.generated_token_ids,
-            generated_text,
-            text,
-            logits: output.logits,
-            prompt_logits: output.prompt_logits,
-            backend: output.backend,
-        })
+        let weight_options = options.weight_options.clone();
+        self.native_decoder_session_with_options(&weight_options)?
+            .generate_text(prompt, options)
     }
 
     /// Compare native decoder logits against a caller-supplied reference.
@@ -7305,6 +7634,36 @@ mod tests {
     }
 
     #[test]
+    fn engine_native_decoder_session_reuses_resident_weights() {
+        let dir = tempdir().unwrap();
+        let engine = tiny_native_decoder_generation_engine(dir.path().join("native-decode.rsmf"));
+        let session = engine.native_decoder_session().unwrap();
+
+        let tokens = session
+            .generate_token_ids(
+                &[0],
+                NativeDecoderRunOptions {
+                    max_new_tokens: 2,
+                    ..NativeDecoderRunOptions::default()
+                },
+            )
+            .unwrap();
+        let text = session
+            .generate_text(
+                "zero",
+                NativeDecoderRunOptions {
+                    max_new_tokens: 2,
+                    ..NativeDecoderRunOptions::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(tokens.generated_token_ids, vec![1, 2]);
+        assert_eq!(text.generated_token_ids, vec![1, 2]);
+        assert_eq!(text.text, "zero one two");
+    }
+
+    #[test]
     fn engine_native_decoder_return_prompt_logits_reports_prefill_rows() {
         let dir = tempdir().unwrap();
         let engine = tiny_native_decoder_generation_engine(dir.path().join("native-decode.rsmf"));
@@ -7574,7 +7933,7 @@ mod tests {
     }
 
     #[test]
-    fn engine_native_decoder_accelerated_dispatch_uses_threaded_cpu_backend() {
+    fn engine_native_decoder_accelerated_dispatch_uses_best_available_backend() {
         let dir = tempdir().unwrap();
         let engine = tiny_native_decoder_generation_engine(dir.path().join("native-decode.rsmf"));
 
@@ -7593,8 +7952,40 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(output.backend, NativeDecoderBackend::CpuThreaded);
+        #[cfg(all(target_os = "macos", feature = "apple-accelerate"))]
+        assert_eq!(output.backend, NativeDecoderBackend::AppleCpuAccelerate);
+        #[cfg(not(all(target_os = "macos", feature = "apple-accelerate")))]
+        assert_eq!(output.backend, NativeDecoderBackend::CpuReference);
         assert_eq!(output.generated_token_ids, vec![1, 2]);
+    }
+
+    #[test]
+    fn engine_native_decoder_rejects_reserved_gpu_and_coreml_backends() {
+        let dir = tempdir().unwrap();
+        let engine = tiny_native_decoder_generation_engine(dir.path().join("native-decode.rsmf"));
+
+        for (backend, expected_name) in [
+            (NativeDecoderBackend::MetalWgpuLmHead, "metal_wgpu_lm_head"),
+            (
+                NativeDecoderBackend::MetalWgpuFullDecoder,
+                "metal_wgpu_full_decoder",
+            ),
+            (NativeDecoderBackend::OrtCoreMl, "ort_core_ml"),
+        ] {
+            let err = engine
+                .native_decoder_greedy_decode(
+                    &[0],
+                    NativeDecoderRunOptions {
+                        backend,
+                        ..NativeDecoderRunOptions::default()
+                    },
+                )
+                .unwrap_err();
+
+            assert!(
+                matches!(err, RuntimeError::NativeDecoderBackendUnavailable { backend, .. } if backend == expected_name)
+            );
+        }
     }
 
     #[test]
@@ -7610,6 +8001,26 @@ mod tests {
             native_decoder_cpu_linear(&[1.0, 2.0], 1, 2, &[3.0, 4.0, 5.0, 6.0], 2).unwrap();
 
         assert_close_slice(&output, &[11.0, 17.0], 1e-6);
+    }
+
+    #[test]
+    fn native_decoder_backend_apple_accelerate_linear_matches_reference() {
+        let input = [1.0, 2.0, -1.0, 0.5];
+        let weight = [3.0, 4.0, 5.0, 6.0, -2.0, 1.0];
+        let performance = NativeDecoderPerformanceOptions::default();
+        let reference = native_decoder_cpu_linear(&input, 2, 2, &weight, 3).unwrap();
+        let output = native_decoder_backend_linear(
+            &input,
+            2,
+            2,
+            &weight,
+            3,
+            NativeDecoderBackend::AppleCpuAccelerate,
+            &performance,
+        )
+        .unwrap();
+
+        assert_close_slice(&output, &reference, 1e-5);
     }
 
     #[test]

@@ -21,6 +21,10 @@ tracing = { workspace = true, optional = true }
 [features]
 default = ["tracing"]
 tracing = ["rsmf-core/tracing", "dep:tracing"]
+# macOS-only native decoder backend using Accelerate / vecLib BLAS for f32
+# linear projections. Non-macOS builds compile the feature but fall back to the
+# CPU reference backend.
+apple-accelerate = []
 
 [dev-dependencies]
 tempfile.workspace = true
