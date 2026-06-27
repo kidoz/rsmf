@@ -86,6 +86,18 @@ pub enum RuntimeError {
         /// Maximum number of queued requests.
         capacity: usize,
     },
+    /// The runtime executor queued tensor byte budget would be exceeded.
+    #[error(
+        "runtime executor queued tensor byte budget exceeded; requested {requested_bytes} bytes with {queued_bytes}/{capacity_bytes} bytes queued"
+    )]
+    ExecutorQueueBytesExceeded {
+        /// Bytes in the rejected request's owned inputs.
+        requested_bytes: usize,
+        /// Bytes already queued before the rejected request.
+        queued_bytes: usize,
+        /// Maximum configured queued input bytes.
+        capacity_bytes: usize,
+    },
     /// The runtime executor has been closed.
     #[error("runtime executor is closed")]
     ExecutorClosed,
@@ -126,6 +138,14 @@ impl Default for DynamicBatchingConfig {
             max_queue_delay: Duration::from_millis(1),
         }
     }
+}
+
+/// Admission-control policy for [`RuntimeExecutor`].
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct RuntimeAdmissionConfig {
+    /// Maximum bytes of owned input tensor data allowed to wait in the queue.
+    /// `None` disables queued tensor byte admission.
+    pub max_queued_tensor_bytes: Option<usize>,
 }
 
 /// ONNX Runtime graph optimization level.
@@ -331,6 +351,8 @@ pub struct RuntimeExecutorConfig {
     /// Optional dynamic batching policy. When enabled, compatible requests are
     /// concatenated along their leading tensor dimension.
     pub dynamic_batching: Option<DynamicBatchingConfig>,
+    /// Optional admission limits beyond request count.
+    pub admission: RuntimeAdmissionConfig,
 }
 
 impl Default for RuntimeExecutorConfig {
@@ -339,6 +361,7 @@ impl Default for RuntimeExecutorConfig {
             worker_threads: 1,
             queue_capacity: 1024,
             dynamic_batching: None,
+            admission: RuntimeAdmissionConfig::default(),
         }
     }
 }
@@ -442,6 +465,31 @@ pub struct RuntimeExecutorMetrics {
     pub deadline_expired: u64,
     /// Requests cancelled before dispatch.
     pub cancelled: u64,
+    /// Requests rejected because the request queue was full.
+    pub rejected_by_capacity: u64,
+    /// Requests rejected because queued tensor bytes would exceed the configured
+    /// budget.
+    pub rejected_by_memory: u64,
+    /// Requests currently waiting in the queue.
+    pub current_queue_depth: usize,
+    /// Maximum queue depth observed by this executor.
+    pub max_observed_queue_depth: usize,
+    /// Owned input tensor bytes currently waiting in the queue.
+    pub current_queued_tensor_bytes: usize,
+    /// Maximum queued owned input tensor bytes observed by this executor.
+    pub max_observed_queued_tensor_bytes: usize,
+    /// Requests currently executing inside graph runtime calls.
+    pub active_requests: usize,
+    /// Maximum concurrently active runtime requests observed by this executor.
+    pub max_active_requests: usize,
+    /// Runtime invocations currently executing.
+    pub active_runtime_invocations: usize,
+    /// Maximum concurrent runtime invocations observed by this executor.
+    pub max_active_runtime_invocations: usize,
+    /// Total batch slots currently executing across active runtime invocations.
+    pub active_batch_size: usize,
+    /// Largest total active batch size observed by this executor.
+    pub max_active_batch_size: usize,
     /// Runtime invocations issued to the graph engine.
     pub runtime_invocations: u64,
     /// Runtime invocations that carried more than one request.
@@ -1019,6 +1067,7 @@ impl RuntimeExecutor {
             available: Condvar::new(),
             queue_capacity: config.queue_capacity,
             dynamic_batching: config.dynamic_batching,
+            admission: config.admission,
         });
         let workers = (0..config.worker_threads)
             .map(|_| {
@@ -1033,15 +1082,33 @@ impl RuntimeExecutor {
     pub fn submit(&self, request: RuntimeRequest) -> Result<RuntimeRequestHandle> {
         let (sender, receiver) = mpsc::channel();
         let request_id = request.request_id.clone();
+        let input_bytes = runtime_inputs_data_bytes(&request.inputs)?;
         let cancellation = RuntimeCancellationToken::new();
         let mut state = self.inner.lock_state()?;
         if state.closed {
             return Err(RuntimeError::ExecutorClosed);
         }
         if state.queue.len() >= self.inner.queue_capacity {
+            state.metrics.rejected_by_capacity =
+                state.metrics.rejected_by_capacity.saturating_add(1);
             return Err(RuntimeError::ExecutorQueueFull {
                 capacity: self.inner.queue_capacity,
             });
+        }
+        if let Some(capacity_bytes) = self.inner.admission.max_queued_tensor_bytes {
+            let queued_bytes = state.metrics.current_queued_tensor_bytes;
+            let would_queue = queued_bytes.checked_add(input_bytes).ok_or_else(|| {
+                RuntimeError::Shape("queued tensor byte count overflow".to_string())
+            })?;
+            if would_queue > capacity_bytes {
+                state.metrics.rejected_by_memory =
+                    state.metrics.rejected_by_memory.saturating_add(1);
+                return Err(RuntimeError::ExecutorQueueBytesExceeded {
+                    requested_bytes: input_bytes,
+                    queued_bytes,
+                    capacity_bytes,
+                });
+            }
         }
 
         let sequence = state.next_sequence;
@@ -1050,12 +1117,13 @@ impl RuntimeExecutor {
             .checked_add(1)
             .ok_or(RuntimeError::ExecutorSequenceOverflow)?;
         let priority = request.priority;
-        state.queue.push(QueuedRuntimeRequest {
+        state.push_queued(QueuedRuntimeRequest {
             priority,
             sequence,
             queued_at: Instant::now(),
             request,
             cancellation: cancellation.clone(),
+            input_bytes,
             sender,
         });
         state.metrics.submitted = state.metrics.submitted.saturating_add(1);
@@ -1119,6 +1187,7 @@ struct RuntimeExecutorInner {
     available: Condvar,
     queue_capacity: usize,
     dynamic_batching: Option<DynamicBatchingConfig>,
+    admission: RuntimeAdmissionConfig,
 }
 
 impl RuntimeExecutorInner {
@@ -1139,7 +1208,7 @@ impl RuntimeExecutorInner {
     fn pop_blocking_batch(&self) -> Option<Vec<QueuedRuntimeRequest>> {
         let mut state = self.state.lock().ok()?;
         loop {
-            if let Some(queued) = state.queue.pop() {
+            if let Some(queued) = state.pop_queued() {
                 if self.dynamic_batching.is_some() {
                     state = wait_for_batch_window(self, state);
                 }
@@ -1207,6 +1276,40 @@ impl RuntimeExecutorInner {
         }
     }
 
+    fn record_runtime_start(&self, batch_size: usize) {
+        if let Ok(mut state) = self.state.lock() {
+            state.metrics.active_runtime_invocations =
+                state.metrics.active_runtime_invocations.saturating_add(1);
+            state.metrics.max_active_runtime_invocations = state
+                .metrics
+                .max_active_runtime_invocations
+                .max(state.metrics.active_runtime_invocations);
+            state.metrics.active_requests =
+                state.metrics.active_requests.saturating_add(batch_size);
+            state.metrics.max_active_requests = state
+                .metrics
+                .max_active_requests
+                .max(state.metrics.active_requests);
+            state.metrics.active_batch_size =
+                state.metrics.active_batch_size.saturating_add(batch_size);
+            state.metrics.max_active_batch_size = state
+                .metrics
+                .max_active_batch_size
+                .max(state.metrics.active_batch_size);
+        }
+    }
+
+    fn record_runtime_finish(&self, batch_size: usize) {
+        if let Ok(mut state) = self.state.lock() {
+            state.metrics.active_runtime_invocations =
+                state.metrics.active_runtime_invocations.saturating_sub(1);
+            state.metrics.active_requests =
+                state.metrics.active_requests.saturating_sub(batch_size);
+            state.metrics.active_batch_size =
+                state.metrics.active_batch_size.saturating_sub(batch_size);
+        }
+    }
+
     fn record_cancelled(&self, queue_time: Duration) {
         if let Ok(mut state) = self.state.lock() {
             state.metrics.failed = state.metrics.failed.saturating_add(1);
@@ -1223,12 +1326,42 @@ struct RuntimeExecutorState {
     metrics: RuntimeExecutorMetrics,
 }
 
+impl RuntimeExecutorState {
+    fn push_queued(&mut self, queued: QueuedRuntimeRequest) {
+        self.metrics.current_queue_depth = self.metrics.current_queue_depth.saturating_add(1);
+        self.metrics.max_observed_queue_depth = self
+            .metrics
+            .max_observed_queue_depth
+            .max(self.metrics.current_queue_depth);
+        self.metrics.current_queued_tensor_bytes = self
+            .metrics
+            .current_queued_tensor_bytes
+            .saturating_add(queued.input_bytes);
+        self.metrics.max_observed_queued_tensor_bytes = self
+            .metrics
+            .max_observed_queued_tensor_bytes
+            .max(self.metrics.current_queued_tensor_bytes);
+        self.queue.push(queued);
+    }
+
+    fn pop_queued(&mut self) -> Option<QueuedRuntimeRequest> {
+        let queued = self.queue.pop()?;
+        self.metrics.current_queue_depth = self.metrics.current_queue_depth.saturating_sub(1);
+        self.metrics.current_queued_tensor_bytes = self
+            .metrics
+            .current_queued_tensor_bytes
+            .saturating_sub(queued.input_bytes);
+        Some(queued)
+    }
+}
+
 struct QueuedRuntimeRequest {
     priority: i32,
     sequence: u64,
     queued_at: Instant,
     request: RuntimeRequest,
     cancellation: RuntimeCancellationToken,
+    input_bytes: usize,
     sender: Sender<Result<RuntimeResponse>>,
 }
 
@@ -1264,7 +1397,7 @@ fn pop_batch_from_state(
     state: &mut RuntimeExecutorState,
     config: Option<&DynamicBatchingConfig>,
 ) -> Option<Vec<QueuedRuntimeRequest>> {
-    let queued = state.queue.pop()?;
+    let queued = state.pop_queued()?;
     let mut batch = vec![queued];
     extend_batch_from_state(state, config, &mut batch);
     Some(batch)
@@ -1284,7 +1417,7 @@ fn extend_batch_from_state(
 
     let mut skipped = Vec::new();
     while batch.len() < config.max_batch_size {
-        let Some(candidate) = state.queue.pop() else {
+        let Some(candidate) = state.pop_queued() else {
             break;
         };
         if can_batch_queued_requests(&batch[0], &candidate) {
@@ -1294,7 +1427,7 @@ fn extend_batch_from_state(
         }
     }
     for skipped in skipped {
-        state.queue.push(skipped);
+        state.push_queued(skipped);
     }
 }
 
@@ -1397,11 +1530,13 @@ fn execute_prepared_single(inner: &RuntimeExecutorInner, prepared: PreparedRunti
     let started_at = Instant::now();
     let queue_time = started_at.saturating_duration_since(prepared.queued_at);
     let request_id = prepared.request.request_id;
+    inner.record_runtime_start(1);
     let result = inner.engine.run(
         prepared.request.graph_idx,
         prepared.request.options,
         prepared.request.inputs,
     );
+    inner.record_runtime_finish(1);
     let finished_at = Instant::now();
     let run_time = finished_at.saturating_duration_since(started_at);
     prepared.cancellation.mark_completed();
@@ -1545,10 +1680,10 @@ fn run_prepared_batch(
     let graph_idx = prepared[0].request.graph_idx;
     let options = prepared[0].request.options.clone();
     let started_at = Instant::now();
-    let outputs = inner
-        .engine
-        .run(graph_idx, options, inputs)
-        .map_err(|_| ())?;
+    inner.record_runtime_start(prepared.len());
+    let outputs = inner.engine.run(graph_idx, options, inputs);
+    inner.record_runtime_finish(prepared.len());
+    let outputs = outputs.map_err(|_| ())?;
     let finished_at = Instant::now();
     let run_time = finished_at.saturating_duration_since(started_at);
     let split_outputs = split_runtime_outputs(outputs, &batch_sizes).map_err(|_| ())?;
@@ -1637,6 +1772,30 @@ fn runtime_tensor_shape(tensor: &RuntimeTensor) -> &[usize] {
         | RuntimeTensor::I8 { shape, .. }
         | RuntimeTensor::Bool { shape, .. } => shape,
     }
+}
+
+fn runtime_inputs_data_bytes(inputs: &RuntimeInputs) -> Result<usize> {
+    inputs.values().try_fold(0usize, |acc, tensor| {
+        acc.checked_add(runtime_tensor_data_bytes(tensor)?)
+            .ok_or_else(|| RuntimeError::Shape("runtime input byte count overflow".to_string()))
+    })
+}
+
+fn runtime_tensor_data_bytes(tensor: &RuntimeTensor) -> Result<usize> {
+    match tensor {
+        RuntimeTensor::F32 { data, .. } => runtime_tensor_data_bytes_for::<f32>(data.len()),
+        RuntimeTensor::F64 { data, .. } => runtime_tensor_data_bytes_for::<f64>(data.len()),
+        RuntimeTensor::I64 { data, .. } => runtime_tensor_data_bytes_for::<i64>(data.len()),
+        RuntimeTensor::I32 { data, .. } => runtime_tensor_data_bytes_for::<i32>(data.len()),
+        RuntimeTensor::U8 { data, .. } => runtime_tensor_data_bytes_for::<u8>(data.len()),
+        RuntimeTensor::I8 { data, .. } => runtime_tensor_data_bytes_for::<i8>(data.len()),
+        RuntimeTensor::Bool { data, .. } => runtime_tensor_data_bytes_for::<bool>(data.len()),
+    }
+}
+
+fn runtime_tensor_data_bytes_for<T>(len: usize) -> Result<usize> {
+    len.checked_mul(std::mem::size_of::<T>())
+        .ok_or_else(|| RuntimeError::Shape("runtime tensor byte count overflow".to_string()))
 }
 
 fn leading_batch_parts(name: &str, shape: &[usize], data_len: usize) -> Result<(usize, usize)> {
@@ -2812,6 +2971,7 @@ mod tests {
                 worker_threads: 0,
                 queue_capacity: 4,
                 dynamic_batching: None,
+                admission: RuntimeAdmissionConfig::default(),
             },
         );
 
@@ -2847,6 +3007,7 @@ mod tests {
                 worker_threads: 0,
                 queue_capacity: 4,
                 dynamic_batching: None,
+                admission: RuntimeAdmissionConfig::default(),
             },
         );
 
@@ -2877,6 +3038,7 @@ mod tests {
                 worker_threads: 0,
                 queue_capacity: 4,
                 dynamic_batching: None,
+                admission: RuntimeAdmissionConfig::default(),
             },
         );
         let expired = Instant::now() - Duration::from_secs(1);
@@ -2908,6 +3070,7 @@ mod tests {
                 worker_threads: 0,
                 queue_capacity: 4,
                 dynamic_batching: None,
+                admission: RuntimeAdmissionConfig::default(),
             },
         );
         let handle = executor
@@ -2941,6 +3104,7 @@ mod tests {
                 worker_threads: 0,
                 queue_capacity: 4,
                 dynamic_batching: None,
+                admission: RuntimeAdmissionConfig::default(),
             },
         );
         let handle = executor
@@ -2973,6 +3137,7 @@ mod tests {
                 worker_threads: 0,
                 queue_capacity: 4,
                 dynamic_batching: None,
+                admission: RuntimeAdmissionConfig::default(),
             },
         );
         let handle = executor.submit(add_request("done", 1.0, 10.0)).unwrap();
@@ -3000,6 +3165,7 @@ mod tests {
                 worker_threads: 0,
                 queue_capacity: 4,
                 dynamic_batching: None,
+                admission: RuntimeAdmissionConfig::default(),
             },
         );
         let handle = executor
@@ -3037,6 +3203,7 @@ mod tests {
                 worker_threads: 0,
                 queue_capacity: 1,
                 dynamic_batching: None,
+                admission: RuntimeAdmissionConfig::default(),
             },
         );
 
@@ -3048,6 +3215,67 @@ mod tests {
             err,
             RuntimeError::ExecutorQueueFull { capacity: 1 }
         ));
+        let metrics = executor.metrics().unwrap();
+        assert_eq!(metrics.submitted, 1);
+        assert_eq!(metrics.rejected_by_capacity, 1);
+        assert_eq!(metrics.rejected_by_memory, 0);
+        assert_eq!(metrics.current_queue_depth, 1);
+        assert_eq!(metrics.max_observed_queue_depth, 1);
+        assert_eq!(metrics.current_queued_tensor_bytes, 16);
+        assert_eq!(metrics.max_observed_queued_tensor_bytes, 16);
+    }
+
+    #[test]
+    fn executor_memory_budget_is_enforced_and_reported() {
+        let dir = tempdir().unwrap();
+        let engine = add_graph_engine(dir.path().join("executor-memory-budget.rsmf"));
+        let executor = RuntimeExecutor::new(
+            engine,
+            RuntimeExecutorConfig {
+                worker_threads: 0,
+                queue_capacity: 4,
+                dynamic_batching: None,
+                admission: RuntimeAdmissionConfig {
+                    max_queued_tensor_bytes: Some(16),
+                },
+            },
+        );
+
+        let first = executor.submit(add_request("first", 1.0, 10.0)).unwrap();
+        let err = executor
+            .submit(add_request("second", 2.0, 20.0))
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            RuntimeError::ExecutorQueueBytesExceeded {
+                requested_bytes: 16,
+                queued_bytes: 16,
+                capacity_bytes: 16,
+            }
+        ));
+        let metrics = executor.metrics().unwrap();
+        assert_eq!(metrics.submitted, 1);
+        assert_eq!(metrics.rejected_by_capacity, 0);
+        assert_eq!(metrics.rejected_by_memory, 1);
+        assert_eq!(metrics.current_queue_depth, 1);
+        assert_eq!(metrics.current_queued_tensor_bytes, 16);
+        assert_eq!(metrics.max_observed_queue_depth, 1);
+        assert_eq!(metrics.max_observed_queued_tensor_bytes, 16);
+
+        assert!(executor.execute_next().unwrap());
+        let response = first.wait().unwrap();
+        assert_eq!(f32_output(&response, "z"), vec![11.0, 11.0]);
+        let metrics = executor.metrics().unwrap();
+        assert_eq!(metrics.current_queue_depth, 0);
+        assert_eq!(metrics.current_queued_tensor_bytes, 0);
+        assert_eq!(metrics.completed, 1);
+        assert_eq!(metrics.runtime_invocations, 1);
+        assert_eq!(metrics.active_requests, 0);
+        assert_eq!(metrics.active_runtime_invocations, 0);
+        assert_eq!(metrics.active_batch_size, 0);
+        assert_eq!(metrics.max_active_requests, 1);
+        assert_eq!(metrics.max_active_runtime_invocations, 1);
+        assert_eq!(metrics.max_active_batch_size, 1);
     }
 
     #[test]
@@ -3063,6 +3291,7 @@ mod tests {
                     max_batch_size: 4,
                     max_queue_delay: Duration::ZERO,
                 }),
+                admission: RuntimeAdmissionConfig::default(),
             },
         );
 
@@ -3089,6 +3318,12 @@ mod tests {
         assert_eq!(metrics.batches_executed, 1);
         assert_eq!(metrics.batched_requests, 2);
         assert_eq!(metrics.batch_fallbacks, 0);
+        assert_eq!(metrics.active_requests, 0);
+        assert_eq!(metrics.active_runtime_invocations, 0);
+        assert_eq!(metrics.active_batch_size, 0);
+        assert_eq!(metrics.max_active_requests, 2);
+        assert_eq!(metrics.max_active_runtime_invocations, 1);
+        assert_eq!(metrics.max_active_batch_size, 2);
     }
 
     #[test]
@@ -3104,6 +3339,7 @@ mod tests {
                     max_batch_size: 4,
                     max_queue_delay: Duration::ZERO,
                 }),
+                admission: RuntimeAdmissionConfig::default(),
             },
         );
 
