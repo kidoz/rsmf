@@ -25,6 +25,7 @@ pub mod reader;
 pub mod section;
 pub mod selection;
 pub mod shard;
+pub mod state_dict;
 pub mod streaming_writer;
 pub mod tensor;
 pub mod tier;
@@ -67,6 +68,10 @@ pub use selection::{
 };
 pub use shard::{
     ShardArtifact, ShardStrategy, ShardWriteOptions, ShardWriteSummary, write_sharded_file,
+};
+pub use state_dict::{
+    StateDict, StateDictEntry, StateDictSchema, StateDictValidationIssue,
+    StateDictValidationReport, TensorSpec,
 };
 pub use streaming_writer::StreamingRsmfWriter;
 pub use tensor::descriptor::TensorDescriptor;

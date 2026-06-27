@@ -399,6 +399,17 @@ impl RsmfFile {
         &self.manifest
     }
 
+    /// Return a PyTorch-style state dict view of tensor names, dtypes, shapes,
+    /// variants, shard ids, and tensor metadata.
+    ///
+    /// The returned value is owned and deterministic by tensor name. It does
+    /// not read tensor bytes; use [`Self::tensor_view`] or
+    /// [`Self::tensor_view_variant`] when payload access is needed.
+    #[must_use]
+    pub fn state_dict(&self) -> crate::state_dict::StateDict {
+        crate::state_dict::StateDict::from_manifest(&self.manifest)
+    }
+
     /// Index the file's adapter tensors (LoRA / DoRA / IA³).
     ///
     /// Walks tensors carrying `adapter.*` metadata and groups them by
