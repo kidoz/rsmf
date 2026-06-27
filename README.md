@@ -244,7 +244,11 @@ The native decoder track starts with a contract-only slice:
 `Engine::native_decoder_contract()` reads `config.json`, requires
 `tokenizer.json`, recognizes a LLaMA-style decoder config, and validates the
 expected RSMF tensor names, shapes, and F32/F16/BF16 weight dtypes. It does not
-execute decoder blocks or parse tokenizer internals yet.
+parse tokenizer internals yet. CPU reference tensor ops cover one
+LLaMA-style decoder block: RMSNorm, row-major linear projection, RoPE, causal
+grouped-query attention, SwiGLU MLP, and residual additions over supplied f32
+buffers. Weight loading, KV cache, logits, and token generation remain later
+slices.
 
 ### Minimal MoE runtime PoC
 

@@ -57,7 +57,10 @@ rsmf-core  (library)           ← format, reader, writer, validator, selection
   `Engine::native_decoder_contract()`, which validates a LLaMA-style
   `config.json`, required `tokenizer.json`, optional `generation_config.json`,
   and the expected ordinary RSMF tensor names, shapes, and weight dtypes without
-  adding a graph IR or executing generation.
+  adding a graph IR. The CPU reference decoder block path implements RMSNorm,
+  row-major projections, RoPE, causal grouped-query attention, SwiGLU MLP, and
+  residual additions over supplied f32 buffers; weight loading, KV cache, logits,
+  and generation remain separate slices.
 - `rsmf-moe-runtime` is a proof-of-concept runtime for one MoE layer: host-side
   top-1 gating, token batching by destination expert, placement-aware expert
   shard lookup, WGPU expert matmuls when available, and a CPU reference path.
