@@ -33,10 +33,11 @@ rsmf-core  (library)           ← format, reader, writer, validator, selection
   The initializer path supports raw row-major `F32`, `F64`, `I64`, `I32`,
   `U8`, `I8`, and `Bool` tensors. ONNX initializer dtype/shape metadata is
   preflighted before ORT session creation. `SessionHandle::memory_report()`
-  exposes graph payload bytes and per-initializer materialized bytes. The
-  current initializer path avoids graph-embedded duplicate weight bytes but
-  materializes an ORT-owned value at session build time; mmap/device zero-copy
-  remains future work. `RuntimeExecutor` adds the first runtime-server control
+  exposes graph payload bytes, per-initializer materialized bytes, process RSS
+  where supported, and ORT allocator stats when the active allocator reports
+  them. The current initializer path avoids graph-embedded duplicate weight
+  bytes but materializes an ORT-owned value at session build time; mmap/device
+  zero-copy remains future work. `RuntimeExecutor` adds the first runtime-server control
   layer: a bounded in-process priority queue around `Engine::run`, with FIFO
   ordering within a priority level, pre-dispatch deadline expiry, timeout
   helpers, queued cancellation, typed error propagation, per-request queue/run
