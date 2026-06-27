@@ -4,9 +4,13 @@
 //! remain opaque ONNX / ORT payloads, while this crate owns session lifecycle,
 //! typed request values, runtime options, and session caching.
 
-use std::collections::HashMap;
+use std::cmp::Ordering;
+use std::collections::{BinaryHeap, HashMap};
 use std::fmt::Debug;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use ndarray::{ArrayD, ArrayViewD};
 use ort::ep::CPUExecutionProvider;
@@ -74,6 +78,27 @@ pub enum RuntimeError {
         tensor_name: String,
         /// Reason the binding is unsupported.
         reason: String,
+    },
+    /// The runtime executor queue has reached its configured capacity.
+    #[error("runtime executor queue is full; capacity is {capacity}")]
+    ExecutorQueueFull {
+        /// Maximum number of queued requests.
+        capacity: usize,
+    },
+    /// The runtime executor has been closed.
+    #[error("runtime executor is closed")]
+    ExecutorClosed,
+    /// The runtime executor lock was poisoned by a panic in another caller.
+    #[error("runtime executor lock poisoned")]
+    ExecutorPoisoned,
+    /// The runtime executor request sequence counter overflowed.
+    #[error("runtime executor request sequence overflow")]
+    ExecutorSequenceOverflow,
+    /// A request deadline expired before runtime dispatch.
+    #[error("runtime request {request_id} deadline expired before dispatch")]
+    RequestDeadlineExceeded {
+        /// Caller-provided request identifier.
+        request_id: String,
     },
 }
 
@@ -268,6 +293,144 @@ pub type RuntimeInputs = HashMap<String, RuntimeTensor>;
 
 /// Named output tensor map.
 pub type RuntimeOutputs = HashMap<String, RuntimeTensor>;
+
+/// Configuration for the in-process runtime executor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeExecutorConfig {
+    /// Number of background worker threads. Use `0` to drive execution
+    /// manually with [`RuntimeExecutor::execute_next`].
+    pub worker_threads: usize,
+    /// Maximum number of requests waiting in the queue.
+    pub queue_capacity: usize,
+}
+
+impl Default for RuntimeExecutorConfig {
+    fn default() -> Self {
+        Self {
+            worker_threads: 1,
+            queue_capacity: 1024,
+        }
+    }
+}
+
+/// One graph-runtime request submitted to [`RuntimeExecutor`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct RuntimeRequest {
+    /// Caller-provided request identifier.
+    pub request_id: String,
+    /// Graph payload index.
+    pub graph_idx: usize,
+    /// Session options used to select or build the runtime session.
+    pub options: SessionOptions,
+    /// Owned runtime inputs.
+    pub inputs: RuntimeInputs,
+    /// Optional deadline. Expired requests fail before graph dispatch.
+    pub deadline: Option<Instant>,
+    /// Request priority. Higher values run before lower values.
+    pub priority: i32,
+}
+
+impl RuntimeRequest {
+    /// Build a request with default session options, no deadline, and priority
+    /// `0`.
+    #[must_use]
+    pub fn new(request_id: impl Into<String>, graph_idx: usize, inputs: RuntimeInputs) -> Self {
+        Self {
+            request_id: request_id.into(),
+            graph_idx,
+            options: SessionOptions::default(),
+            inputs,
+            deadline: None,
+            priority: 0,
+        }
+    }
+
+    /// Set session options for this request.
+    #[must_use]
+    pub fn with_options(mut self, options: SessionOptions) -> Self {
+        self.options = options;
+        self
+    }
+
+    /// Set the absolute deadline for this request.
+    #[must_use]
+    pub fn with_deadline(mut self, deadline: Instant) -> Self {
+        self.deadline = Some(deadline);
+        self
+    }
+
+    /// Set request priority. Higher values run first.
+    #[must_use]
+    pub fn with_priority(mut self, priority: i32) -> Self {
+        self.priority = priority;
+        self
+    }
+}
+
+/// Per-request timing metadata captured by [`RuntimeExecutor`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeRequestTimings {
+    /// Time when the request was accepted into the queue.
+    pub queued_at: Instant,
+    /// Time when the request left the queue.
+    pub started_at: Instant,
+    /// Time when execution finished.
+    pub finished_at: Instant,
+    /// Time spent waiting in the executor queue.
+    pub queue_time: Duration,
+    /// Time spent inside graph runtime execution.
+    pub run_time: Duration,
+}
+
+/// Successful runtime executor response.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RuntimeResponse {
+    /// Caller-provided request identifier.
+    pub request_id: String,
+    /// Owned graph outputs.
+    pub outputs: RuntimeOutputs,
+    /// Per-request timing metadata.
+    pub timings: RuntimeRequestTimings,
+}
+
+/// Cumulative in-process executor metrics.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct RuntimeExecutorMetrics {
+    /// Requests accepted into the queue.
+    pub submitted: u64,
+    /// Requests completed successfully.
+    pub completed: u64,
+    /// Requests completed with an error.
+    pub failed: u64,
+    /// Requests rejected because their deadline expired before dispatch.
+    pub deadline_expired: u64,
+    /// Cumulative queue time for completed and failed dispatched requests.
+    pub total_queue_time: Duration,
+    /// Cumulative run time for completed and failed dispatched requests.
+    pub total_run_time: Duration,
+}
+
+/// Completion handle returned by [`RuntimeExecutor::submit`].
+#[derive(Debug)]
+pub struct RuntimeRequestHandle {
+    request_id: String,
+    receiver: Receiver<Result<RuntimeResponse>>,
+}
+
+impl RuntimeRequestHandle {
+    /// Caller-provided request identifier for this handle.
+    #[must_use]
+    pub fn request_id(&self) -> &str {
+        &self.request_id
+    }
+
+    /// Wait for request completion.
+    pub fn wait(self) -> Result<RuntimeResponse> {
+        self.receiver
+            .recv()
+            .map_err(|_| RuntimeError::ExecutorClosed)?
+    }
+}
 
 /// Per-initializer memory materialization report.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -682,6 +845,268 @@ impl Engine {
             },
             other => RuntimeError::Core(other),
         })
+    }
+}
+
+/// In-process, graph-agnostic runtime request executor.
+///
+/// The executor owns or shares an [`Engine`], accepts bounded queued requests,
+/// orders them by priority and FIFO sequence, and runs requests on background
+/// workers or through [`Self::execute_next`].
+pub struct RuntimeExecutor {
+    inner: Arc<RuntimeExecutorInner>,
+    workers: Vec<JoinHandle<()>>,
+}
+
+impl RuntimeExecutor {
+    /// Create an executor that owns `engine`.
+    #[must_use]
+    pub fn new(engine: Engine, config: RuntimeExecutorConfig) -> Self {
+        Self::from_shared(Arc::new(engine), config)
+    }
+
+    /// Create an executor from a shared engine.
+    #[must_use]
+    pub fn from_shared(engine: Arc<Engine>, config: RuntimeExecutorConfig) -> Self {
+        let inner = Arc::new(RuntimeExecutorInner {
+            engine,
+            state: Mutex::new(RuntimeExecutorState {
+                queue: BinaryHeap::new(),
+                closed: false,
+                next_sequence: 0,
+                metrics: RuntimeExecutorMetrics::default(),
+            }),
+            available: Condvar::new(),
+            queue_capacity: config.queue_capacity,
+        });
+        let workers = (0..config.worker_threads)
+            .map(|_| {
+                let inner = Arc::clone(&inner);
+                std::thread::spawn(move || worker_loop(inner))
+            })
+            .collect();
+        Self { inner, workers }
+    }
+
+    /// Submit a request to the bounded priority queue.
+    pub fn submit(&self, request: RuntimeRequest) -> Result<RuntimeRequestHandle> {
+        let (sender, receiver) = mpsc::channel();
+        let request_id = request.request_id.clone();
+        let mut state = self.inner.lock_state()?;
+        if state.closed {
+            return Err(RuntimeError::ExecutorClosed);
+        }
+        if state.queue.len() >= self.inner.queue_capacity {
+            return Err(RuntimeError::ExecutorQueueFull {
+                capacity: self.inner.queue_capacity,
+            });
+        }
+
+        let sequence = state.next_sequence;
+        state.next_sequence = state
+            .next_sequence
+            .checked_add(1)
+            .ok_or(RuntimeError::ExecutorSequenceOverflow)?;
+        let priority = request.priority;
+        state.queue.push(QueuedRuntimeRequest {
+            priority,
+            sequence,
+            queued_at: Instant::now(),
+            request,
+            sender,
+        });
+        state.metrics.submitted = state.metrics.submitted.saturating_add(1);
+        drop(state);
+        self.inner.available.notify_one();
+
+        Ok(RuntimeRequestHandle {
+            request_id,
+            receiver,
+        })
+    }
+
+    /// Execute the next queued request on the caller's thread.
+    ///
+    /// Returns `Ok(true)` when a request was executed and `Ok(false)` when no
+    /// request is currently queued.
+    pub fn execute_next(&self) -> Result<bool> {
+        let Some(queued) = self.inner.pop_ready()? else {
+            return Ok(false);
+        };
+        execute_queued_request(&self.inner, queued);
+        Ok(true)
+    }
+
+    /// Stop accepting new requests and wake sleeping workers.
+    ///
+    /// Already queued requests are still drained by workers or
+    /// [`Self::execute_next`].
+    pub fn close(&self) -> Result<()> {
+        let mut state = self.inner.lock_state()?;
+        state.closed = true;
+        drop(state);
+        self.inner.available.notify_all();
+        Ok(())
+    }
+
+    /// Snapshot cumulative executor metrics.
+    pub fn metrics(&self) -> Result<RuntimeExecutorMetrics> {
+        self.inner.lock_state().map(|state| state.metrics.clone())
+    }
+
+    /// Current number of queued requests.
+    pub fn queued_len(&self) -> Result<usize> {
+        self.inner.lock_state().map(|state| state.queue.len())
+    }
+}
+
+impl Drop for RuntimeExecutor {
+    fn drop(&mut self) {
+        let _ = self.close();
+        for worker in self.workers.drain(..) {
+            let _ = worker.join();
+        }
+    }
+}
+
+struct RuntimeExecutorInner {
+    engine: Arc<Engine>,
+    state: Mutex<RuntimeExecutorState>,
+    available: Condvar,
+    queue_capacity: usize,
+}
+
+impl RuntimeExecutorInner {
+    fn lock_state(&self) -> Result<MutexGuard<'_, RuntimeExecutorState>> {
+        self.state
+            .lock()
+            .map_err(|_| RuntimeError::ExecutorPoisoned)
+    }
+
+    fn pop_ready(&self) -> Result<Option<QueuedRuntimeRequest>> {
+        self.lock_state().map(|mut state| state.queue.pop())
+    }
+
+    fn pop_blocking(&self) -> Option<QueuedRuntimeRequest> {
+        let mut state = self.state.lock().ok()?;
+        loop {
+            if let Some(queued) = state.queue.pop() {
+                return Some(queued);
+            }
+            if state.closed {
+                return None;
+            }
+            state = self.available.wait(state).ok()?;
+        }
+    }
+
+    fn record_completed(&self, queue_time: Duration, run_time: Duration) {
+        if let Ok(mut state) = self.state.lock() {
+            state.metrics.completed = state.metrics.completed.saturating_add(1);
+            state.metrics.total_queue_time += queue_time;
+            state.metrics.total_run_time += run_time;
+        }
+    }
+
+    fn record_failed(&self, queue_time: Duration, run_time: Duration, deadline_expired: bool) {
+        if let Ok(mut state) = self.state.lock() {
+            state.metrics.failed = state.metrics.failed.saturating_add(1);
+            if deadline_expired {
+                state.metrics.deadline_expired = state.metrics.deadline_expired.saturating_add(1);
+            }
+            state.metrics.total_queue_time += queue_time;
+            state.metrics.total_run_time += run_time;
+        }
+    }
+}
+
+struct RuntimeExecutorState {
+    queue: BinaryHeap<QueuedRuntimeRequest>,
+    closed: bool,
+    next_sequence: u64,
+    metrics: RuntimeExecutorMetrics,
+}
+
+struct QueuedRuntimeRequest {
+    priority: i32,
+    sequence: u64,
+    queued_at: Instant,
+    request: RuntimeRequest,
+    sender: Sender<Result<RuntimeResponse>>,
+}
+
+impl PartialEq for QueuedRuntimeRequest {
+    fn eq(&self, other: &Self) -> bool {
+        self.priority == other.priority && self.sequence == other.sequence
+    }
+}
+
+impl Eq for QueuedRuntimeRequest {}
+
+impl PartialOrd for QueuedRuntimeRequest {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for QueuedRuntimeRequest {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.priority
+            .cmp(&other.priority)
+            .then_with(|| other.sequence.cmp(&self.sequence))
+    }
+}
+
+fn worker_loop(inner: Arc<RuntimeExecutorInner>) {
+    while let Some(queued) = inner.pop_blocking() {
+        execute_queued_request(&inner, queued);
+    }
+}
+
+fn execute_queued_request(inner: &RuntimeExecutorInner, queued: QueuedRuntimeRequest) {
+    let started_at = Instant::now();
+    let queue_time = started_at.saturating_duration_since(queued.queued_at);
+    if queued
+        .request
+        .deadline
+        .is_some_and(|deadline| deadline <= started_at)
+    {
+        inner.record_failed(queue_time, Duration::ZERO, true);
+        let _ = queued
+            .sender
+            .send(Err(RuntimeError::RequestDeadlineExceeded {
+                request_id: queued.request.request_id,
+            }));
+        return;
+    }
+
+    let request_id = queued.request.request_id;
+    let result = inner.engine.run(
+        queued.request.graph_idx,
+        queued.request.options,
+        queued.request.inputs,
+    );
+    let finished_at = Instant::now();
+    let run_time = finished_at.saturating_duration_since(started_at);
+    match result {
+        Ok(outputs) => {
+            inner.record_completed(queue_time, run_time);
+            let _ = queued.sender.send(Ok(RuntimeResponse {
+                request_id,
+                outputs,
+                timings: RuntimeRequestTimings {
+                    queued_at: queued.queued_at,
+                    started_at,
+                    finished_at,
+                    queue_time,
+                    run_time,
+                },
+            }));
+        }
+        Err(error) => {
+            inner.record_failed(queue_time, run_time, false);
+            let _ = queued.sender.send(Err(error));
+        }
     }
 }
 
@@ -1706,6 +2131,154 @@ mod tests {
         );
     }
 
+    #[test]
+    fn executor_runs_same_priority_fifo() {
+        let dir = tempdir().unwrap();
+        let engine = add_graph_engine(dir.path().join("executor-fifo.rsmf"));
+        let executor = RuntimeExecutor::new(
+            engine,
+            RuntimeExecutorConfig {
+                worker_threads: 0,
+                queue_capacity: 4,
+            },
+        );
+
+        let first = executor
+            .submit(add_request("first", 1.0, 10.0).with_priority(7))
+            .unwrap();
+        let second = executor
+            .submit(add_request("second", 2.0, 20.0).with_priority(7))
+            .unwrap();
+
+        assert!(executor.execute_next().unwrap());
+        let first_response = first.receiver.try_recv().unwrap().unwrap();
+        assert_eq!(first_response.request_id, "first");
+        assert_eq!(f32_output(&first_response, "z"), vec![11.0, 11.0]);
+        assert!(matches!(
+            second.receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+
+        assert!(executor.execute_next().unwrap());
+        let second_response = second.wait().unwrap();
+        assert_eq!(second_response.request_id, "second");
+        assert_eq!(f32_output(&second_response, "z"), vec![22.0, 22.0]);
+    }
+
+    #[test]
+    fn executor_runs_higher_priority_first() {
+        let dir = tempdir().unwrap();
+        let engine = add_graph_engine(dir.path().join("executor-priority.rsmf"));
+        let executor = RuntimeExecutor::new(
+            engine,
+            RuntimeExecutorConfig {
+                worker_threads: 0,
+                queue_capacity: 4,
+            },
+        );
+
+        let low = executor
+            .submit(add_request("low", 1.0, 10.0).with_priority(1))
+            .unwrap();
+        let high = executor
+            .submit(add_request("high", 2.0, 20.0).with_priority(9))
+            .unwrap();
+
+        assert!(executor.execute_next().unwrap());
+        let high_response = high.receiver.try_recv().unwrap().unwrap();
+        assert_eq!(high_response.request_id, "high");
+        assert_eq!(f32_output(&high_response, "z"), vec![22.0, 22.0]);
+        assert!(matches!(
+            low.receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn executor_rejects_expired_deadline_before_runtime_dispatch() {
+        let dir = tempdir().unwrap();
+        let engine = add_graph_engine(dir.path().join("executor-deadline.rsmf"));
+        let executor = RuntimeExecutor::new(
+            engine,
+            RuntimeExecutorConfig {
+                worker_threads: 0,
+                queue_capacity: 4,
+            },
+        );
+        let expired = Instant::now() - Duration::from_secs(1);
+        let handle = executor
+            .submit(RuntimeRequest::new("expired", 99, RuntimeInputs::new()).with_deadline(expired))
+            .unwrap();
+
+        assert!(executor.execute_next().unwrap());
+        let err = handle.wait().unwrap_err();
+        assert!(matches!(
+            err,
+            RuntimeError::RequestDeadlineExceeded { request_id } if request_id == "expired"
+        ));
+        let metrics = executor.metrics().unwrap();
+        assert_eq!(metrics.submitted, 1);
+        assert_eq!(metrics.completed, 0);
+        assert_eq!(metrics.failed, 1);
+        assert_eq!(metrics.deadline_expired, 1);
+    }
+
+    #[test]
+    fn executor_preserves_runtime_errors() {
+        let dir = tempdir().unwrap();
+        let engine = add_graph_engine(dir.path().join("executor-error.rsmf"));
+        let executor = RuntimeExecutor::new(
+            engine,
+            RuntimeExecutorConfig {
+                worker_threads: 0,
+                queue_capacity: 4,
+            },
+        );
+        let handle = executor
+            .submit(RuntimeRequest::new(
+                "missing-graph",
+                99,
+                RuntimeInputs::new(),
+            ))
+            .unwrap();
+
+        assert!(executor.execute_next().unwrap());
+        let err = handle.wait().unwrap_err();
+        assert!(matches!(
+            err,
+            RuntimeError::GraphNotFound {
+                graph_idx: 99,
+                graph_count: 1
+            }
+        ));
+        let metrics = executor.metrics().unwrap();
+        assert_eq!(metrics.submitted, 1);
+        assert_eq!(metrics.completed, 0);
+        assert_eq!(metrics.failed, 1);
+    }
+
+    #[test]
+    fn executor_queue_capacity_is_enforced() {
+        let dir = tempdir().unwrap();
+        let engine = add_graph_engine(dir.path().join("executor-capacity.rsmf"));
+        let executor = RuntimeExecutor::new(
+            engine,
+            RuntimeExecutorConfig {
+                worker_threads: 0,
+                queue_capacity: 1,
+            },
+        );
+
+        let _handle = executor.submit(add_request("first", 1.0, 10.0)).unwrap();
+        let err = executor
+            .submit(add_request("second", 2.0, 20.0))
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            RuntimeError::ExecutorQueueFull { capacity: 1 }
+        ));
+    }
+
     fn tiny_add_onnx_model() -> Vec<u8> {
         let mut model = Vec::new();
         push_i64(&mut model, 1, 7);
@@ -1818,6 +2391,53 @@ mod tests {
             .iter()
             .flat_map(|value| value.to_le_bytes())
             .collect()
+    }
+
+    fn add_graph_engine(path: std::path::PathBuf) -> Engine {
+        RsmfWriter::new()
+            .with_tensor(TensorInput {
+                name: "fixture.weight".to_string(),
+                dtype: LogicalDtype::F32,
+                shape: vec![1],
+                shard_id: 0,
+                metadata: Vec::new(),
+                canonical: VariantInput::canonical_raw(0.0f32.to_le_bytes().to_vec()),
+                packed: Vec::new(),
+            })
+            .with_graph(GraphInput::onnx(tiny_add_onnx_model()))
+            .write_to_path(&path)
+            .unwrap();
+        Engine::new(RsmfFile::open(path).unwrap()).unwrap()
+    }
+
+    fn add_request(request_id: &str, x: f32, y: f32) -> RuntimeRequest {
+        RuntimeRequest::new(
+            request_id,
+            0,
+            HashMap::from([
+                (
+                    "x".to_string(),
+                    RuntimeTensor::F32 {
+                        shape: vec![2],
+                        data: vec![x, x],
+                    },
+                ),
+                (
+                    "y".to_string(),
+                    RuntimeTensor::F32 {
+                        shape: vec![2],
+                        data: vec![y, y],
+                    },
+                ),
+            ]),
+        )
+    }
+
+    fn f32_output(response: &RuntimeResponse, name: &str) -> Vec<f32> {
+        match response.outputs.get(name).unwrap() {
+            RuntimeTensor::F32 { data, .. } => data.clone(),
+            other => panic!("expected F32 output, got {other:?}"),
+        }
     }
 
     fn value_info(name: &str, shape: &[i64]) -> Vec<u8> {
