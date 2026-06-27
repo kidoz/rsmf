@@ -220,7 +220,8 @@ in-process priority queue around `Engine::run`. It supports FIFO ordering
 within a priority level, higher-priority dispatch, pre-dispatch deadline
 expiry, timeout helpers, queued cancellation, typed runtime error propagation,
 opt-in dynamic batching on the leading tensor dimension, per-request queue/run
-timings, and cumulative executor metrics. Already-running ORT calls are not
+timings, queued tensor byte admission, live queue/active-runtime pressure
+metrics, and cumulative executor metrics. Already-running ORT calls are not
 interrupted yet. It is intentionally graph-runtime agnostic so native decoder
 execution can share the same control plane later.
 

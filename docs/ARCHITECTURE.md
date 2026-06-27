@@ -41,8 +41,11 @@ rsmf-core  (library)           ← format, reader, writer, validator, selection
   ordering within a priority level, pre-dispatch deadline expiry, timeout
   helpers, queued cancellation, typed error propagation, per-request queue/run
   timings, opt-in dynamic batching on the leading tensor dimension, and
-  cumulative metrics. Already-running ORT calls are not interrupted yet. It
-  stays graph-runtime agnostic for later native decoder paths.
+  cumulative metrics. It also reports live queue depth, queued input bytes,
+  active runtime invocations, active requests, and batch pressure, with
+  optional queued tensor byte admission. Already-running ORT calls are not
+  interrupted yet. It stays graph-runtime agnostic for later native decoder
+  paths.
 - `rsmf-moe-runtime` is a proof-of-concept runtime for one MoE layer: host-side
   top-1 gating, token batching by destination expert, placement-aware expert
   shard lookup, WGPU expert matmuls when available, and a CPU reference path.
