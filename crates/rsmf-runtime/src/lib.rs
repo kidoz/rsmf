@@ -109,6 +109,25 @@ pub enum RuntimeError {
     },
 }
 
+/// Dynamic batching policy for [`RuntimeExecutor`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DynamicBatchingConfig {
+    /// Maximum number of requests to combine into one runtime invocation.
+    pub max_batch_size: usize,
+    /// Maximum time a background worker waits after receiving the first request
+    /// to allow more compatible requests to arrive.
+    pub max_queue_delay: Duration,
+}
+
+impl Default for DynamicBatchingConfig {
+    fn default() -> Self {
+        Self {
+            max_batch_size: 8,
+            max_queue_delay: Duration::from_millis(1),
+        }
+    }
+}
+
 /// ONNX Runtime graph optimization level.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum GraphOptimizationLevel {
@@ -309,6 +328,9 @@ pub struct RuntimeExecutorConfig {
     pub worker_threads: usize,
     /// Maximum number of requests waiting in the queue.
     pub queue_capacity: usize,
+    /// Optional dynamic batching policy. When enabled, compatible requests are
+    /// concatenated along their leading tensor dimension.
+    pub dynamic_batching: Option<DynamicBatchingConfig>,
 }
 
 impl Default for RuntimeExecutorConfig {
@@ -316,6 +338,7 @@ impl Default for RuntimeExecutorConfig {
         Self {
             worker_threads: 1,
             queue_capacity: 1024,
+            dynamic_batching: None,
         }
     }
 }
@@ -419,6 +442,15 @@ pub struct RuntimeExecutorMetrics {
     pub deadline_expired: u64,
     /// Requests cancelled before dispatch.
     pub cancelled: u64,
+    /// Runtime invocations issued to the graph engine.
+    pub runtime_invocations: u64,
+    /// Runtime invocations that carried more than one request.
+    pub batches_executed: u64,
+    /// Requests completed through a runtime invocation carrying more than one
+    /// request.
+    pub batched_requests: u64,
+    /// Attempted batches that fell back to individual request execution.
+    pub batch_fallbacks: u64,
     /// Cumulative queue time for completed and failed dispatched requests.
     pub total_queue_time: Duration,
     /// Cumulative run time for completed and failed dispatched requests.
@@ -986,6 +1018,7 @@ impl RuntimeExecutor {
             }),
             available: Condvar::new(),
             queue_capacity: config.queue_capacity,
+            dynamic_batching: config.dynamic_batching,
         });
         let workers = (0..config.worker_threads)
             .map(|_| {
@@ -1041,10 +1074,10 @@ impl RuntimeExecutor {
     /// Returns `Ok(true)` when a request was executed and `Ok(false)` when no
     /// request is currently queued.
     pub fn execute_next(&self) -> Result<bool> {
-        let Some(queued) = self.inner.pop_ready()? else {
+        let Some(batch) = self.inner.pop_ready_batch()? else {
             return Ok(false);
         };
-        execute_queued_request(&self.inner, queued);
+        execute_queued_batch(&self.inner, batch);
         Ok(true)
     }
 
@@ -1085,6 +1118,7 @@ struct RuntimeExecutorInner {
     state: Mutex<RuntimeExecutorState>,
     available: Condvar,
     queue_capacity: usize,
+    dynamic_batching: Option<DynamicBatchingConfig>,
 }
 
 impl RuntimeExecutorInner {
@@ -1094,15 +1128,24 @@ impl RuntimeExecutorInner {
             .map_err(|_| RuntimeError::ExecutorPoisoned)
     }
 
-    fn pop_ready(&self) -> Result<Option<QueuedRuntimeRequest>> {
-        self.lock_state().map(|mut state| state.queue.pop())
+    fn pop_ready_batch(&self) -> Result<Option<Vec<QueuedRuntimeRequest>>> {
+        let mut state = self.lock_state()?;
+        Ok(pop_batch_from_state(
+            &mut state,
+            self.dynamic_batching.as_ref(),
+        ))
     }
 
-    fn pop_blocking(&self) -> Option<QueuedRuntimeRequest> {
+    fn pop_blocking_batch(&self) -> Option<Vec<QueuedRuntimeRequest>> {
         let mut state = self.state.lock().ok()?;
         loop {
             if let Some(queued) = state.queue.pop() {
-                return Some(queued);
+                if self.dynamic_batching.is_some() {
+                    state = wait_for_batch_window(self, state);
+                }
+                let mut batch = vec![queued];
+                extend_batch_from_state(&mut state, self.dynamic_batching.as_ref(), &mut batch);
+                return Some(batch);
             }
             if state.closed {
                 return None;
@@ -1111,22 +1154,56 @@ impl RuntimeExecutorInner {
         }
     }
 
-    fn record_completed(&self, queue_time: Duration, run_time: Duration) {
+    fn record_completed_batch(
+        &self,
+        queue_times: &[Duration],
+        run_time: Duration,
+        batch_size: usize,
+    ) {
         if let Ok(mut state) = self.state.lock() {
-            state.metrics.completed = state.metrics.completed.saturating_add(1);
-            state.metrics.total_queue_time += queue_time;
-            state.metrics.total_run_time += run_time;
+            state.metrics.completed = state
+                .metrics
+                .completed
+                .saturating_add(queue_times.len() as u64);
+            state.metrics.runtime_invocations = state.metrics.runtime_invocations.saturating_add(1);
+            if batch_size > 1 {
+                state.metrics.batches_executed = state.metrics.batches_executed.saturating_add(1);
+                state.metrics.batched_requests = state
+                    .metrics
+                    .batched_requests
+                    .saturating_add(queue_times.len() as u64);
+            }
+            for &queue_time in queue_times {
+                state.metrics.total_queue_time += queue_time;
+                state.metrics.total_run_time += run_time;
+            }
         }
     }
 
-    fn record_failed(&self, queue_time: Duration, run_time: Duration, deadline_expired: bool) {
+    fn record_failed(
+        &self,
+        queue_time: Duration,
+        run_time: Duration,
+        deadline_expired: bool,
+        runtime_invoked: bool,
+    ) {
         if let Ok(mut state) = self.state.lock() {
             state.metrics.failed = state.metrics.failed.saturating_add(1);
             if deadline_expired {
                 state.metrics.deadline_expired = state.metrics.deadline_expired.saturating_add(1);
             }
+            if runtime_invoked {
+                state.metrics.runtime_invocations =
+                    state.metrics.runtime_invocations.saturating_add(1);
+            }
             state.metrics.total_queue_time += queue_time;
             state.metrics.total_run_time += run_time;
+        }
+    }
+
+    fn record_batch_fallback(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.metrics.batch_fallbacks = state.metrics.batch_fallbacks.saturating_add(1);
         }
     }
 
@@ -1178,13 +1255,104 @@ impl Ord for QueuedRuntimeRequest {
 }
 
 fn worker_loop(inner: Arc<RuntimeExecutorInner>) {
-    while let Some(queued) = inner.pop_blocking() {
-        execute_queued_request(&inner, queued);
+    while let Some(batch) = inner.pop_blocking_batch() {
+        execute_queued_batch(&inner, batch);
     }
 }
 
-fn execute_queued_request(inner: &RuntimeExecutorInner, queued: QueuedRuntimeRequest) {
+fn pop_batch_from_state(
+    state: &mut RuntimeExecutorState,
+    config: Option<&DynamicBatchingConfig>,
+) -> Option<Vec<QueuedRuntimeRequest>> {
+    let queued = state.queue.pop()?;
+    let mut batch = vec![queued];
+    extend_batch_from_state(state, config, &mut batch);
+    Some(batch)
+}
+
+fn extend_batch_from_state(
+    state: &mut RuntimeExecutorState,
+    config: Option<&DynamicBatchingConfig>,
+    batch: &mut Vec<QueuedRuntimeRequest>,
+) {
+    let Some(config) = config else {
+        return;
+    };
+    if config.max_batch_size <= 1 {
+        return;
+    }
+
+    let mut skipped = Vec::new();
+    while batch.len() < config.max_batch_size {
+        let Some(candidate) = state.queue.pop() else {
+            break;
+        };
+        if can_batch_queued_requests(&batch[0], &candidate) {
+            batch.push(candidate);
+        } else {
+            skipped.push(candidate);
+        }
+    }
+    for skipped in skipped {
+        state.queue.push(skipped);
+    }
+}
+
+fn wait_for_batch_window<'a>(
+    inner: &RuntimeExecutorInner,
+    state: MutexGuard<'a, RuntimeExecutorState>,
+) -> MutexGuard<'a, RuntimeExecutorState> {
+    let Some(config) = &inner.dynamic_batching else {
+        return state;
+    };
+    if config.max_batch_size <= 1 || config.max_queue_delay.is_zero() {
+        return state;
+    }
+    inner
+        .available
+        .wait_timeout(state, config.max_queue_delay)
+        .map_or_else(|poisoned| poisoned.into_inner().0, |(state, _)| state)
+}
+
+fn execute_queued_batch(inner: &RuntimeExecutorInner, batch: Vec<QueuedRuntimeRequest>) {
+    let prepared = prepare_queued_batch(inner, batch);
+    if prepared.is_empty() {
+        return;
+    }
+    if prepared.len() == 1 {
+        if let Some(prepared) = prepared.into_iter().next() {
+            execute_prepared_single(inner, prepared);
+        }
+        return;
+    }
+
+    match run_prepared_batch(inner, &prepared) {
+        Ok(()) => {}
+        Err(()) => {
+            inner.record_batch_fallback();
+            for prepared in prepared {
+                execute_prepared_single(inner, prepared);
+            }
+        }
+    }
+}
+
+fn prepare_queued_batch(
+    inner: &RuntimeExecutorInner,
+    batch: Vec<QueuedRuntimeRequest>,
+) -> Vec<PreparedRuntimeRequest> {
     let started_at = Instant::now();
+    batch
+        .into_iter()
+        .filter_map(|queued| prepare_queued_request(inner, queued, started_at))
+        .collect()
+}
+
+fn prepare_queued_request(
+    inner: &RuntimeExecutorInner,
+    queued: QueuedRuntimeRequest,
+    started_at: Instant,
+) -> Option<PreparedRuntimeRequest> {
     let queue_time = started_at.saturating_duration_since(queued.queued_at);
     if queued.cancellation.try_mark_running().is_err() {
         queued.cancellation.mark_completed();
@@ -1192,7 +1360,7 @@ fn execute_queued_request(inner: &RuntimeExecutorInner, queued: QueuedRuntimeReq
         let _ = queued.sender.send(Err(RuntimeError::RequestCancelled {
             request_id: queued.request.request_id,
         }));
-        return;
+        return None;
     }
 
     if queued
@@ -1201,32 +1369,50 @@ fn execute_queued_request(inner: &RuntimeExecutorInner, queued: QueuedRuntimeReq
         .is_some_and(|deadline| deadline <= started_at)
     {
         queued.cancellation.mark_completed();
-        inner.record_failed(queue_time, Duration::ZERO, true);
+        inner.record_failed(queue_time, Duration::ZERO, true, false);
         let _ = queued
             .sender
             .send(Err(RuntimeError::RequestDeadlineExceeded {
                 request_id: queued.request.request_id,
             }));
-        return;
+        return None;
     }
 
-    let request_id = queued.request.request_id;
+    Some(PreparedRuntimeRequest {
+        queued_at: queued.queued_at,
+        request: queued.request,
+        cancellation: queued.cancellation,
+        sender: queued.sender,
+    })
+}
+
+struct PreparedRuntimeRequest {
+    queued_at: Instant,
+    request: RuntimeRequest,
+    cancellation: RuntimeCancellationToken,
+    sender: Sender<Result<RuntimeResponse>>,
+}
+
+fn execute_prepared_single(inner: &RuntimeExecutorInner, prepared: PreparedRuntimeRequest) {
+    let started_at = Instant::now();
+    let queue_time = started_at.saturating_duration_since(prepared.queued_at);
+    let request_id = prepared.request.request_id;
     let result = inner.engine.run(
-        queued.request.graph_idx,
-        queued.request.options,
-        queued.request.inputs,
+        prepared.request.graph_idx,
+        prepared.request.options,
+        prepared.request.inputs,
     );
     let finished_at = Instant::now();
     let run_time = finished_at.saturating_duration_since(started_at);
-    queued.cancellation.mark_completed();
+    prepared.cancellation.mark_completed();
     match result {
         Ok(outputs) => {
-            inner.record_completed(queue_time, run_time);
-            let _ = queued.sender.send(Ok(RuntimeResponse {
+            inner.record_completed_batch(&[queue_time], run_time, 1);
+            let _ = prepared.sender.send(Ok(RuntimeResponse {
                 request_id,
                 outputs,
                 timings: RuntimeRequestTimings {
-                    queued_at: queued.queued_at,
+                    queued_at: prepared.queued_at,
                     started_at,
                     finished_at,
                     queue_time,
@@ -1235,8 +1421,362 @@ fn execute_queued_request(inner: &RuntimeExecutorInner, queued: QueuedRuntimeReq
             }));
         }
         Err(error) => {
-            inner.record_failed(queue_time, run_time, false);
-            let _ = queued.sender.send(Err(error));
+            inner.record_failed(queue_time, run_time, false, true);
+            let _ = prepared.sender.send(Err(error));
+        }
+    }
+}
+
+fn can_batch_queued_requests(
+    first: &QueuedRuntimeRequest,
+    candidate: &QueuedRuntimeRequest,
+) -> bool {
+    first.priority == candidate.priority
+        && first.request.graph_idx == candidate.request.graph_idx
+        && first.request.options == candidate.request.options
+        && inputs_are_batch_compatible(&first.request.inputs, &candidate.request.inputs)
+}
+
+fn inputs_are_batch_compatible(first: &RuntimeInputs, candidate: &RuntimeInputs) -> bool {
+    if first.len() != candidate.len()
+        || request_leading_batch_size(first).is_none()
+        || request_leading_batch_size(candidate).is_none()
+    {
+        return false;
+    }
+    first.iter().all(|(name, tensor)| {
+        candidate
+            .get(name)
+            .is_some_and(|other| tensors_are_batch_compatible(tensor, other))
+    })
+}
+
+fn request_leading_batch_size(inputs: &RuntimeInputs) -> Option<usize> {
+    let mut leading = None;
+    for tensor in inputs.values() {
+        let shape = runtime_tensor_shape(tensor);
+        let &first_dim = shape.first()?;
+        if leading.is_some_and(|existing| existing != first_dim) {
+            return None;
+        }
+        leading = Some(first_dim);
+    }
+    leading
+}
+
+fn tensors_are_batch_compatible(first: &RuntimeTensor, candidate: &RuntimeTensor) -> bool {
+    match (first, candidate) {
+        (
+            RuntimeTensor::F32 {
+                shape: first_shape, ..
+            },
+            RuntimeTensor::F32 {
+                shape: candidate_shape,
+                ..
+            },
+        )
+        | (
+            RuntimeTensor::F64 {
+                shape: first_shape, ..
+            },
+            RuntimeTensor::F64 {
+                shape: candidate_shape,
+                ..
+            },
+        )
+        | (
+            RuntimeTensor::I64 {
+                shape: first_shape, ..
+            },
+            RuntimeTensor::I64 {
+                shape: candidate_shape,
+                ..
+            },
+        )
+        | (
+            RuntimeTensor::I32 {
+                shape: first_shape, ..
+            },
+            RuntimeTensor::I32 {
+                shape: candidate_shape,
+                ..
+            },
+        )
+        | (
+            RuntimeTensor::U8 {
+                shape: first_shape, ..
+            },
+            RuntimeTensor::U8 {
+                shape: candidate_shape,
+                ..
+            },
+        )
+        | (
+            RuntimeTensor::I8 {
+                shape: first_shape, ..
+            },
+            RuntimeTensor::I8 {
+                shape: candidate_shape,
+                ..
+            },
+        )
+        | (
+            RuntimeTensor::Bool {
+                shape: first_shape, ..
+            },
+            RuntimeTensor::Bool {
+                shape: candidate_shape,
+                ..
+            },
+        ) => {
+            !first_shape.is_empty()
+                && first_shape.len() == candidate_shape.len()
+                && first_shape[1..] == candidate_shape[1..]
+        }
+        _ => false,
+    }
+}
+
+fn run_prepared_batch(
+    inner: &RuntimeExecutorInner,
+    prepared: &[PreparedRuntimeRequest],
+) -> std::result::Result<(), ()> {
+    let (inputs, batch_sizes) = merge_prepared_inputs(prepared).map_err(|_| ())?;
+    let graph_idx = prepared[0].request.graph_idx;
+    let options = prepared[0].request.options.clone();
+    let started_at = Instant::now();
+    let outputs = inner
+        .engine
+        .run(graph_idx, options, inputs)
+        .map_err(|_| ())?;
+    let finished_at = Instant::now();
+    let run_time = finished_at.saturating_duration_since(started_at);
+    let split_outputs = split_runtime_outputs(outputs, &batch_sizes).map_err(|_| ())?;
+    let queue_times = prepared
+        .iter()
+        .map(|request| started_at.saturating_duration_since(request.queued_at))
+        .collect::<Vec<_>>();
+    inner.record_completed_batch(&queue_times, run_time, prepared.len());
+
+    for ((prepared, outputs), queue_time) in prepared.iter().zip(split_outputs).zip(queue_times) {
+        prepared.cancellation.mark_completed();
+        let _ = prepared.sender.send(Ok(RuntimeResponse {
+            request_id: prepared.request.request_id.clone(),
+            outputs,
+            timings: RuntimeRequestTimings {
+                queued_at: prepared.queued_at,
+                started_at,
+                finished_at,
+                queue_time,
+                run_time,
+            },
+        }));
+    }
+    Ok(())
+}
+
+fn merge_prepared_inputs(
+    prepared: &[PreparedRuntimeRequest],
+) -> Result<(RuntimeInputs, Vec<usize>)> {
+    let first = prepared
+        .first()
+        .ok_or_else(|| RuntimeError::Shape("cannot batch zero requests".to_string()))?;
+    let batch_sizes = prepared
+        .iter()
+        .map(|request| {
+            request_leading_batch_size(&request.request.inputs).ok_or_else(|| {
+                RuntimeError::Shape(format!(
+                    "request {} has no leading batch dimension",
+                    request.request.request_id
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let mut inputs = RuntimeInputs::with_capacity(first.request.inputs.len());
+    for name in first.request.inputs.keys() {
+        let tensors = prepared
+            .iter()
+            .map(|request| {
+                request.request.inputs.get(name).ok_or_else(|| {
+                    RuntimeError::Shape(format!(
+                        "request {} is missing batched input {name}",
+                        request.request.request_id
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        inputs.insert(name.clone(), merge_runtime_tensors(name, &tensors)?);
+    }
+    Ok((inputs, batch_sizes))
+}
+
+fn split_runtime_outputs(
+    outputs: RuntimeOutputs,
+    batch_sizes: &[usize],
+) -> Result<Vec<RuntimeOutputs>> {
+    let mut per_request = (0..batch_sizes.len())
+        .map(|_| RuntimeOutputs::new())
+        .collect::<Vec<_>>();
+    for (name, tensor) in outputs {
+        let split = split_runtime_tensor(&name, tensor, batch_sizes)?;
+        for (request_outputs, tensor) in per_request.iter_mut().zip(split) {
+            request_outputs.insert(name.clone(), tensor);
+        }
+    }
+    Ok(per_request)
+}
+
+fn runtime_tensor_shape(tensor: &RuntimeTensor) -> &[usize] {
+    match tensor {
+        RuntimeTensor::F32 { shape, .. }
+        | RuntimeTensor::F64 { shape, .. }
+        | RuntimeTensor::I64 { shape, .. }
+        | RuntimeTensor::I32 { shape, .. }
+        | RuntimeTensor::U8 { shape, .. }
+        | RuntimeTensor::I8 { shape, .. }
+        | RuntimeTensor::Bool { shape, .. } => shape,
+    }
+}
+
+fn leading_batch_parts(name: &str, shape: &[usize], data_len: usize) -> Result<(usize, usize)> {
+    let Some((&batch_size, trailing_shape)) = shape.split_first() else {
+        return Err(RuntimeError::Shape(format!(
+            "tensor {name} has no leading batch dimension"
+        )));
+    };
+    let trailing_elements = trailing_shape.iter().try_fold(1usize, |acc, &dim| {
+        acc.checked_mul(dim)
+            .ok_or_else(|| RuntimeError::Shape(format!("tensor {name} shape overflows usize")))
+    })?;
+    let expected = batch_size.checked_mul(trailing_elements).ok_or_else(|| {
+        RuntimeError::Shape(format!("tensor {name} element count overflows usize"))
+    })?;
+    if expected != data_len {
+        return Err(RuntimeError::Shape(format!(
+            "tensor {name} shape {:?} implies {expected} elements, got {data_len}",
+            shape
+        )));
+    }
+    Ok((batch_size, trailing_elements))
+}
+
+macro_rules! merge_runtime_tensor_variant {
+    ($name:expr, $tensors:expr, $variant:ident) => {{
+        let mut merged_shape = Vec::new();
+        let mut merged_data = Vec::new();
+        for (idx, tensor) in $tensors.iter().enumerate() {
+            let RuntimeTensor::$variant { shape, data } = tensor else {
+                return Err(RuntimeError::Shape(format!(
+                    "input {} has mixed tensor dtypes for batching",
+                    $name
+                )));
+            };
+            let (batch_size, _) = leading_batch_parts($name, shape, data.len())?;
+            if idx == 0 {
+                merged_shape = shape.clone();
+                merged_shape[0] = 0;
+            } else if shape[1..] != merged_shape[1..] {
+                return Err(RuntimeError::Shape(format!(
+                    "input {} has incompatible trailing dimensions for batching",
+                    $name
+                )));
+            }
+            merged_shape[0] = merged_shape[0].checked_add(batch_size).ok_or_else(|| {
+                RuntimeError::Shape(format!("input {} batch dimension overflows usize", $name))
+            })?;
+            merged_data.extend_from_slice(data);
+        }
+        Ok(RuntimeTensor::$variant {
+            shape: merged_shape,
+            data: merged_data,
+        })
+    }};
+}
+
+fn merge_runtime_tensors(name: &str, tensors: &[&RuntimeTensor]) -> Result<RuntimeTensor> {
+    let Some(first) = tensors.first() else {
+        return Err(RuntimeError::Shape(format!(
+            "input {name} has no tensors to batch"
+        )));
+    };
+    match first {
+        RuntimeTensor::F32 { .. } => merge_runtime_tensor_variant!(name, tensors, F32),
+        RuntimeTensor::F64 { .. } => merge_runtime_tensor_variant!(name, tensors, F64),
+        RuntimeTensor::I64 { .. } => merge_runtime_tensor_variant!(name, tensors, I64),
+        RuntimeTensor::I32 { .. } => merge_runtime_tensor_variant!(name, tensors, I32),
+        RuntimeTensor::U8 { .. } => merge_runtime_tensor_variant!(name, tensors, U8),
+        RuntimeTensor::I8 { .. } => merge_runtime_tensor_variant!(name, tensors, I8),
+        RuntimeTensor::Bool { .. } => merge_runtime_tensor_variant!(name, tensors, Bool),
+    }
+}
+
+macro_rules! split_runtime_tensor_variant {
+    ($name:expr, $shape:expr, $data:expr, $batch_sizes:expr, $variant:ident) => {{
+        let total_batch = $batch_sizes.iter().try_fold(0usize, |acc, &batch_size| {
+            acc.checked_add(batch_size).ok_or_else(|| {
+                RuntimeError::Shape(format!("output {} batch dimension overflows usize", $name))
+            })
+        })?;
+        let (batch_size, trailing_elements) = leading_batch_parts($name, &$shape, $data.len())?;
+        if batch_size != total_batch {
+            return Err(RuntimeError::Shape(format!(
+                "output {} leading batch dimension is {batch_size}, expected {total_batch}",
+                $name
+            )));
+        }
+        let mut offset = 0usize;
+        let mut split = Vec::with_capacity($batch_sizes.len());
+        for &request_batch_size in $batch_sizes {
+            let len = request_batch_size
+                .checked_mul(trailing_elements)
+                .ok_or_else(|| {
+                    RuntimeError::Shape(format!(
+                        "output {} split element count overflows usize",
+                        $name
+                    ))
+                })?;
+            let end = offset.checked_add(len).ok_or_else(|| {
+                RuntimeError::Shape(format!("output {} split range overflows usize", $name))
+            })?;
+            let mut shape = $shape.clone();
+            shape[0] = request_batch_size;
+            split.push(RuntimeTensor::$variant {
+                shape,
+                data: $data[offset..end].to_vec(),
+            });
+            offset = end;
+        }
+        Ok(split)
+    }};
+}
+
+fn split_runtime_tensor(
+    name: &str,
+    tensor: RuntimeTensor,
+    batch_sizes: &[usize],
+) -> Result<Vec<RuntimeTensor>> {
+    match tensor {
+        RuntimeTensor::F32 { shape, data } => {
+            split_runtime_tensor_variant!(name, shape, data, batch_sizes, F32)
+        }
+        RuntimeTensor::F64 { shape, data } => {
+            split_runtime_tensor_variant!(name, shape, data, batch_sizes, F64)
+        }
+        RuntimeTensor::I64 { shape, data } => {
+            split_runtime_tensor_variant!(name, shape, data, batch_sizes, I64)
+        }
+        RuntimeTensor::I32 { shape, data } => {
+            split_runtime_tensor_variant!(name, shape, data, batch_sizes, I32)
+        }
+        RuntimeTensor::U8 { shape, data } => {
+            split_runtime_tensor_variant!(name, shape, data, batch_sizes, U8)
+        }
+        RuntimeTensor::I8 { shape, data } => {
+            split_runtime_tensor_variant!(name, shape, data, batch_sizes, I8)
+        }
+        RuntimeTensor::Bool { shape, data } => {
+            split_runtime_tensor_variant!(name, shape, data, batch_sizes, Bool)
         }
     }
 }
@@ -2271,6 +2811,7 @@ mod tests {
             RuntimeExecutorConfig {
                 worker_threads: 0,
                 queue_capacity: 4,
+                dynamic_batching: None,
             },
         );
 
@@ -2305,6 +2846,7 @@ mod tests {
             RuntimeExecutorConfig {
                 worker_threads: 0,
                 queue_capacity: 4,
+                dynamic_batching: None,
             },
         );
 
@@ -2334,6 +2876,7 @@ mod tests {
             RuntimeExecutorConfig {
                 worker_threads: 0,
                 queue_capacity: 4,
+                dynamic_batching: None,
             },
         );
         let expired = Instant::now() - Duration::from_secs(1);
@@ -2364,6 +2907,7 @@ mod tests {
             RuntimeExecutorConfig {
                 worker_threads: 0,
                 queue_capacity: 4,
+                dynamic_batching: None,
             },
         );
         let handle = executor
@@ -2396,6 +2940,7 @@ mod tests {
             RuntimeExecutorConfig {
                 worker_threads: 0,
                 queue_capacity: 4,
+                dynamic_batching: None,
             },
         );
         let handle = executor
@@ -2427,6 +2972,7 @@ mod tests {
             RuntimeExecutorConfig {
                 worker_threads: 0,
                 queue_capacity: 4,
+                dynamic_batching: None,
             },
         );
         let handle = executor.submit(add_request("done", 1.0, 10.0)).unwrap();
@@ -2453,6 +2999,7 @@ mod tests {
             RuntimeExecutorConfig {
                 worker_threads: 0,
                 queue_capacity: 4,
+                dynamic_batching: None,
             },
         );
         let handle = executor
@@ -2489,6 +3036,7 @@ mod tests {
             RuntimeExecutorConfig {
                 worker_threads: 0,
                 queue_capacity: 1,
+                dynamic_batching: None,
             },
         );
 
@@ -2500,6 +3048,93 @@ mod tests {
             err,
             RuntimeError::ExecutorQueueFull { capacity: 1 }
         ));
+    }
+
+    #[test]
+    fn executor_batches_compatible_requests() {
+        let dir = tempdir().unwrap();
+        let engine = dynamic_add_graph_engine(dir.path().join("executor-batch.rsmf"));
+        let executor = RuntimeExecutor::new(
+            engine,
+            RuntimeExecutorConfig {
+                worker_threads: 0,
+                queue_capacity: 8,
+                dynamic_batching: Some(DynamicBatchingConfig {
+                    max_batch_size: 4,
+                    max_queue_delay: Duration::ZERO,
+                }),
+            },
+        );
+
+        let first = executor
+            .submit(dynamic_add_request("first", &[1.0, 2.0], &[10.0, 20.0]))
+            .unwrap();
+        let second = executor
+            .submit(dynamic_add_request("second", &[3.0, 4.0], &[30.0, 40.0]))
+            .unwrap();
+
+        assert!(executor.execute_next().unwrap());
+        let first_response = first.wait().unwrap();
+        let second_response = second.wait().unwrap();
+        assert_eq!(f32_output_shape(&first_response, "z"), vec![1, 2]);
+        assert_eq!(f32_output(&first_response, "z"), vec![11.0, 22.0]);
+        assert_eq!(f32_output_shape(&second_response, "z"), vec![1, 2]);
+        assert_eq!(f32_output(&second_response, "z"), vec![33.0, 44.0]);
+
+        let metrics = executor.metrics().unwrap();
+        assert_eq!(metrics.submitted, 2);
+        assert_eq!(metrics.completed, 2);
+        assert_eq!(metrics.failed, 0);
+        assert_eq!(metrics.runtime_invocations, 1);
+        assert_eq!(metrics.batches_executed, 1);
+        assert_eq!(metrics.batched_requests, 2);
+        assert_eq!(metrics.batch_fallbacks, 0);
+    }
+
+    #[test]
+    fn executor_skips_incompatible_batch_candidates() {
+        let dir = tempdir().unwrap();
+        let engine = dynamic_add_graph_engine(dir.path().join("executor-batch-skip.rsmf"));
+        let executor = RuntimeExecutor::new(
+            engine,
+            RuntimeExecutorConfig {
+                worker_threads: 0,
+                queue_capacity: 8,
+                dynamic_batching: Some(DynamicBatchingConfig {
+                    max_batch_size: 4,
+                    max_queue_delay: Duration::ZERO,
+                }),
+            },
+        );
+
+        let first = executor
+            .submit(dynamic_add_request("first", &[1.0, 2.0], &[10.0, 20.0]))
+            .unwrap();
+        let incompatible = executor
+            .submit(
+                dynamic_add_request("incompatible", &[3.0, 4.0], &[30.0, 40.0]).with_priority(-1),
+            )
+            .unwrap();
+
+        assert!(executor.execute_next().unwrap());
+        let first_response = first.wait().unwrap();
+        assert_eq!(f32_output(&first_response, "z"), vec![11.0, 22.0]);
+        assert!(matches!(
+            incompatible.receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+
+        assert!(executor.execute_next().unwrap());
+        let incompatible_response = incompatible.wait().unwrap();
+        assert_eq!(f32_output(&incompatible_response, "z"), vec![33.0, 44.0]);
+
+        let metrics = executor.metrics().unwrap();
+        assert_eq!(metrics.submitted, 2);
+        assert_eq!(metrics.completed, 2);
+        assert_eq!(metrics.runtime_invocations, 2);
+        assert_eq!(metrics.batches_executed, 0);
+        assert_eq!(metrics.batched_requests, 0);
+        assert_eq!(metrics.batch_fallbacks, 0);
     }
 
     fn tiny_add_onnx_model() -> Vec<u8> {
@@ -2538,6 +3173,25 @@ mod tests {
         push_message(&mut graph, 11, value_info("x", &[2]));
         push_message(&mut graph, 11, value_info("y", &[2]));
         push_message(&mut graph, 12, value_info("z", &[2]));
+        graph
+    }
+
+    fn tiny_dynamic_add_onnx_model() -> Vec<u8> {
+        let mut model = Vec::new();
+        push_i64(&mut model, 1, 7);
+        push_string(&mut model, 2, "rsmf-runtime-test");
+        push_message(&mut model, 7, tiny_dynamic_add_graph());
+        push_message(&mut model, 8, opset_import("", 13));
+        model
+    }
+
+    fn tiny_dynamic_add_graph() -> Vec<u8> {
+        let mut graph = Vec::new();
+        push_message(&mut graph, 1, add_node());
+        push_string(&mut graph, 2, "rsmf_dynamic_add_graph");
+        push_message(&mut graph, 11, dynamic_value_info("x"));
+        push_message(&mut graph, 11, dynamic_value_info("y"));
+        push_message(&mut graph, 12, dynamic_value_info("z"));
         graph
     }
 
@@ -2633,6 +3287,23 @@ mod tests {
         Engine::new(RsmfFile::open(path).unwrap()).unwrap()
     }
 
+    fn dynamic_add_graph_engine(path: std::path::PathBuf) -> Engine {
+        RsmfWriter::new()
+            .with_tensor(TensorInput {
+                name: "fixture.weight".to_string(),
+                dtype: LogicalDtype::F32,
+                shape: vec![1],
+                shard_id: 0,
+                metadata: Vec::new(),
+                canonical: VariantInput::canonical_raw(0.0f32.to_le_bytes().to_vec()),
+                packed: Vec::new(),
+            })
+            .with_graph(GraphInput::onnx(tiny_dynamic_add_onnx_model()))
+            .write_to_path(&path)
+            .unwrap();
+        Engine::new(RsmfFile::open(path).unwrap()).unwrap()
+    }
+
     fn add_request(request_id: &str, x: f32, y: f32) -> RuntimeRequest {
         RuntimeRequest::new(
             request_id,
@@ -2656,9 +3327,39 @@ mod tests {
         )
     }
 
+    fn dynamic_add_request(request_id: &str, x: &[f32], y: &[f32]) -> RuntimeRequest {
+        RuntimeRequest::new(
+            request_id,
+            0,
+            HashMap::from([
+                (
+                    "x".to_string(),
+                    RuntimeTensor::F32 {
+                        shape: vec![1, x.len()],
+                        data: x.to_vec(),
+                    },
+                ),
+                (
+                    "y".to_string(),
+                    RuntimeTensor::F32 {
+                        shape: vec![1, y.len()],
+                        data: y.to_vec(),
+                    },
+                ),
+            ]),
+        )
+    }
+
     fn f32_output(response: &RuntimeResponse, name: &str) -> Vec<f32> {
         match response.outputs.get(name).unwrap() {
             RuntimeTensor::F32 { data, .. } => data.clone(),
+            other => panic!("expected F32 output, got {other:?}"),
+        }
+    }
+
+    fn f32_output_shape(response: &RuntimeResponse, name: &str) -> Vec<usize> {
+        match response.outputs.get(name).unwrap() {
+            RuntimeTensor::F32 { shape, .. } => shape.clone(),
             other => panic!("expected F32 output, got {other:?}"),
         }
     }
@@ -2674,10 +3375,27 @@ mod tests {
         value
     }
 
+    fn dynamic_value_info(name: &str) -> Vec<u8> {
+        let mut value = Vec::new();
+        push_string(&mut value, 1, name);
+        push_message(&mut value, 2, dynamic_type_proto());
+        value
+    }
+
     fn type_proto(data_type: i32, shape: &[i64]) -> Vec<u8> {
         let mut tensor = Vec::new();
         push_i32(&mut tensor, 1, data_type);
         push_message(&mut tensor, 2, tensor_shape(shape));
+
+        let mut type_proto = Vec::new();
+        push_message(&mut type_proto, 1, tensor);
+        type_proto
+    }
+
+    fn dynamic_type_proto() -> Vec<u8> {
+        let mut tensor = Vec::new();
+        push_i32(&mut tensor, 1, 1);
+        push_message(&mut tensor, 2, dynamic_tensor_shape());
 
         let mut type_proto = Vec::new();
         push_message(&mut type_proto, 1, tensor);
@@ -2691,6 +3409,18 @@ mod tests {
             push_i64(&mut dimension, 1, dim);
             push_message(&mut tensor_shape, 1, dimension);
         }
+        tensor_shape
+    }
+
+    fn dynamic_tensor_shape() -> Vec<u8> {
+        let mut tensor_shape = Vec::new();
+        let mut batch = Vec::new();
+        push_string(&mut batch, 2, "batch");
+        push_message(&mut tensor_shape, 1, batch);
+
+        let mut width = Vec::new();
+        push_i64(&mut width, 1, 2);
+        push_message(&mut tensor_shape, 1, width);
         tensor_shape
     }
 
