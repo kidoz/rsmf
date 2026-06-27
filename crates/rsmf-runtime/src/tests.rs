@@ -1,3 +1,4 @@
+use super::native_decoder::*;
 use super::*;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
