@@ -2,6 +2,103 @@ use ort::session::builder::GraphOptimizationLevel as OrtGraphOptimizationLevel;
 use ort::value::Outlet;
 use serde::{Deserialize, Serialize};
 
+/// Byte-valued runtime memory measurement.
+///
+/// Some memory sources, such as ORT provider allocator statistics, depend on
+/// upstream runtime APIs that may not be exposed safely by the pinned backend.
+/// Those fields are reported as explicitly unavailable instead of inferred.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum RuntimeMemoryMeasurement {
+    /// The runtime measured this memory source.
+    Available {
+        /// Measured byte count.
+        bytes: usize,
+    },
+    /// The runtime cannot measure this memory source with the current backend
+    /// and build.
+    Unavailable {
+        /// Human-readable reason.
+        reason: String,
+    },
+}
+
+impl RuntimeMemoryMeasurement {
+    /// Build an available byte measurement.
+    #[must_use]
+    pub fn available(bytes: usize) -> Self {
+        Self::Available { bytes }
+    }
+
+    /// Build an explicit unavailable measurement.
+    #[must_use]
+    pub fn unavailable(reason: impl Into<String>) -> Self {
+        Self::Unavailable {
+            reason: reason.into(),
+        }
+    }
+
+    /// Return measured bytes when available.
+    #[must_use]
+    pub fn bytes(&self) -> Option<usize> {
+        match self {
+            Self::Available { bytes } => Some(*bytes),
+            Self::Unavailable { .. } => None,
+        }
+    }
+}
+
+/// Runtime feature or backend capability.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum RuntimeCapability {
+    /// The capability is available.
+    Available,
+    /// The capability is not available in this runtime build or backend.
+    Unavailable {
+        /// Human-readable reason.
+        reason: String,
+    },
+}
+
+impl RuntimeCapability {
+    /// Build an unavailable capability report.
+    #[must_use]
+    pub fn unavailable(reason: impl Into<String>) -> Self {
+        Self::Unavailable {
+            reason: reason.into(),
+        }
+    }
+
+    /// Return whether the capability is available.
+    #[must_use]
+    pub fn is_available(&self) -> bool {
+        matches!(self, Self::Available)
+    }
+}
+
+/// Runtime capability report for residency-sensitive execution features.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeCapabilityReport {
+    /// Safe ORT CPU I/O binding support for owned runtime tensors.
+    pub ort_cpu_io_binding: RuntimeCapability,
+    /// ORT provider allocator memory statistics.
+    pub ort_provider_allocator_stats: RuntimeCapability,
+    /// True borrowed mmap-backed ONNX initializer binding.
+    pub mmap_initializer_zero_copy: RuntimeCapability,
+}
+
+/// Runtime I/O binding policy for ORT graph execution.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IoBindingPolicy {
+    /// Use the standard ORT `Session::run` API.
+    #[default]
+    Disabled,
+    /// Bind owned CPU tensors through ORT's safe `IoBinding` API.
+    Cpu,
+}
+
 /// ONNX Runtime graph optimization level.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -104,6 +201,8 @@ pub struct SessionOptions {
     pub execution_providers: Vec<ExecutionProvider>,
     /// ONNX initializer names to bind from RSMF tensors.
     pub initializers: Vec<InitializerBinding>,
+    /// Optional ORT I/O binding policy.
+    pub io_binding: IoBindingPolicy,
 }
 
 impl Default for SessionOptions {
@@ -117,6 +216,7 @@ impl Default for SessionOptions {
             deterministic_compute: false,
             execution_providers: vec![ExecutionProvider::default()],
             initializers: Vec::new(),
+            io_binding: IoBindingPolicy::Disabled,
         }
     }
 }
@@ -168,6 +268,10 @@ pub struct InitializerMemoryReport {
     pub variant_idx: Option<u32>,
     /// Bytes materialized into an ORT-owned initializer value.
     pub materialized_bytes: usize,
+    /// Bytes in the selected RSMF tensor variant used as the initializer source.
+    pub source_bytes: usize,
+    /// Bytes bound through a true zero-copy initializer path.
+    pub zero_copy_bytes: usize,
 }
 
 /// Memory accounting captured when a session is built.
@@ -179,6 +283,17 @@ pub struct SessionMemoryReport {
     pub initializers: Vec<InitializerMemoryReport>,
     /// Total initializer bytes materialized into ORT-owned values.
     pub initializer_materialized_bytes: usize,
+    /// Total selected RSMF tensor source bytes for initializer bindings.
+    pub initializer_source_bytes: usize,
+    /// Total initializer bytes kept in borrowed zero-copy residency.
+    pub initializer_zero_copy_bytes: usize,
+    /// ORT provider allocator memory accounting, if exposed safely.
+    pub provider_allocator_bytes: RuntimeMemoryMeasurement,
+    /// Process resident set size observed after session construction, if
+    /// supported on this target.
+    pub process_resident_set_bytes: RuntimeMemoryMeasurement,
+    /// I/O binding policy configured for this session.
+    pub io_binding: IoBindingPolicy,
 }
 
 impl SessionMemoryReport {
@@ -187,4 +302,53 @@ impl SessionMemoryReport {
     pub fn initializer_count(&self) -> usize {
         self.initializers.len()
     }
+}
+
+pub(crate) fn runtime_capability_report() -> RuntimeCapabilityReport {
+    RuntimeCapabilityReport {
+        ort_cpu_io_binding: RuntimeCapability::Available,
+        ort_provider_allocator_stats: RuntimeCapability::unavailable(
+            "the pinned safe ort crate does not expose provider allocator byte counters",
+        ),
+        mmap_initializer_zero_copy: RuntimeCapability::unavailable(
+            "ONNX external initializer binding currently requires an ORT-owned value; borrowed RSMF mmap initializer lifetimes are not exposed safely",
+        ),
+    }
+}
+
+pub(crate) fn current_process_resident_set_bytes() -> RuntimeMemoryMeasurement {
+    current_process_resident_set_bytes_impl()
+}
+
+#[cfg(target_os = "linux")]
+fn current_process_resident_set_bytes_impl() -> RuntimeMemoryMeasurement {
+    let status = match std::fs::read_to_string("/proc/self/status") {
+        Ok(status) => status,
+        Err(error) => {
+            return RuntimeMemoryMeasurement::unavailable(format!(
+                "failed to read /proc/self/status: {error}"
+            ));
+        }
+    };
+    for line in status.lines() {
+        let Some(rest) = line.strip_prefix("VmRSS:") else {
+            continue;
+        };
+        let mut parts = rest.split_whitespace();
+        let Some(kib) = parts.next().and_then(|value| value.parse::<usize>().ok()) else {
+            return RuntimeMemoryMeasurement::unavailable("VmRSS was not a numeric KiB value");
+        };
+        return match kib.checked_mul(1024) {
+            Some(bytes) => RuntimeMemoryMeasurement::available(bytes),
+            None => RuntimeMemoryMeasurement::unavailable("VmRSS byte count overflowed usize"),
+        };
+    }
+    RuntimeMemoryMeasurement::unavailable("/proc/self/status did not contain VmRSS")
+}
+
+#[cfg(not(target_os = "linux"))]
+fn current_process_resident_set_bytes_impl() -> RuntimeMemoryMeasurement {
+    RuntimeMemoryMeasurement::unavailable(
+        "process RSS measurement is implemented only for Linux /proc in this build",
+    )
 }

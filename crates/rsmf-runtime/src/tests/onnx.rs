@@ -19,7 +19,15 @@ fn session_options_participate_in_cache_key() {
             ..SessionOptions::default()
         },
     );
+    let io_binding_key = SessionKey::new(
+        0,
+        SessionOptions {
+            io_binding: IoBindingPolicy::Cpu,
+            ..SessionOptions::default()
+        },
+    );
     assert_ne!(default_key, tuned_key);
+    assert_ne!(default_key, io_binding_key);
 }
 
 #[test]
@@ -88,6 +96,25 @@ fn runs_embedded_onnx_add_graph_from_rsmf() {
     assert_eq!(handle.memory_report().graph_payload_bytes, graph.len());
     assert_eq!(handle.memory_report().initializer_count(), 0);
     assert_eq!(handle.memory_report().initializer_materialized_bytes, 0);
+    assert_eq!(handle.memory_report().initializer_source_bytes, 0);
+    assert_eq!(handle.memory_report().initializer_zero_copy_bytes, 0);
+    assert_eq!(handle.memory_report().io_binding, IoBindingPolicy::Disabled);
+    assert!(matches!(
+        &handle.memory_report().provider_allocator_bytes,
+        RuntimeMemoryMeasurement::Unavailable { .. }
+    ));
+    assert!(matches!(
+        handle.capability_report().ort_cpu_io_binding,
+        RuntimeCapability::Available
+    ));
+    assert!(matches!(
+        handle.capability_report().ort_provider_allocator_stats,
+        RuntimeCapability::Unavailable { .. }
+    ));
+    assert!(matches!(
+        handle.capability_report().mmap_initializer_zero_copy,
+        RuntimeCapability::Unavailable { .. }
+    ));
     let input_names = handle
         .inputs()
         .iter()
@@ -123,6 +150,52 @@ fn runs_embedded_onnx_add_graph_from_rsmf() {
 }
 
 #[test]
+fn runs_embedded_onnx_add_graph_with_cpu_io_binding_policy() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("add-iobinding.onnx.rsmf");
+    RsmfWriter::new()
+        .with_tensor(TensorInput {
+            name: "fixture.weight".to_string(),
+            dtype: LogicalDtype::F32,
+            shape: vec![1],
+            shard_id: 0,
+            metadata: Vec::new(),
+            canonical: VariantInput::canonical_raw(0.0f32.to_le_bytes().to_vec()),
+            packed: Vec::new(),
+        })
+        .with_graph(GraphInput::onnx(tiny_add_onnx_model()))
+        .write_to_path(&path)
+        .unwrap();
+
+    let engine = Engine::new(RsmfFile::open(path).unwrap()).unwrap();
+    let options = SessionOptions {
+        io_binding: IoBindingPolicy::Cpu,
+        ..SessionOptions::default()
+    };
+    let handle = engine.session_handle(0, options.clone()).unwrap();
+    assert_eq!(handle.memory_report().io_binding, IoBindingPolicy::Cpu);
+    let outputs = engine
+        .run_f32_with_options(
+            0,
+            options,
+            HashMap::from([
+                (
+                    "x".to_string(),
+                    ArrayD::from_shape_vec(vec![2], vec![1.5, -2.0]).unwrap(),
+                ),
+                (
+                    "y".to_string(),
+                    ArrayD::from_shape_vec(vec![2], vec![2.5, 3.0]).unwrap(),
+                ),
+            ]),
+        )
+        .unwrap();
+
+    let z = outputs.get("z").unwrap();
+    assert_eq!(z.iter().copied().collect::<Vec<_>>(), vec![4.0, 1.0]);
+}
+
+#[test]
 fn runs_onnx_graph_with_rsmf_external_initializer() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("add-initializer.onnx.rsmf");
@@ -151,6 +224,8 @@ fn runs_onnx_graph_with_rsmf_external_initializer() {
     assert_eq!(memory_report.graph_payload_bytes, graph.len());
     assert_eq!(memory_report.initializer_count(), 1);
     assert_eq!(memory_report.initializer_materialized_bytes, 8);
+    assert_eq!(memory_report.initializer_source_bytes, 8);
+    assert_eq!(memory_report.initializer_zero_copy_bytes, 0);
     assert_eq!(
         memory_report.initializers,
         vec![InitializerMemoryReport {
@@ -158,6 +233,8 @@ fn runs_onnx_graph_with_rsmf_external_initializer() {
             tensor_name: "bias.tensor".to_string(),
             variant_idx: None,
             materialized_bytes: 8,
+            source_bytes: 8,
+            zero_copy_bytes: 0,
         }]
     );
     let cached_handle = engine.session_handle(0, options.clone()).unwrap();
@@ -221,6 +298,8 @@ fn runs_onnx_graph_with_selected_raw_rsmf_initializer_variant() {
     };
     let handle = engine.session_handle(0, options.clone()).unwrap();
     assert_eq!(handle.memory_report().initializer_materialized_bytes, 8);
+    assert_eq!(handle.memory_report().initializer_source_bytes, 8);
+    assert_eq!(handle.memory_report().initializer_zero_copy_bytes, 0);
     assert_eq!(
         handle.memory_report().initializers,
         vec![InitializerMemoryReport {
@@ -228,6 +307,8 @@ fn runs_onnx_graph_with_selected_raw_rsmf_initializer_variant() {
             tensor_name: "bias.tensor".to_string(),
             variant_idx: Some(1),
             materialized_bytes: 8,
+            source_bytes: 8,
+            zero_copy_bytes: 0,
         }]
     );
 
@@ -312,6 +393,8 @@ fn runs_onnx_graph_with_i64_rsmf_external_initializer() {
     assert_eq!(handle.memory_report().graph_payload_bytes, graph.len());
     assert_eq!(handle.memory_report().initializer_count(), 1);
     assert_eq!(handle.memory_report().initializer_materialized_bytes, 16);
+    assert_eq!(handle.memory_report().initializer_source_bytes, 16);
+    assert_eq!(handle.memory_report().initializer_zero_copy_bytes, 0);
 
     let outputs = engine
         .run(

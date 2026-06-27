@@ -29,6 +29,7 @@ pub use network::{
 };
 pub use session::{
     ExecutionProvider, GraphOptimizationLevel, InitializerBinding, InitializerMemoryReport,
+    IoBindingPolicy, RuntimeCapability, RuntimeCapabilityReport, RuntimeMemoryMeasurement,
     SessionKey, SessionMemoryReport, SessionOptions, ValueInfo,
 };
 pub use tensor::{RuntimeInputs, RuntimeOutputs, RuntimeTensor, tensor_view_to_ndarray};

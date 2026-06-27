@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use ndarray::ArrayD;
 use ort::ep::CPUExecutionProvider;
+use ort::memory::{AllocationDevice, AllocatorType, MemoryInfo, MemoryType};
 use ort::session::{RunOptions, Session};
 use ort::value::DynValue;
 use rsmf_core::manifest::GraphKind;
@@ -21,8 +22,9 @@ use crate::native_decoder::{
 };
 use crate::onnx::{OnnxTensorDataType, onnx_initializers};
 use crate::session::{
-    ExecutionProvider, InitializerBinding, InitializerMemoryReport, SessionKey,
-    SessionMemoryReport, SessionOptions, ValueInfo,
+    ExecutionProvider, InitializerBinding, InitializerMemoryReport, IoBindingPolicy,
+    RuntimeMemoryMeasurement, SessionKey, SessionMemoryReport, SessionOptions, ValueInfo,
+    current_process_resident_set_bytes, runtime_capability_report,
 };
 use crate::tensor::{materialize_outputs, runtime_tensor_kind, tensor_from_vec};
 use crate::{Result, RuntimeError, RuntimeInputs, RuntimeOutputs, RuntimeTensor, ort_error};
@@ -65,6 +67,12 @@ impl SessionHandle {
         &self.memory_report
     }
 
+    /// Runtime capabilities relevant to this session's residency policy.
+    #[must_use]
+    pub fn capability_report(&self) -> crate::RuntimeCapabilityReport {
+        runtime_capability_report()
+    }
+
     /// Run this cached session with owned runtime tensors.
     pub fn run(&self, inputs: RuntimeInputs) -> Result<RuntimeOutputs> {
         self.run_with_cancellation(inputs, None)
@@ -102,18 +110,27 @@ impl SessionHandle {
                     return Err(error);
                 }
             }
-            let result = session
-                .run_with_options(ort_inputs, &*run_options)
-                .map_err(|e| ort_error("session run", e));
+            let result = if self.key.options.io_binding == IoBindingPolicy::Cpu {
+                run_with_cpu_io_binding(&mut session, &self.outputs, ort_inputs, Some(&run_options))
+            } else {
+                session
+                    .run_with_options(ort_inputs, &*run_options)
+                    .map_err(|e| ort_error("session run", e))
+                    .and_then(materialize_outputs)
+            };
             for cancellation in cancellations {
                 cancellation.clear_run_options();
             }
-            materialize_outputs(result?)
+            result
         } else {
-            let outputs = session
-                .run(ort_inputs)
-                .map_err(|e| ort_error("session run", e))?;
-            materialize_outputs(outputs)
+            if self.key.options.io_binding == IoBindingPolicy::Cpu {
+                run_with_cpu_io_binding(&mut session, &self.outputs, ort_inputs, None)
+            } else {
+                let outputs = session
+                    .run(ort_inputs)
+                    .map_err(|e| ort_error("session run", e))?;
+                materialize_outputs(outputs)
+            }
         }
     }
 
@@ -153,6 +170,13 @@ impl Engine {
     #[must_use]
     pub fn file(&self) -> &RsmfFile {
         &self.file
+    }
+
+    /// Runtime capabilities relevant to residency and provider memory
+    /// accounting.
+    #[must_use]
+    pub fn capability_report(&self) -> crate::RuntimeCapabilityReport {
+        runtime_capability_report()
     }
 
     /// Resolve and validate the native decoder model contract for this RSMF
@@ -448,10 +472,29 @@ impl Engine {
                     RuntimeError::Shape("initializer materialized byte count overflow".to_string())
                 })
             })?;
+        let initializer_source_bytes =
+            initializer_reports.iter().try_fold(0usize, |acc, report| {
+                acc.checked_add(report.source_bytes).ok_or_else(|| {
+                    RuntimeError::Shape("initializer source byte count overflow".to_string())
+                })
+            })?;
+        let initializer_zero_copy_bytes =
+            initializer_reports.iter().try_fold(0usize, |acc, report| {
+                acc.checked_add(report.zero_copy_bytes).ok_or_else(|| {
+                    RuntimeError::Shape("initializer zero-copy byte count overflow".to_string())
+                })
+            })?;
         let memory_report = SessionMemoryReport {
             graph_payload_bytes: payload.bytes.len(),
             initializer_materialized_bytes,
+            initializer_source_bytes,
+            initializer_zero_copy_bytes,
             initializers: initializer_reports,
+            provider_allocator_bytes: RuntimeMemoryMeasurement::unavailable(
+                "the pinned safe ort crate does not expose provider allocator byte counters",
+            ),
+            process_resident_set_bytes: current_process_resident_set_bytes(),
+            io_binding: options.io_binding,
         };
         let session = builder
             .commit_from_memory(payload.bytes)
@@ -480,6 +523,8 @@ impl Engine {
                 tensor_name: binding.tensor_name.clone(),
                 variant_idx: binding.variant_idx,
                 materialized_bytes,
+                source_bytes: view.bytes().len(),
+                zero_copy_bytes: 0,
             },
         })
     }
@@ -576,6 +621,44 @@ impl Engine {
             other => RuntimeError::Core(other),
         })
     }
+}
+
+fn run_with_cpu_io_binding(
+    session: &mut Session,
+    outputs: &[ValueInfo],
+    ort_inputs: Vec<(String, DynValue)>,
+    run_options: Option<&RunOptions>,
+) -> Result<RuntimeOutputs> {
+    let mut binding = session
+        .create_binding()
+        .map_err(|e| ort_error("create I/O binding", e))?;
+    for (name, value) in &ort_inputs {
+        binding
+            .bind_input(name, value)
+            .map_err(|e| ort_error("bind I/O input", e))?;
+    }
+    let cpu_memory = MemoryInfo::new(
+        AllocationDevice::CPU,
+        0,
+        AllocatorType::Device,
+        MemoryType::Default,
+    )
+    .map_err(|e| ort_error("create CPU memory info", e))?;
+    for output in outputs {
+        binding
+            .bind_output_to_device(&output.name, &cpu_memory)
+            .map_err(|e| ort_error("bind I/O output", e))?;
+    }
+    let outputs = if let Some(run_options) = run_options {
+        session
+            .run_binding_with_options(&binding, run_options)
+            .map_err(|e| ort_error("session run with I/O binding", e))?
+    } else {
+        session
+            .run_binding(&binding)
+            .map_err(|e| ort_error("session run with I/O binding", e))?
+    };
+    materialize_outputs(outputs)
 }
 
 fn shape_u64_to_usize(shape: &[u64]) -> std::result::Result<Vec<usize>, String> {
