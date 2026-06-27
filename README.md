@@ -204,13 +204,16 @@ provider defaults, cached sessions, graph input/output metadata, and typed
 owned input/output tensors.
 
 R2 adds explicit initializer bindings through `SessionOptions.initializers`,
-mapping ONNX initializer names to canonical RSMF tensor names. The CPU path
-supports row-major `F32`, `F64`, `I64`, `I32`, `U8`, `I8`, and `Bool`
-initializers, with ONNX initializer dtype/shape preflight before ORT session
-creation. It avoids embedding duplicate weight bytes in the graph payload,
-while the pinned ORT Rust API still materializes an ORT-owned initializer value
-during session build. `SessionHandle::memory_report` exposes graph payload
-bytes and per-initializer materialized bytes.
+mapping ONNX initializer names to RSMF tensor names. Bindings use canonical
+tensors by default and can opt into a specific global RSMF variant index with
+`InitializerBinding::with_variant`. The CPU path supports raw row-major `F32`,
+`F64`, `I64`, `I32`, `U8`, `I8`, and `Bool` initializers, with ONNX
+initializer dtype/shape preflight before ORT session creation. Unsupported
+layouts or encodings fail with typed runtime errors. It avoids embedding
+duplicate weight bytes in the graph payload, while the pinned ORT Rust API
+still materializes an ORT-owned initializer value during session build.
+`SessionHandle::memory_report` exposes graph payload bytes and
+per-initializer materialized bytes.
 
 Build it explicitly:
 

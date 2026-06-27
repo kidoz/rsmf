@@ -28,14 +28,15 @@ rsmf-core  (library)           ← format, reader, writer, validator, selection
   payloads with explicit graph selection, configurable session options, CPU as
   the portable default execution provider, cached sessions, graph
   input/output metadata, typed owned input/output tensors, and explicit
-  ONNX-initializer-to-RSMF-tensor bindings for canonical CPU residency. The
-  initializer path supports row-major `F32`, `F64`, `I64`, `I32`, `U8`, `I8`,
-  and `Bool` tensors. ONNX initializer dtype/shape metadata is preflighted
-  before ORT session creation. `SessionHandle::memory_report()` exposes graph
-  payload bytes and per-initializer materialized bytes. The current initializer
-  path avoids graph-embedded duplicate weight bytes but materializes an
-  ORT-owned value at session build time; mmap/device zero-copy remains future
-  work.
+  ONNX-initializer-to-RSMF-tensor bindings for CPU residency. Bindings default
+  to canonical tensors and may select a specific global RSMF variant index.
+  The initializer path supports raw row-major `F32`, `F64`, `I64`, `I32`,
+  `U8`, `I8`, and `Bool` tensors. ONNX initializer dtype/shape metadata is
+  preflighted before ORT session creation. `SessionHandle::memory_report()`
+  exposes graph payload bytes and per-initializer materialized bytes. The
+  current initializer path avoids graph-embedded duplicate weight bytes but
+  materializes an ORT-owned value at session build time; mmap/device zero-copy
+  remains future work.
 - `rsmf-moe-runtime` is a proof-of-concept runtime for one MoE layer: host-side
   top-1 gating, token batching by destination expert, placement-aware expert
   shard lookup, WGPU expert matmuls when available, and a CPU reference path.
