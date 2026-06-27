@@ -1,14 +1,23 @@
+use std::time::{Duration, Instant};
+
 use rsmf_core::writer::{AssetInput, RsmfWriter, TensorInput, VariantInput};
 use rsmf_core::{LogicalDtype, RsmfFile};
 use rsmf_runtime::{
-    Engine, NATIVE_DECODER_CONFIG_ASSET, NATIVE_DECODER_TOKENIZER_ASSET, NativeDecoderRunOptions,
+    Engine, NATIVE_DECODER_CONFIG_ASSET, NATIVE_DECODER_TOKENIZER_ASSET, NativeDecoderBackend,
+    NativeDecoderRunOptions,
 };
 use tempfile::tempdir;
 
 fn main() -> anyhow::Result<()> {
+    let backend = if std::env::args().any(|arg| arg == "--accelerated") {
+        NativeDecoderBackend::Accelerated
+    } else {
+        NativeDecoderBackend::Auto
+    };
     let dir = tempdir()?;
     let path = dir.path().join("tiny-native-decoder.rsmf");
 
+    let write_start = Instant::now();
     let mut writer = RsmfWriter::new()
         .with_metadata("model.arch", "llama")
         .with_asset(AssetInput::new(
@@ -24,25 +33,39 @@ fn main() -> anyhow::Result<()> {
         writer = writer.with_tensor(tensor_with_values(name, shape, tensor_values(name, shape)));
     }
     writer.write_to_path(&path)?;
+    let write_elapsed = write_start.elapsed();
 
     let engine = Engine::new(RsmfFile::open(&path)?)?;
+    let session_start = Instant::now();
     let session = engine.native_decoder_session()?;
+    let session_elapsed = session_start.elapsed();
+    let generation_start = Instant::now();
     let output = session.generate_text(
         "zero",
         NativeDecoderRunOptions {
             max_new_tokens: 3,
+            backend,
             ..NativeDecoderRunOptions::default()
         },
     )?;
+    let generation_elapsed = generation_start.elapsed();
 
     println!("wrote {}", path.display());
     println!("prompt:     {}", output.prompt);
     println!("generated:  {}", output.generated_text);
     println!("full text:  {}", output.text);
     println!("token ids:  {:?}", output.token_ids);
+    println!("requested:  {backend:?}");
     println!("backend:    {:?}", output.backend);
+    println!("bundle:     {}", format_duration(write_elapsed));
+    println!("session:    {}", format_duration(session_elapsed));
+    println!("generation: {}", format_duration(generation_elapsed));
 
     Ok(())
+}
+
+fn format_duration(duration: Duration) -> String {
+    format!("{:.3} ms", duration.as_secs_f64() * 1_000.0)
 }
 
 fn tiny_config_json() -> String {
