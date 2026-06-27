@@ -30,9 +30,10 @@ rsmf-core  (library)           ← format, reader, writer, validator, selection
   input/output metadata, typed owned input/output tensors, and explicit
   ONNX-initializer-to-RSMF-tensor bindings for canonical F32 CPU residency. ONNX
   initializer dtype/shape metadata is preflighted before ORT session creation.
-  The current initializer path avoids graph-embedded duplicate weight bytes but
-  materializes an ORT-owned value at session build time; mmap/device zero-copy
-  remains future work.
+  `SessionHandle::memory_report()` exposes graph payload bytes and
+  per-initializer materialized bytes. The current initializer path avoids
+  graph-embedded duplicate weight bytes but materializes an ORT-owned value at
+  session build time; mmap/device zero-copy remains future work.
 - `rsmf-moe-runtime` is a proof-of-concept runtime for one MoE layer: host-side
   top-1 gating, token batching by destination expert, placement-aware expert
   shard lookup, WGPU expert matmuls when available, and a CPU reference path.
