@@ -146,6 +146,31 @@ variant, and `--decode-f32` when that variant is stored in a packed /
 quantized representation. Raw row-major tensors export byte-for-byte; decoded
 tensors are materialized as F32 safetensors payloads.
 
+### PyTorch-style state dict validation
+
+`rsmf-core` exposes a lightweight `state_dict()` view for PyTorch-style model
+contract checks without depending on PyTorch:
+
+```rust
+use rsmf_core::{LogicalDtype, RsmfFile, StateDictSchema, TensorSpec};
+
+fn main() -> rsmf_core::Result<()> {
+    let file = RsmfFile::open("model.rsmf")?;
+    let state = file.state_dict();
+    let report = state.validate(&StateDictSchema::strict(vec![
+        TensorSpec::new("model.embed_tokens.weight", LogicalDtype::F32, vec![32000, 4096]),
+        TensorSpec::new("lm_head.weight", LogicalDtype::F32, vec![32000, 4096]),
+    ]));
+
+    assert!(report.is_valid(), "{:?}", report.issues);
+    Ok(())
+}
+```
+
+Strict schemas report missing, unexpected, dtype-mismatched, and
+shape-mismatched keys. Non-strict schemas allow extra tensors while still
+checking required keys.
+
 ### Shard a packed model
 
 ```sh
