@@ -13,6 +13,9 @@ fn bench_native_decoder(c: &mut Criterion) {
     build_tiny_native_decoder(&path);
     let engine = Engine::new(RsmfFile::open(path).expect("open native decoder fixture"))
         .expect("create runtime engine");
+    let resident_session = engine
+        .native_decoder_session()
+        .expect("create resident native decoder session");
 
     let prompt_one = vec![0i64];
     c.bench_function("native_decoder/token_generation_cpu_reference", |b| {
@@ -28,6 +31,48 @@ fn bench_native_decoder(c: &mut Criterion) {
                 .expect("generate native decoder tokens")
         });
     });
+
+    c.bench_function("native_decoder/session_build_weight_residency", |b| {
+        b.iter(|| {
+            engine
+                .native_decoder_session()
+                .expect("create resident native decoder session")
+        });
+    });
+
+    c.bench_function(
+        "native_decoder/resident_token_generation_cpu_reference",
+        |b| {
+            b.iter(|| {
+                resident_session
+                    .generate_token_ids(
+                        std::hint::black_box(&prompt_one),
+                        NativeDecoderRunOptions {
+                            max_new_tokens: 2,
+                            ..NativeDecoderRunOptions::default()
+                        },
+                    )
+                    .expect("generate resident native decoder tokens")
+            });
+        },
+    );
+
+    c.bench_function(
+        "native_decoder/resident_text_generation_cpu_reference",
+        |b| {
+            b.iter(|| {
+                resident_session
+                    .generate_text(
+                        std::hint::black_box("zero"),
+                        NativeDecoderRunOptions {
+                            max_new_tokens: 2,
+                            ..NativeDecoderRunOptions::default()
+                        },
+                    )
+                    .expect("generate resident native decoder text")
+            });
+        },
+    );
 
     c.bench_function("native_decoder/threaded_logits", |b| {
         b.iter(|| {
@@ -45,6 +90,25 @@ fn bench_native_decoder(c: &mut Criterion) {
                     },
                 )
                 .expect("generate native decoder tokens with threaded logits")
+        });
+    });
+
+    c.bench_function("native_decoder/resident_threaded_logits", |b| {
+        b.iter(|| {
+            resident_session
+                .generate_token_ids(
+                    std::hint::black_box(&prompt_one),
+                    NativeDecoderRunOptions {
+                        max_new_tokens: 2,
+                        backend: NativeDecoderBackend::CpuThreaded,
+                        performance: NativeDecoderPerformanceOptions {
+                            cpu_threads: Some(2),
+                            ..NativeDecoderPerformanceOptions::default()
+                        },
+                        ..NativeDecoderRunOptions::default()
+                    },
+                )
+                .expect("generate resident native decoder tokens with threaded logits")
         });
     });
 
@@ -84,6 +148,27 @@ fn bench_native_decoder(c: &mut Criterion) {
                 .expect("generate native decoder tokens with chunked prefill")
         });
     });
+
+    c.bench_function(
+        "native_decoder/resident_prompt_len_3_chunked_prefill",
+        |b| {
+            b.iter(|| {
+                resident_session
+                    .generate_token_ids(
+                        std::hint::black_box(&prompt_three),
+                        NativeDecoderRunOptions {
+                            max_new_tokens: 1,
+                            performance: NativeDecoderPerformanceOptions {
+                                prefill_chunk_size: Some(2),
+                                ..NativeDecoderPerformanceOptions::default()
+                            },
+                            ..NativeDecoderRunOptions::default()
+                        },
+                    )
+                    .expect("generate resident native decoder tokens with chunked prefill")
+            });
+        },
+    );
 }
 
 fn build_tiny_native_decoder(path: &std::path::Path) {

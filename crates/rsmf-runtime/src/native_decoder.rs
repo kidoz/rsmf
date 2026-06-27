@@ -375,8 +375,10 @@ pub struct NativeDecoderTokenizer {
     id_to_token: HashMap<i64, String>,
     unk_token: Option<String>,
     mode: NativeDecoderTokenizerMode,
+    normalizer: NativeDecoderNormalizer,
     pre_tokenizer: NativeDecoderPreTokenizer,
     bpe_ranks: HashMap<(String, String), usize>,
+    byte_fallback: bool,
 }
 
 impl NativeDecoderTokenizer {
@@ -386,8 +388,8 @@ impl NativeDecoderTokenizer {
                 reason: error.to_string(),
             }
         })?;
-        reject_supported_tokenizer_component("normalizer", raw.normalizer.as_ref())?;
         reject_supported_tokenizer_component("post_processor", raw.post_processor.as_ref())?;
+        let normalizer = NativeDecoderNormalizer::from_json(raw.normalizer.as_ref())?;
         let pre_tokenizer = NativeDecoderPreTokenizer::from_json(raw.pre_tokenizer.as_ref())?;
         let mode = match raw.model.tokenizer_type.as_str() {
             "WordLevel" => NativeDecoderTokenizerMode::WordLevel,
@@ -436,8 +438,10 @@ impl NativeDecoderTokenizer {
             id_to_token,
             unk_token,
             mode,
+            normalizer,
             pre_tokenizer,
             bpe_ranks,
+            byte_fallback: raw.model.byte_fallback,
         })
     }
 
@@ -448,8 +452,9 @@ impl NativeDecoderTokenizer {
     /// exact special-token lookup. Unsupported tokenizer components fail at
     /// load time with typed errors.
     pub fn encode(&self, text: &str) -> Result<Vec<i64>> {
+        let normalized = self.normalizer.normalize(text);
         let mut token_ids = Vec::new();
-        for token in self.pre_tokenizer.pieces(text) {
+        for token in self.pre_tokenizer.pieces(&normalized) {
             match self.mode {
                 NativeDecoderTokenizerMode::WordLevel => {
                     token_ids.push(self.lookup_token_id(&token)?);
@@ -479,7 +484,7 @@ impl NativeDecoderTokenizer {
             .collect::<Result<Vec<_>>>()?;
         match self.mode {
             NativeDecoderTokenizerMode::WordLevel => Ok(tokens.join(" ")),
-            NativeDecoderTokenizerMode::Bpe => Ok(decode_bpe_tokens(&tokens)),
+            NativeDecoderTokenizerMode::Bpe => Ok(self.decode_bpe_tokens(&tokens)?),
         }
     }
 
@@ -522,8 +527,46 @@ impl NativeDecoderTokenizer {
         }
         symbols
             .into_iter()
-            .map(|symbol| self.lookup_token_id(&symbol))
-            .collect()
+            .map(|symbol| self.lookup_bpe_symbol_ids(&symbol))
+            .collect::<Result<Vec<_>>>()
+            .map(|parts| parts.into_iter().flatten().collect())
+    }
+
+    pub(crate) fn lookup_bpe_symbol_ids(&self, symbol: &str) -> Result<Vec<i64>> {
+        if let Some(token_id) = self.vocab.get(symbol) {
+            return Ok(vec![*token_id]);
+        }
+        if self.byte_fallback {
+            return symbol
+                .as_bytes()
+                .iter()
+                .map(|byte| {
+                    self.lookup_token_id(&format!("<0x{byte:02X}>"))
+                        .map_err(|_| RuntimeError::NativeDecoderTokenizerTokenUnknown {
+                            token: symbol.to_string(),
+                        })
+                })
+                .collect();
+        }
+        self.lookup_token_id(symbol).map(|token_id| vec![token_id])
+    }
+
+    pub(crate) fn decode_bpe_tokens(&self, tokens: &[String]) -> Result<String> {
+        if !self.byte_fallback {
+            return Ok(decode_bpe_tokens(tokens));
+        }
+        let mut decoded_tokens = Vec::new();
+        let mut byte_buffer = Vec::new();
+        for token in tokens {
+            if let Some(byte) = parse_byte_fallback_token(token) {
+                byte_buffer.push(byte);
+            } else {
+                flush_byte_fallback_buffer(&mut byte_buffer, &mut decoded_tokens)?;
+                decoded_tokens.push(token.clone());
+            }
+        }
+        flush_byte_fallback_buffer(&mut byte_buffer, &mut decoded_tokens)?;
+        Ok(decode_bpe_tokens(&decoded_tokens))
     }
 }
 
@@ -531,6 +574,57 @@ impl NativeDecoderTokenizer {
 pub(crate) enum NativeDecoderTokenizerMode {
     WordLevel,
     Bpe,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum NativeDecoderNormalizer {
+    None,
+    Lowercase,
+    Sequence(Vec<NativeDecoderNormalizer>),
+}
+
+impl NativeDecoderNormalizer {
+    pub(crate) fn from_json(value: Option<&serde_json::Value>) -> Result<Self> {
+        let Some(value) = value else {
+            return Ok(Self::None);
+        };
+        if value.is_null() {
+            return Ok(Self::None);
+        }
+        let Some(kind) = value.get("type").and_then(serde_json::Value::as_str) else {
+            return Err(RuntimeError::NativeDecoderTokenizerInvalid {
+                reason: "normalizer.type is required when normalizer is present".to_string(),
+            });
+        };
+        match kind {
+            "Lowercase" => Ok(Self::Lowercase),
+            "Sequence" => {
+                let normalizers = value
+                    .get("normalizers")
+                    .and_then(serde_json::Value::as_array)
+                    .ok_or_else(|| RuntimeError::NativeDecoderTokenizerInvalid {
+                        reason: "normalizer Sequence requires a normalizers array".to_string(),
+                    })?
+                    .iter()
+                    .map(|normalizer| Self::from_json(Some(normalizer)))
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(Self::Sequence(normalizers))
+            }
+            other => Err(RuntimeError::NativeDecoderTokenizerInvalid {
+                reason: format!("unsupported normalizer {other}"),
+            }),
+        }
+    }
+
+    pub(crate) fn normalize(&self, text: &str) -> String {
+        match self {
+            Self::None => text.to_string(),
+            Self::Lowercase => text.to_lowercase(),
+            Self::Sequence(normalizers) => normalizers
+                .iter()
+                .fold(text.to_string(), |text, next| next.normalize(&text)),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -682,6 +776,8 @@ pub(crate) struct NativeDecoderTokenizerModelJson {
     unk_token: Option<String>,
     #[serde(default)]
     merges: Vec<NativeDecoderBpeMergeJson>,
+    #[serde(default)]
+    byte_fallback: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -755,6 +851,30 @@ pub(crate) fn decode_bpe_tokens(tokens: &[String]) -> String {
         }
     }
     text
+}
+
+pub(crate) fn parse_byte_fallback_token(token: &str) -> Option<u8> {
+    let hex = token.strip_prefix("<0x")?.strip_suffix('>')?;
+    if hex.len() != 2 {
+        return None;
+    }
+    u8::from_str_radix(hex, 16).ok()
+}
+
+pub(crate) fn flush_byte_fallback_buffer(
+    byte_buffer: &mut Vec<u8>,
+    decoded_tokens: &mut Vec<String>,
+) -> Result<()> {
+    if byte_buffer.is_empty() {
+        return Ok(());
+    }
+    let text = String::from_utf8(std::mem::take(byte_buffer)).map_err(|error| {
+        RuntimeError::NativeDecoderTokenizerInvalid {
+            reason: format!("byte_fallback emitted invalid UTF-8: {error}"),
+        }
+    })?;
+    decoded_tokens.push(text);
+    Ok(())
 }
 
 /// Owned LLaMA-style layer weights decoded for native decoder execution.

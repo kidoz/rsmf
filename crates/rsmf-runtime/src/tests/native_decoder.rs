@@ -249,10 +249,75 @@ fn native_decoder_bpe_tokenizer_accepts_added_special_tokens() {
 }
 
 #[test]
+fn native_decoder_bpe_tokenizer_supports_byte_fallback() {
+    let tokenizer = NativeDecoderTokenizer::from_json(
+        serde_json::json!({
+            "model": {
+                "type": "BPE",
+                "vocab": {
+                    "<0xC3>": 0,
+                    "<0xA9>": 1
+                },
+                "merges": [],
+                "byte_fallback": true
+            }
+        })
+        .to_string()
+        .as_bytes(),
+    )
+    .unwrap();
+
+    assert_eq!(tokenizer.encode("é").unwrap(), vec![0, 1]);
+    assert_eq!(tokenizer.decode(&[0, 1]).unwrap(), "é");
+}
+
+#[test]
+fn native_decoder_tokenizer_applies_lowercase_normalizer() {
+    let tokenizer = NativeDecoderTokenizer::from_json(
+        serde_json::json!({
+            "normalizer": { "type": "Lowercase" },
+            "model": {
+                "type": "BPE",
+                "vocab": { "hello": 0, "world": 1 },
+                "merges": []
+            }
+        })
+        .to_string()
+        .as_bytes(),
+    )
+    .unwrap();
+
+    assert_eq!(tokenizer.encode("HELLO WORLD").unwrap(), vec![0, 1]);
+}
+
+#[test]
+fn native_decoder_tokenizer_applies_sequence_normalizer() {
+    let tokenizer = NativeDecoderTokenizer::from_json(
+        serde_json::json!({
+            "normalizer": {
+                "type": "Sequence",
+                "normalizers": [
+                    { "type": "Lowercase" }
+                ]
+            },
+            "model": {
+                "type": "WordLevel",
+                "vocab": { "hello": 0 }
+            }
+        })
+        .to_string()
+        .as_bytes(),
+    )
+    .unwrap();
+
+    assert_eq!(tokenizer.encode("HELLO").unwrap(), vec![0]);
+}
+
+#[test]
 fn native_decoder_tokenizer_rejects_unsupported_normalizer() {
     let err = NativeDecoderTokenizer::from_json(
         serde_json::json!({
-            "normalizer": { "type": "Lowercase" },
+            "normalizer": { "type": "NFC" },
             "model": {
                 "type": "BPE",
                 "vocab": { "hello": 0 },
@@ -265,7 +330,7 @@ fn native_decoder_tokenizer_rejects_unsupported_normalizer() {
     .unwrap_err();
 
     assert!(
-        matches!(err, RuntimeError::NativeDecoderTokenizerInvalid { reason } if reason.contains("normalizer"))
+        matches!(err, RuntimeError::NativeDecoderTokenizerInvalid { reason } if reason.contains("unsupported normalizer"))
     );
 }
 
