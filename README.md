@@ -240,6 +240,12 @@ cargo test -p rsmf-runtime
 Provider-specific device I/O binding and true mmap/device zero-copy residency
 are future runtime milestones.
 
+The native decoder track starts with a contract-only slice:
+`Engine::native_decoder_contract()` reads `config.json`, requires
+`tokenizer.json`, recognizes a LLaMA-style decoder config, and validates the
+expected RSMF tensor names, shapes, and F32/F16/BF16 weight dtypes. It does not
+execute decoder blocks or parse tokenizer internals yet.
+
 ### Minimal MoE runtime PoC
 
 `rsmf-moe-runtime` is an experimental, non-default crate that validates the

@@ -53,7 +53,11 @@ rsmf-core  (library)           ← format, reader, writer, validator, selection
   supports protocol version fields, configurable header/body/response size
   limits, connection timeouts, sanitized error responses, and JSON `tenant_id`
   propagation for executor quota accounting. It stays graph-runtime agnostic for
-  later native decoder paths.
+  later native decoder paths. The native decoder track begins with
+  `Engine::native_decoder_contract()`, which validates a LLaMA-style
+  `config.json`, required `tokenizer.json`, optional `generation_config.json`,
+  and the expected ordinary RSMF tensor names, shapes, and weight dtypes without
+  adding a graph IR or executing generation.
 - `rsmf-moe-runtime` is a proof-of-concept runtime for one MoE layer: host-side
   top-1 gating, token batching by destination expert, placement-aware expert
   shard lookup, WGPU expert matmuls when available, and a CPU reference path.
