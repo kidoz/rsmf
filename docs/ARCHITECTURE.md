@@ -40,12 +40,13 @@ rsmf-core  (library)           ← format, reader, writer, validator, selection
   layer: a bounded in-process priority queue around `Engine::run`, with FIFO
   ordering within a priority level, pre-dispatch deadline expiry, timeout
   helpers, queued cancellation, typed error propagation, per-request queue/run
-  timings, opt-in dynamic batching on the leading tensor dimension, and
-  cumulative metrics. It also reports live queue depth, queued input bytes,
-  active runtime invocations, active requests, and batch pressure, with
-  optional queued tensor byte admission. Already-running ORT calls receive a
-  best-effort `RunOptions::terminate` signal through request cancellation
-  tokens. It stays graph-runtime agnostic for later native decoder paths.
+  timings, and opt-in continuous batching on the leading tensor dimension. It
+  reports live queue depth, queued input bytes, active runtime invocations,
+  active requests, batch pressure, scheduler flush reasons, and cumulative
+  metrics, with optional queued tensor byte admission. Already-running ORT
+  calls receive a best-effort `RunOptions::terminate` signal through request
+  cancellation tokens. It stays graph-runtime agnostic for later native decoder
+  paths.
 - `rsmf-moe-runtime` is a proof-of-concept runtime for one MoE layer: host-side
   top-1 gating, token batching by destination expert, placement-aware expert
   shard lookup, WGPU expert matmuls when available, and a CPU reference path.

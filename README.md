@@ -221,9 +221,10 @@ within a priority level, higher-priority dispatch, pre-dispatch deadline
 expiry, timeout helpers, queued cancellation, typed runtime error propagation,
 opt-in dynamic batching on the leading tensor dimension, per-request queue/run
 timings, queued tensor byte admission, live queue/active-runtime pressure
-metrics, cumulative executor metrics, and best-effort interruption of running
-ORT calls through `RunOptions::terminate`. It is intentionally graph-runtime
-agnostic so native decoder execution can share the same control plane later.
+metrics, continuous-batching flush metrics, cumulative executor metrics, and
+best-effort interruption of running ORT calls through `RunOptions::terminate`.
+It is intentionally graph-runtime agnostic so native decoder execution can
+share the same control plane later.
 
 Build it explicitly:
 
