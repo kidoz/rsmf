@@ -6,8 +6,8 @@
 
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
-use std::fmt::Debug;
-use std::sync::atomic::{AtomicU8, Ordering as AtomicOrdering};
+use std::fmt::{self, Debug};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering as AtomicOrdering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::JoinHandle;
@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use ndarray::{ArrayD, ArrayViewD};
 use ort::ep::CPUExecutionProvider;
 use ort::session::builder::GraphOptimizationLevel as OrtGraphOptimizationLevel;
-use ort::session::{Session, SessionOutputs};
+use ort::session::{RunOptions, Session, SessionOutputs};
 use ort::value::{DynValue, Outlet, Tensor, TensorElementType};
 use rsmf_core::manifest::GraphKind;
 use rsmf_core::tensor::variant::{EncodingKind, LayoutTag};
@@ -512,32 +512,50 @@ pub enum RuntimeCancellationResult {
     Cancelled,
     /// The request had already been marked for cancellation.
     AlreadyCancelled,
-    /// The request has already started runtime execution and cannot currently
-    /// be interrupted.
+    /// The request has already started runtime execution but no interrupt
+    /// handle was available.
     AlreadyRunning,
+    /// The request has started runtime execution and an ORT termination signal
+    /// was requested.
+    RunningCancellationRequested,
     /// The request already completed.
     AlreadyCompleted,
 }
 
 /// Shared cancellation token for a submitted runtime request.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct RuntimeCancellationToken {
     state: Arc<AtomicU8>,
+    interrupt_requested: Arc<AtomicBool>,
+    active_run: Arc<Mutex<Option<Arc<RunOptions>>>>,
+}
+
+impl Debug for RuntimeCancellationToken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RuntimeCancellationToken")
+            .field("state", &self.state.load(AtomicOrdering::Acquire))
+            .field(
+                "interrupt_requested",
+                &self.interrupt_requested.load(AtomicOrdering::Acquire),
+            )
+            .finish_non_exhaustive()
+    }
 }
 
 impl RuntimeCancellationToken {
     fn new() -> Self {
         Self {
             state: Arc::new(AtomicU8::new(REQUEST_QUEUED)),
+            interrupt_requested: Arc::new(AtomicBool::new(false)),
+            active_run: Arc::new(Mutex::new(None)),
         }
     }
 
     /// Attempt to cancel the request before runtime dispatch.
     ///
-    /// Cancellation is currently guaranteed only while the request is still
-    /// queued. Already-running ORT executions are reported as
-    /// [`RuntimeCancellationResult::AlreadyRunning`] and continue to their
-    /// normal result.
+    /// Queued requests are cancelled before dispatch. Already-running ORT
+    /// executions receive a best-effort `RunOptions::terminate` signal and may
+    /// stop once ORT observes that signal.
     #[must_use]
     pub fn cancel(&self) -> RuntimeCancellationResult {
         match self.state.compare_exchange(
@@ -548,7 +566,7 @@ impl RuntimeCancellationToken {
         ) {
             Ok(_) => RuntimeCancellationResult::Cancelled,
             Err(REQUEST_CANCELLED) => RuntimeCancellationResult::AlreadyCancelled,
-            Err(REQUEST_RUNNING) => RuntimeCancellationResult::AlreadyRunning,
+            Err(REQUEST_RUNNING) => self.request_running_interrupt(),
             Err(REQUEST_COMPLETED) => RuntimeCancellationResult::AlreadyCompleted,
             Err(_) => RuntimeCancellationResult::AlreadyCompleted,
         }
@@ -558,6 +576,12 @@ impl RuntimeCancellationToken {
     #[must_use]
     pub fn is_cancelled(&self) -> bool {
         self.state.load(AtomicOrdering::Acquire) == REQUEST_CANCELLED
+    }
+
+    /// Return `true` if cancellation or ORT termination has been requested.
+    #[must_use]
+    pub fn is_cancellation_requested(&self) -> bool {
+        self.is_cancelled() || self.interrupt_requested.load(AtomicOrdering::Acquire)
     }
 
     fn try_mark_running(&self) -> std::result::Result<(), RuntimeCancellationResult> {
@@ -575,7 +599,46 @@ impl RuntimeCancellationToken {
         }
     }
 
+    fn request_running_interrupt(&self) -> RuntimeCancellationResult {
+        self.interrupt_requested
+            .store(true, AtomicOrdering::Release);
+        let run_options = self
+            .active_run
+            .lock()
+            .ok()
+            .and_then(|active| active.clone());
+        if let Some(run_options) = run_options {
+            let _ = run_options.terminate();
+            RuntimeCancellationResult::RunningCancellationRequested
+        } else {
+            RuntimeCancellationResult::AlreadyRunning
+        }
+    }
+
+    fn attach_run_options(&self, run_options: Arc<RunOptions>) -> Result<()> {
+        {
+            let mut active = self
+                .active_run
+                .lock()
+                .map_err(|_| RuntimeError::ExecutorPoisoned)?;
+            *active = Some(Arc::clone(&run_options));
+        }
+        if self.interrupt_requested.load(AtomicOrdering::Acquire) {
+            run_options
+                .terminate()
+                .map_err(|e| ort_error("terminate run options", e))?;
+        }
+        Ok(())
+    }
+
+    fn clear_run_options(&self) {
+        if let Ok(mut active) = self.active_run.lock() {
+            *active = None;
+        }
+    }
+
     fn mark_completed(&self) {
+        self.clear_run_options();
         self.state.store(REQUEST_COMPLETED, AtomicOrdering::Release);
     }
 }
@@ -690,15 +753,54 @@ impl SessionHandle {
 
     /// Run this cached session with owned runtime tensors.
     pub fn run(&self, inputs: RuntimeInputs) -> Result<RuntimeOutputs> {
+        self.run_with_cancellation(inputs, None)
+    }
+
+    fn run_with_cancellation(
+        &self,
+        inputs: RuntimeInputs,
+        cancellation: Option<&RuntimeCancellationToken>,
+    ) -> Result<RuntimeOutputs> {
+        match cancellation {
+            Some(cancellation) => self.run_with_cancellations(inputs, &[cancellation]),
+            None => self.run_with_cancellations(inputs, &[]),
+        }
+    }
+
+    fn run_with_cancellations(
+        &self,
+        inputs: RuntimeInputs,
+        cancellations: &[&RuntimeCancellationToken],
+    ) -> Result<RuntimeOutputs> {
         let ort_inputs = inputs
             .into_iter()
             .map(|(name, tensor)| Ok((name, tensor.into_ort_value()?)))
             .collect::<Result<Vec<_>>>()?;
         let mut session = self.lock_session()?;
-        let outputs = session
-            .run(ort_inputs)
-            .map_err(|e| ort_error("session run", e))?;
-        materialize_outputs(outputs)
+        if !cancellations.is_empty() {
+            let run_options =
+                Arc::new(RunOptions::new().map_err(|e| ort_error("create run options", e))?);
+            for cancellation in cancellations {
+                if let Err(error) = cancellation.attach_run_options(Arc::clone(&run_options)) {
+                    for cancellation in cancellations {
+                        cancellation.clear_run_options();
+                    }
+                    return Err(error);
+                }
+            }
+            let result = session
+                .run_with_options(ort_inputs, &*run_options)
+                .map_err(|e| ort_error("session run", e));
+            for cancellation in cancellations {
+                cancellation.clear_run_options();
+            }
+            materialize_outputs(result?)
+        } else {
+            let outputs = session
+                .run(ort_inputs)
+                .map_err(|e| ort_error("session run", e))?;
+            materialize_outputs(outputs)
+        }
     }
 
     fn lock_session(&self) -> Result<MutexGuard<'_, Session>> {
@@ -799,6 +901,20 @@ impl Engine {
         let _span = info_span!("Engine::run", graph_idx).entered();
 
         self.session_handle(graph_idx, options)?.run(inputs)
+    }
+
+    fn run_with_cancellations(
+        &self,
+        graph_idx: usize,
+        options: SessionOptions,
+        inputs: RuntimeInputs,
+        cancellations: &[&RuntimeCancellationToken],
+    ) -> Result<RuntimeOutputs> {
+        #[cfg(feature = "tracing")]
+        let _span = info_span!("Engine::run_with_cancellations", graph_idx).entered();
+
+        self.session_handle(graph_idx, options)?
+            .run_with_cancellations(inputs, cancellations)
     }
 
     /// Convenience helper for F32 models.
@@ -1531,10 +1647,11 @@ fn execute_prepared_single(inner: &RuntimeExecutorInner, prepared: PreparedRunti
     let queue_time = started_at.saturating_duration_since(prepared.queued_at);
     let request_id = prepared.request.request_id;
     inner.record_runtime_start(1);
-    let result = inner.engine.run(
+    let result = inner.engine.run_with_cancellations(
         prepared.request.graph_idx,
         prepared.request.options,
         prepared.request.inputs,
+        &[&prepared.cancellation],
     );
     inner.record_runtime_finish(1);
     let finished_at = Instant::now();
@@ -1679,9 +1796,15 @@ fn run_prepared_batch(
     let (inputs, batch_sizes) = merge_prepared_inputs(prepared).map_err(|_| ())?;
     let graph_idx = prepared[0].request.graph_idx;
     let options = prepared[0].request.options.clone();
+    let cancellations = prepared
+        .iter()
+        .map(|request| &request.cancellation)
+        .collect::<Vec<_>>();
     let started_at = Instant::now();
     inner.record_runtime_start(prepared.len());
-    let outputs = inner.engine.run(graph_idx, options, inputs);
+    let outputs = inner
+        .engine
+        .run_with_cancellations(graph_idx, options, inputs, &cancellations);
     inner.record_runtime_finish(prepared.len());
     let outputs = outputs.map_err(|_| ())?;
     let finished_at = Instant::now();
@@ -3153,6 +3276,55 @@ mod tests {
         assert_eq!(metrics.completed, 1);
         assert_eq!(metrics.failed, 0);
         assert_eq!(metrics.cancelled, 0);
+    }
+
+    #[test]
+    fn running_cancellation_requests_ort_termination() {
+        let token = RuntimeCancellationToken::new();
+        assert!(token.try_mark_running().is_ok());
+        let run_options = Arc::new(RunOptions::new().unwrap());
+        token.attach_run_options(Arc::clone(&run_options)).unwrap();
+
+        assert_eq!(
+            token.cancel(),
+            RuntimeCancellationResult::RunningCancellationRequested
+        );
+        assert!(token.is_cancellation_requested());
+    }
+
+    #[test]
+    fn pre_requested_running_cancellation_terminates_ort_run() {
+        let dir = tempdir().unwrap();
+        let engine = add_graph_engine(dir.path().join("executor-preterminated-run.rsmf"));
+        let handle = engine.session_handle(0, SessionOptions::default()).unwrap();
+        let token = RuntimeCancellationToken::new();
+        assert!(token.try_mark_running().is_ok());
+        assert_eq!(token.cancel(), RuntimeCancellationResult::AlreadyRunning);
+
+        let err = handle
+            .run_with_cancellation(
+                HashMap::from([
+                    (
+                        "x".to_string(),
+                        RuntimeTensor::F32 {
+                            shape: vec![2],
+                            data: vec![1.0, 2.0],
+                        },
+                    ),
+                    (
+                        "y".to_string(),
+                        RuntimeTensor::F32 {
+                            shape: vec![2],
+                            data: vec![10.0, 20.0],
+                        },
+                    ),
+                ]),
+                Some(&token),
+            )
+            .unwrap_err();
+
+        assert!(matches!(err, RuntimeError::Ort { message, .. } if message.contains("terminate")));
+        token.mark_completed();
     }
 
     #[test]
