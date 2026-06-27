@@ -135,6 +135,7 @@ pub fn run(args: Args) -> Result<(), CliError> {
     // through the existing safetensors pipeline below. The NamedTempFile is
     // held in a guard local so it lives until this function returns and is
     // unlinked automatically on drop.
+    let mut source_metadata = Vec::new();
     let _torch_tmp_guard;
     let _onnx_tmp_guard;
     let effective_from_safetensors: Option<PathBuf> = if let Some(pt_path) = args.from_torch {
@@ -143,7 +144,7 @@ pub fn run(args: Args) -> Result<(), CliError> {
             .suffix(".safetensors")
             .tempfile()
             .map_err(|e| CliError::user(anyhow!("tempfile: {e}")))?;
-        convert_torch_to_safetensors(&pt_path, tmp.path())?;
+        source_metadata = convert_torch_to_safetensors(&pt_path, tmp.path())?;
         let path = tmp.path().to_path_buf();
         _torch_tmp_guard = tmp;
         Some(path)
@@ -318,6 +319,10 @@ pub fn run(args: Args) -> Result<(), CliError> {
         )));
     };
 
+    for (key, value) in source_metadata {
+        writer = writer.with_metadata_replaced(key, value);
+    }
+
     if args.compress_tensors {
         writer = writer
             .with_canonical_compression(3)
@@ -388,8 +393,10 @@ pub fn run(args: Args) -> Result<(), CliError> {
 ///
 /// The script walks up to two nesting levels (`state_dict`, `model`,
 /// `model_state_dict`) to locate a tensor-valued dict, filters to
-/// `torch.Tensor` values, and calls `safetensors.torch.save_file`.
+/// `torch.Tensor` values, calls `safetensors.torch.save_file`, and emits
+/// JSON provenance metadata to stdout for the Rust packer to import.
 const TORCH_TO_SAFETENSORS_SCRIPT: &str = r#"
+import json
 import os
 import sys
 
@@ -405,32 +412,34 @@ except ImportError:
 
 def find_state_dict(obj):
     if isinstance(obj, torch.Tensor):
-        return {"tensor": obj}
+        return {"tensor": obj}, "tensor"
     if isinstance(obj, dict):
         if any(isinstance(v, torch.Tensor) for v in obj.values()):
-            return obj
+            return obj, "<root>"
         for k in ("state_dict", "model", "model_state_dict"):
             nested = obj.get(k)
             if isinstance(nested, dict) and any(isinstance(v, torch.Tensor) for v in nested.values()):
-                return nested
+                return nested, k
     raise SystemExit(
         f"rsmf could not locate a tensor state_dict in {type(obj).__name__}"
     )
 
 
 pt_path, out_path = sys.argv[1], sys.argv[2]
+safe_load = True
 try:
     loaded = torch.load(pt_path, map_location="cpu", weights_only=True)
 except Exception as err:
     if os.getenv("RSMF_ALLOW_UNSAFE_PICKLE", "0").lower() in ("1", "true", "yes"):
         loaded = torch.load(pt_path, map_location="cpu", weights_only=False)
+        safe_load = False
     else:
         raise SystemExit(
             f"torch.load rejected this file in safe mode: {err}\n"
             "Set RSMF_ALLOW_UNSAFE_PICKLE=1 only for files you trust."
         )
 
-state = find_state_dict(loaded)
+state, state_path = find_state_dict(loaded)
 tensors = {}
 for name, val in state.items():
     if not isinstance(val, torch.Tensor):
@@ -443,6 +452,16 @@ if not tensors:
     raise SystemExit("rsmf found no tensors in the input")
 
 safetensors.torch.save_file(tensors, out_path)
+metadata = {
+    "source": "torch",
+    "rsmf.source_format": "torch",
+    "rsmf.intermediate_format": "safetensors",
+    "torch.safe_load": "true" if safe_load else "false",
+    "torch.weights_only": "true" if safe_load else "false",
+    "torch.state_dict_path": state_path,
+    "torch.tensor_count": str(len(tensors)),
+}
+print(json.dumps(metadata, sort_keys=True), flush=True)
 sys.stderr.write(f"[rsmf] converted {len(tensors)} tensors via python subprocess\n")
 "#;
 
@@ -451,7 +470,7 @@ sys.stderr.write(f"[rsmf] converted {len(tensors)} tensors via python subprocess
 fn convert_torch_to_safetensors(
     pt_path: &std::path::Path,
     out_path: &std::path::Path,
-) -> Result<(), CliError> {
+) -> Result<Vec<(String, String)>, CliError> {
     if !pt_path.exists() {
         return Err(CliError::user(anyhow!(
             "torch input not found: {}",
@@ -460,12 +479,12 @@ fn convert_torch_to_safetensors(
     }
 
     let python = resolve_python_binary()?;
-    let status = std::process::Command::new(&python)
+    let output = std::process::Command::new(&python)
         .arg("-c")
         .arg(TORCH_TO_SAFETENSORS_SCRIPT)
         .arg(pt_path)
         .arg(out_path)
-        .status()
+        .output()
         .map_err(|e| {
             CliError::user(anyhow!(
                 "failed to invoke {}: {e}. Install python3 with `torch` and `safetensors` to use --from-torch.",
@@ -473,10 +492,12 @@ fn convert_torch_to_safetensors(
             ))
         })?;
 
-    if !status.success() {
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(CliError::user(anyhow!(
-            "python torch→safetensors conversion failed (exit code {:?})",
-            status.code()
+            "python torch→safetensors conversion failed (exit code {:?}): {}",
+            output.status.code(),
+            stderr.trim()
         )));
     }
 
@@ -486,7 +507,32 @@ fn convert_torch_to_safetensors(
             out_path.display()
         )));
     }
-    Ok(())
+
+    parse_torch_metadata_stdout(&output.stdout)
+}
+
+fn parse_torch_metadata_stdout(stdout: &[u8]) -> Result<Vec<(String, String)>, CliError> {
+    let value: serde_json::Value = serde_json::from_slice(stdout).map_err(|e| {
+        CliError::user(anyhow!(
+            "python torch→safetensors metadata was not valid JSON: {e}"
+        ))
+    })?;
+    let object = value.as_object().ok_or_else(|| {
+        CliError::user(anyhow!(
+            "python torch→safetensors metadata must be a JSON object"
+        ))
+    })?;
+    let mut metadata = Vec::with_capacity(object.len());
+    for (key, value) in object {
+        let value = value.as_str().ok_or_else(|| {
+            CliError::user(anyhow!(
+                "python torch→safetensors metadata value for `{key}` must be a string"
+            ))
+        })?;
+        metadata.push((key.clone(), value.to_string()));
+    }
+    metadata.sort_by(|left, right| left.0.cmp(&right.0));
+    Ok(metadata)
 }
 
 /// Python one-liner that extracts initializers from an ONNX model
@@ -819,4 +865,26 @@ fn stream_from_npy(
         src.display()
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_torch_metadata_stdout_returns_sorted_string_pairs() {
+        let metadata = parse_torch_metadata_stdout(
+            br#"{"torch.tensor_count":"2","source":"torch","rsmf.source_format":"torch"}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            metadata,
+            vec![
+                ("rsmf.source_format".to_string(), "torch".to_string()),
+                ("source".to_string(), "torch".to_string()),
+                ("torch.tensor_count".to_string(), "2".to_string()),
+            ]
+        );
+    }
 }

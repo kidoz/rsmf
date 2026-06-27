@@ -104,7 +104,7 @@ def test_from_torch_composes_with_quantization(
         assert variants[1]["storage_dtype"] == "q4_0"
 
 
-def test_from_torch_file_carries_safetensors_source_marker(
+def test_from_torch_file_carries_torch_source_metadata(
     sample_pt: Path, rsmf_binary: str, tmp_path: Path
 ) -> None:
     out_path = tmp_path / "sample.rsmf"
@@ -112,7 +112,10 @@ def test_from_torch_file_carries_safetensors_source_marker(
 
     with rsmf.RsmfFile(out_path) as model:
         meta = model.metadata()
-        # The torch path currently goes through the safetensors pipeline
-        # via a temp file, so the source metadata reflects that. If ADR 0012
-        # adds a richer marker later this assertion will tighten.
-        assert meta.get("source") == "safetensors"
+        assert meta.get("source") == "torch"
+        assert meta.get("rsmf.source_format") == "torch"
+        assert meta.get("rsmf.intermediate_format") == "safetensors"
+        assert meta.get("torch.safe_load") == "true"
+        assert meta.get("torch.weights_only") == "true"
+        assert meta.get("torch.state_dict_path") == "<root>"
+        assert meta.get("torch.tensor_count") == "2"
