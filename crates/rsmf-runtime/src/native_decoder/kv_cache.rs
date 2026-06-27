@@ -66,6 +66,14 @@ impl NativeDecoderKvCache {
             .map(|page_size| self.position.div_ceil(page_size))
             .unwrap_or(0)
     }
+
+    /// Resident KV-cache bytes currently allocated by this cache.
+    #[must_use]
+    pub fn resident_bytes(&self) -> usize {
+        self.layers.iter().fold(0usize, |total, layer| {
+            total.saturating_add(layer.resident_bytes())
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -74,6 +82,23 @@ pub(crate) struct NativeDecoderLayerKvCache {
     values: Vec<f32>,
     key_pages: Vec<Vec<f32>>,
     value_pages: Vec<Vec<f32>>,
+}
+
+impl NativeDecoderLayerKvCache {
+    fn resident_bytes(&self) -> usize {
+        let flat = f32_capacity_bytes(&self.keys).saturating_add(f32_capacity_bytes(&self.values));
+        let paged_keys = self.key_pages.iter().fold(0usize, |total, page| {
+            total.saturating_add(f32_capacity_bytes(page))
+        });
+        let paged_values = self.value_pages.iter().fold(0usize, |total, page| {
+            total.saturating_add(f32_capacity_bytes(page))
+        });
+        flat.saturating_add(paged_keys).saturating_add(paged_values)
+    }
+}
+
+fn f32_capacity_bytes(values: &Vec<f32>) -> usize {
+    values.capacity().saturating_mul(std::mem::size_of::<f32>())
 }
 
 pub(crate) fn native_decoder_kv_cache_with_performance(

@@ -20,6 +20,20 @@ pub struct NativeDecoderTextGenerateOutput {
     pub backend: NativeDecoderBackend,
 }
 
+/// Resident native decoder memory held by a session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeDecoderResidencyReport {
+    /// Decoded resident weight bytes.
+    pub resident_weight_bytes: usize,
+    /// Resident KV-cache bytes currently retained by the session.
+    ///
+    /// The current native decoder session does not retain KV cache across
+    /// generation calls, so this is `0`. Individual [`NativeDecoderKvCache`]
+    /// values expose their own resident byte accounting while generation is
+    /// active.
+    pub resident_kv_cache_bytes: usize,
+}
+
 /// Resident native decoder session with decoded weights and tokenizer cached in
 /// memory.
 #[derive(Debug, Clone, PartialEq)]
@@ -31,6 +45,15 @@ pub struct NativeDecoderSession {
 }
 
 impl NativeDecoderSession {
+    /// Resident decoded memory retained by this session.
+    #[must_use]
+    pub fn residency_report(&self) -> NativeDecoderResidencyReport {
+        NativeDecoderResidencyReport {
+            resident_weight_bytes: self.weights.resident_bytes(),
+            resident_kv_cache_bytes: 0,
+        }
+    }
+
     /// Generate token ids without reloading weights from the RSMF file.
     pub fn generate_token_ids(
         &self,

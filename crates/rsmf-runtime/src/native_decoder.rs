@@ -22,8 +22,8 @@ pub use contract::{
     NativeDecoderContract, NativeDecoderFamily, NativeDecoderTensorBinding,
 };
 pub use generation::{
-    NativeDecoderGenerateOutput, NativeDecoderSession, NativeDecoderStepOutput,
-    NativeDecoderTextGenerateOutput,
+    NativeDecoderGenerateOutput, NativeDecoderResidencyReport, NativeDecoderSession,
+    NativeDecoderStepOutput, NativeDecoderTextGenerateOutput,
 };
 pub use kv_cache::NativeDecoderKvCache;
 pub use ops::{

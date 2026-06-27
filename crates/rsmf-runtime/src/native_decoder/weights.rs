@@ -37,6 +37,20 @@ impl NativeDecoderLayerWeights {
             down_proj: &self.down_proj,
         }
     }
+
+    /// Resident decoded weight bytes held by this layer.
+    #[must_use]
+    pub fn resident_bytes(&self) -> usize {
+        f32_slice_bytes(&self.input_layernorm)
+            .saturating_add(f32_slice_bytes(&self.post_attention_layernorm))
+            .saturating_add(f32_slice_bytes(&self.q_proj))
+            .saturating_add(f32_slice_bytes(&self.k_proj))
+            .saturating_add(f32_slice_bytes(&self.v_proj))
+            .saturating_add(f32_slice_bytes(&self.o_proj))
+            .saturating_add(f32_slice_bytes(&self.gate_proj))
+            .saturating_add(f32_slice_bytes(&self.up_proj))
+            .saturating_add(f32_slice_bytes(&self.down_proj))
+    }
 }
 
 /// Owned native decoder weights decoded from an RSMF file.
@@ -53,6 +67,27 @@ pub struct NativeDecoderWeights {
     pub lm_head: Option<Vec<f32>>,
     /// Per-layer decoded weights.
     pub layers: Vec<NativeDecoderLayerWeights>,
+}
+
+impl NativeDecoderWeights {
+    /// Resident decoded weight bytes held by this native decoder weight set.
+    #[must_use]
+    pub fn resident_bytes(&self) -> usize {
+        let base = f32_slice_bytes(&self.token_embedding)
+            .saturating_add(f32_slice_bytes(&self.final_norm))
+            .saturating_add(
+                self.lm_head
+                    .as_ref()
+                    .map_or(0, |weights| f32_slice_bytes(weights)),
+            );
+        self.layers.iter().fold(base, |total, layer| {
+            total.saturating_add(layer.resident_bytes())
+        })
+    }
+}
+
+pub(crate) fn f32_slice_bytes(values: &[f32]) -> usize {
+    values.len().saturating_mul(std::mem::size_of::<f32>())
 }
 
 pub(crate) fn load_native_decoder_weights(

@@ -385,6 +385,13 @@ fn engine_native_decoder_session_reuses_resident_weights() {
     let dir = tempdir().unwrap();
     let engine = tiny_native_decoder_generation_engine(dir.path().join("native-decode.rsmf"));
     let session = engine.native_decoder_session().unwrap();
+    let residency = session.residency_report();
+    assert_eq!(
+        residency.resident_weight_bytes,
+        session.weights.resident_bytes()
+    );
+    assert!(residency.resident_weight_bytes > 0);
+    assert_eq!(residency.resident_kv_cache_bytes, 0);
 
     let tokens = session
         .generate_token_ids(
@@ -800,6 +807,7 @@ fn native_decoder_paged_kv_cache_tracks_allocated_pages() {
     let engine = tiny_native_decoder_generation_engine(dir.path().join("native-decode.rsmf"));
     let weights = engine.native_decoder_weights().unwrap();
     let mut cache = NativeDecoderKvCache::new_paged(&weights.config, 2).unwrap();
+    assert_eq!(cache.resident_bytes(), 0);
     let performance = NativeDecoderPerformanceOptions {
         kv_cache_page_size_tokens: Some(2),
         ..NativeDecoderPerformanceOptions::default()
@@ -815,6 +823,8 @@ fn native_decoder_paged_kv_cache_tracks_allocated_pages() {
     .unwrap();
     assert_eq!(cache.position(), 1);
     assert_eq!(cache.allocated_pages(), 1);
+    let one_page_bytes = cache.resident_bytes();
+    assert!(one_page_bytes > 0);
     native_decoder_cpu_step(
         &weights,
         &mut cache,
@@ -825,6 +835,7 @@ fn native_decoder_paged_kv_cache_tracks_allocated_pages() {
     .unwrap();
     assert_eq!(cache.position(), 2);
     assert_eq!(cache.allocated_pages(), 1);
+    assert_eq!(cache.resident_bytes(), one_page_bytes);
     native_decoder_cpu_step(
         &weights,
         &mut cache,
@@ -835,6 +846,7 @@ fn native_decoder_paged_kv_cache_tracks_allocated_pages() {
     .unwrap();
     assert_eq!(cache.position(), 3);
     assert_eq!(cache.allocated_pages(), 2);
+    assert!(cache.resident_bytes() > one_page_bytes);
 }
 
 #[test]
