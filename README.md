@@ -237,6 +237,15 @@ Build it explicitly:
 cargo test -p rsmf-runtime
 ```
 
+Small self-contained runtime examples create tiny in-memory-scale RSMF files in
+a temp directory and run without downloading model weights:
+
+```sh
+cargo run -p rsmf-runtime --example tiny_onnx_add
+cargo run -p rsmf-runtime --example tiny_native_decoder
+cargo run -p rsmf-runtime --example tiny_issue_classifier
+```
+
 Provider-specific device I/O binding and true mmap/device zero-copy residency
 are future runtime milestones.
 
