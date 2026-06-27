@@ -127,6 +127,62 @@ pub enum RuntimeError {
         /// Human-readable dtype.
         dtype: String,
     },
+    /// A required native decoder tensor uses an unsupported storage layout,
+    /// encoding, or byte representation for the selected runtime path.
+    #[error("native decoder tensor {tensor_name} is unsupported: {reason}")]
+    NativeDecoderTensorUnsupported {
+        /// Tensor name.
+        tensor_name: String,
+        /// Human-readable reason.
+        reason: String,
+    },
+    /// A requested native decoder backend is not available in this build.
+    #[error("native decoder backend {backend} is unavailable: {reason}")]
+    NativeDecoderBackendUnavailable {
+        /// Requested backend name.
+        backend: String,
+        /// Human-readable reason.
+        reason: String,
+    },
+    /// Native decoder generation requires at least one prompt token.
+    #[error("native decoder generation requires at least one prompt token")]
+    NativeDecoderPromptEmpty,
+    /// A native decoder token id is outside the configured vocabulary.
+    #[error("native decoder token id {token_id} is outside vocabulary size {vocab_size}")]
+    NativeDecoderTokenOutOfRange {
+        /// Invalid token id.
+        token_id: i64,
+        /// Configured vocabulary size.
+        vocab_size: usize,
+    },
+    /// Native decoder sampling options are invalid.
+    #[error("invalid native decoder sampling options: {reason}")]
+    NativeDecoderSamplingInvalid {
+        /// Human-readable validation failure.
+        reason: String,
+    },
+    /// Native decoder reference logits do not match within tolerance.
+    #[error(
+        "native decoder reference logits mismatch: max abs diff {max_abs_diff} exceeds tolerance {tolerance_abs}"
+    )]
+    NativeDecoderReferenceLogitsMismatch {
+        /// Largest absolute difference observed.
+        max_abs_diff: f32,
+        /// Accepted absolute tolerance.
+        tolerance_abs: f32,
+    },
+    /// A native decoder tokenizer asset is malformed or unsupported.
+    #[error("invalid native decoder tokenizer: {reason}")]
+    NativeDecoderTokenizerInvalid {
+        /// Human-readable validation failure.
+        reason: String,
+    },
+    /// A native decoder tokenizer cannot encode or decode a token.
+    #[error("native decoder tokenizer cannot resolve token {token}")]
+    NativeDecoderTokenizerTokenUnknown {
+        /// Token text or id string.
+        token: String,
+    },
     /// The runtime executor queue has reached its configured capacity.
     #[error("runtime executor queue is full; capacity is {capacity}")]
     ExecutorQueueFull {
@@ -743,6 +799,263 @@ impl NativeDecoderContract {
     }
 }
 
+/// Native decoder backend requested by the caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeDecoderBackend {
+    /// Let the runtime choose the best available backend.
+    Auto,
+    /// Deterministic single-threaded CPU reference backend.
+    CpuReference,
+    /// CPU backend with threaded output-logit projection.
+    CpuThreaded,
+    /// Select the best available accelerated backend in this build.
+    Accelerated,
+}
+
+/// Options for selecting RSMF tensor variants when loading native decoder
+/// weights.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct NativeDecoderWeightOptions {
+    /// Optional global RSMF variant index per tensor name. Missing names load
+    /// the canonical variant.
+    pub tensor_variants: HashMap<String, u32>,
+}
+
+/// Token sampling controls for native decoder generation.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct NativeDecoderSamplingOptions {
+    /// Sampling temperature. `None` keeps greedy argmax behavior. `Some(value)`
+    /// must be positive and finite.
+    pub temperature: Option<f32>,
+    /// Optional top-k candidate cap. When present, must be greater than zero.
+    pub top_k: Option<usize>,
+    /// Optional nucleus probability cap in `(0, 1]`.
+    pub top_p: Option<f32>,
+    /// Optional deterministic sampler seed. A fixed internal seed is used when
+    /// sampling is enabled and this is omitted.
+    pub seed: Option<u64>,
+}
+
+/// Performance controls for native decoder execution.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct NativeDecoderPerformanceOptions {
+    /// Optional page size for KV-cache allocation. This currently controls
+    /// page-sized reserve growth for the CPU cache and records page accounting.
+    pub kv_cache_page_size_tokens: Option<usize>,
+    /// Optional CPU worker count for threaded CPU paths.
+    pub cpu_threads: Option<usize>,
+}
+
+/// Options for native decoder greedy generation.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NativeDecoderRunOptions {
+    /// Maximum number of new tokens to generate.
+    pub max_new_tokens: usize,
+    /// Optional EOS token ids. When empty, ids from [`NativeDecoderConfig`] are
+    /// used.
+    pub eos_token_ids: Vec<i64>,
+    /// Requested backend.
+    pub backend: NativeDecoderBackend,
+    /// Weight variant selection options.
+    pub weight_options: NativeDecoderWeightOptions,
+    /// Sampling controls. The default preserves greedy argmax behavior.
+    pub sampling: NativeDecoderSamplingOptions,
+    /// Performance controls for cache allocation and CPU dispatch.
+    pub performance: NativeDecoderPerformanceOptions,
+}
+
+impl Default for NativeDecoderRunOptions {
+    fn default() -> Self {
+        Self {
+            max_new_tokens: 1,
+            eos_token_ids: Vec::new(),
+            backend: NativeDecoderBackend::Auto,
+            weight_options: NativeDecoderWeightOptions::default(),
+            sampling: NativeDecoderSamplingOptions::default(),
+            performance: NativeDecoderPerformanceOptions::default(),
+        }
+    }
+}
+
+/// Reference logits check request for native decoder verification.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NativeDecoderReferenceLogitCheck {
+    /// Token ids to feed one step at a time.
+    pub input_token_ids: Vec<i64>,
+    /// Expected next-token logits after each input token step.
+    pub expected_logits: Vec<Vec<f32>>,
+    /// Maximum accepted absolute difference.
+    pub tolerance_abs: f32,
+    /// Requested backend for the check.
+    pub backend: NativeDecoderBackend,
+    /// Weight variant selection options.
+    pub weight_options: NativeDecoderWeightOptions,
+    /// Performance controls for cache allocation and CPU dispatch.
+    pub performance: NativeDecoderPerformanceOptions,
+}
+
+/// Report from a native decoder reference logits check.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NativeDecoderReferenceLogitReport {
+    /// Number of logits rows compared.
+    pub compared_logits: usize,
+    /// Number of scalar values compared.
+    pub compared_values: usize,
+    /// Largest absolute difference observed.
+    pub max_abs_diff: f32,
+    /// Tolerance used for the check.
+    pub tolerance_abs: f32,
+    /// Backend actually used by this check.
+    pub backend: NativeDecoderBackend,
+}
+
+/// Owned LLaMA-style layer weights decoded for native decoder execution.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NativeDecoderLayerWeights {
+    /// Input RMSNorm weight, shape `[hidden_size]`.
+    pub input_layernorm: Vec<f32>,
+    /// Post-attention RMSNorm weight, shape `[hidden_size]`.
+    pub post_attention_layernorm: Vec<f32>,
+    /// Query projection weight, row-major shape `[hidden_size, hidden_size]`.
+    pub q_proj: Vec<f32>,
+    /// Key projection weight, row-major shape `[kv_width, hidden_size]`.
+    pub k_proj: Vec<f32>,
+    /// Value projection weight, row-major shape `[kv_width, hidden_size]`.
+    pub v_proj: Vec<f32>,
+    /// Attention output projection weight, row-major shape `[hidden_size, hidden_size]`.
+    pub o_proj: Vec<f32>,
+    /// SwiGLU gate projection weight, row-major shape `[intermediate_size, hidden_size]`.
+    pub gate_proj: Vec<f32>,
+    /// SwiGLU up projection weight, row-major shape `[intermediate_size, hidden_size]`.
+    pub up_proj: Vec<f32>,
+    /// SwiGLU down projection weight, row-major shape `[hidden_size, intermediate_size]`.
+    pub down_proj: Vec<f32>,
+}
+
+impl NativeDecoderLayerWeights {
+    fn as_cpu(&self) -> NativeDecoderCpuLayerWeights<'_> {
+        NativeDecoderCpuLayerWeights {
+            input_layernorm: &self.input_layernorm,
+            post_attention_layernorm: &self.post_attention_layernorm,
+            q_proj: &self.q_proj,
+            k_proj: &self.k_proj,
+            v_proj: &self.v_proj,
+            o_proj: &self.o_proj,
+            gate_proj: &self.gate_proj,
+            up_proj: &self.up_proj,
+            down_proj: &self.down_proj,
+        }
+    }
+}
+
+/// Owned native decoder weights decoded from an RSMF file.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NativeDecoderWeights {
+    /// Parsed decoder configuration used to validate these weights.
+    pub config: NativeDecoderConfig,
+    /// Token embedding matrix, row-major shape `[vocab_size, hidden_size]`.
+    pub token_embedding: Vec<f32>,
+    /// Final RMSNorm weight, shape `[hidden_size]`.
+    pub final_norm: Vec<f32>,
+    /// Optional LM head matrix, row-major shape `[vocab_size, hidden_size]`.
+    /// When absent, token embeddings are used as tied output embeddings.
+    pub lm_head: Option<Vec<f32>>,
+    /// Per-layer decoded weights.
+    pub layers: Vec<NativeDecoderLayerWeights>,
+}
+
+/// KV cache for native decoder CPU reference generation.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NativeDecoderKvCache {
+    layers: Vec<NativeDecoderLayerKvCache>,
+    position: usize,
+    kv_width: usize,
+    page_size_tokens: Option<usize>,
+}
+
+impl NativeDecoderKvCache {
+    /// Create an empty KV cache sized for the supplied decoder configuration.
+    #[must_use]
+    pub fn new(config: &NativeDecoderConfig) -> Self {
+        Self::with_page_size(config, None)
+    }
+
+    /// Create an empty KV cache with page-sized allocation growth.
+    ///
+    /// Returns an error when `page_size_tokens` is zero.
+    pub fn new_paged(config: &NativeDecoderConfig, page_size_tokens: usize) -> Result<Self> {
+        if page_size_tokens == 0 {
+            return Err(RuntimeError::NativeDecoderConfigInvalid {
+                reason: "kv_cache_page_size_tokens must be positive".to_string(),
+            });
+        }
+        Ok(Self::with_page_size(config, Some(page_size_tokens)))
+    }
+
+    fn with_page_size(config: &NativeDecoderConfig, page_size_tokens: Option<usize>) -> Self {
+        Self {
+            layers: (0..config.num_hidden_layers)
+                .map(|_| NativeDecoderLayerKvCache {
+                    keys: Vec::new(),
+                    values: Vec::new(),
+                })
+                .collect(),
+            position: 0,
+            kv_width: config.key_value_width(),
+            page_size_tokens,
+        }
+    }
+
+    /// Number of tokens already appended to the cache.
+    #[must_use]
+    pub fn position(&self) -> usize {
+        self.position
+    }
+
+    /// Optional KV-cache allocation page size in tokens.
+    #[must_use]
+    pub fn page_size_tokens(&self) -> Option<usize> {
+        self.page_size_tokens
+    }
+
+    /// Number of pages allocated for the current cache position.
+    #[must_use]
+    pub fn allocated_pages(&self) -> usize {
+        self.page_size_tokens
+            .map(|page_size| self.position.div_ceil(page_size))
+            .unwrap_or(0)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct NativeDecoderLayerKvCache {
+    keys: Vec<f32>,
+    values: Vec<f32>,
+}
+
+/// Output from one native decoder step.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NativeDecoderStepOutput {
+    /// Logits for the next token, shape `[vocab_size]`.
+    pub logits: Vec<f32>,
+    /// Greedy argmax token id selected from `logits`.
+    pub next_token_id: i64,
+}
+
+/// Output from native decoder greedy generation.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NativeDecoderGenerateOutput {
+    /// Prompt tokens followed by generated tokens.
+    pub token_ids: Vec<i64>,
+    /// Newly generated token ids only.
+    pub generated_token_ids: Vec<i64>,
+    /// Per-generation-step logits, one row per generated token.
+    pub logits: Vec<Vec<f32>>,
+    /// Backend actually used by this run.
+    pub backend: NativeDecoderBackend,
+}
+
 #[derive(Debug, Deserialize)]
 struct HfNativeDecoderConfig {
     model_type: String,
@@ -1197,6 +1510,98 @@ pub fn native_decoder_cpu_causal_attention(
     Ok(output)
 }
 
+/// CPU reference grouped-query attention for one query token over an existing
+/// KV cache.
+///
+/// `query` has shape `[num_attention_heads, head_dim]`; `key_cache` and
+/// `value_cache` have shape `[cache_len, num_key_value_heads, head_dim]`.
+pub fn native_decoder_cpu_cached_attention(
+    query: &[f32],
+    key_cache: &[f32],
+    value_cache: &[f32],
+    cache_len: usize,
+    num_attention_heads: usize,
+    num_key_value_heads: usize,
+    head_dim: usize,
+) -> Result<Vec<f32>> {
+    validate_cpu_positive("cached_attention", "cache_len", cache_len)?;
+    validate_cpu_positive(
+        "cached_attention",
+        "num_attention_heads",
+        num_attention_heads,
+    )?;
+    validate_cpu_positive(
+        "cached_attention",
+        "num_key_value_heads",
+        num_key_value_heads,
+    )?;
+    validate_cpu_positive("cached_attention", "head_dim", head_dim)?;
+    if num_attention_heads % num_key_value_heads != 0 {
+        return Err(native_decoder_cpu_shape_error(
+            "cached_attention",
+            "num_attention_heads must be divisible by num_key_value_heads",
+        ));
+    }
+    let query_width = cpu_element_count(
+        "cached_attention",
+        "query width",
+        num_attention_heads,
+        head_dim,
+    )?;
+    let kv_width = cpu_element_count(
+        "cached_attention",
+        "key/value width",
+        num_key_value_heads,
+        head_dim,
+    )?;
+    validate_cpu_vector_len("cached_attention", "query", query.len(), query_width)?;
+    validate_cpu_matrix_len(
+        "cached_attention",
+        "key_cache",
+        key_cache.len(),
+        cache_len,
+        kv_width,
+    )?;
+    validate_cpu_matrix_len(
+        "cached_attention",
+        "value_cache",
+        value_cache.len(),
+        cache_len,
+        kv_width,
+    )?;
+
+    let groups = num_attention_heads / num_key_value_heads;
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    let mut output = vec![0.0f32; query_width];
+    for head in 0..num_attention_heads {
+        let kv_head = head / groups;
+        let query_offset = head * head_dim;
+        let mut scores = vec![0.0f32; cache_len];
+        for (key_token, score) in scores.iter_mut().enumerate() {
+            let key_offset = (key_token * num_key_value_heads + kv_head) * head_dim;
+            *score = dot_product(
+                &query[query_offset..query_offset + head_dim],
+                &key_cache[key_offset..key_offset + head_dim],
+            ) * scale;
+        }
+        let max_score = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let mut weight_sum = 0.0f32;
+        for score in &mut scores {
+            *score = (*score - max_score).exp();
+            weight_sum += *score;
+        }
+        let output_offset = head * head_dim;
+        for (key_token, score) in scores.iter().enumerate() {
+            let attention_weight = *score / weight_sum;
+            let value_offset = (key_token * num_key_value_heads + kv_head) * head_dim;
+            for dim in 0..head_dim {
+                output[output_offset + dim] += attention_weight * value_cache[value_offset + dim];
+            }
+        }
+    }
+    Ok(output)
+}
+
 /// CPU reference LLaMA-style decoder block over supplied f32 layer weights.
 ///
 /// This is a correctness-oriented reference path for R4.2. It performs RMSNorm,
@@ -1424,6 +1829,864 @@ fn add_same_shape(
         .zip(right.iter())
         .map(|(left, right)| left + right)
         .collect())
+}
+
+fn resolve_native_decoder_backend(backend: NativeDecoderBackend) -> Result<NativeDecoderBackend> {
+    match backend {
+        NativeDecoderBackend::Auto | NativeDecoderBackend::CpuReference => {
+            Ok(NativeDecoderBackend::CpuReference)
+        }
+        NativeDecoderBackend::CpuThreaded | NativeDecoderBackend::Accelerated => {
+            Ok(NativeDecoderBackend::CpuThreaded)
+        }
+    }
+}
+
+fn load_native_decoder_weights(
+    file: &RsmfFile,
+    config: NativeDecoderConfig,
+    options: &NativeDecoderWeightOptions,
+) -> Result<NativeDecoderWeights> {
+    if config.family != NativeDecoderFamily::Llama {
+        return Err(RuntimeError::UnsupportedNativeDecoder {
+            family: format!("{:?}", config.family),
+        });
+    }
+    let hidden = usize_to_u64(config.hidden_size, "hidden_size")?;
+    let intermediate = usize_to_u64(config.intermediate_size, "intermediate_size")?;
+    let vocab = usize_to_u64(config.vocab_size, "vocab_size")?;
+    let kv_width = usize_to_u64(config.key_value_width(), "kv projection width")?;
+    let token_embedding = load_native_decoder_tensor_f32(
+        file,
+        options,
+        "model.embed_tokens.weight",
+        &[vocab, hidden],
+    )?;
+    let final_norm = load_native_decoder_tensor_f32(file, options, "model.norm.weight", &[hidden])?;
+    let lm_head = if config.tie_word_embeddings {
+        None
+    } else {
+        Some(load_native_decoder_tensor_f32(
+            file,
+            options,
+            "lm_head.weight",
+            &[vocab, hidden],
+        )?)
+    };
+    let mut layers = Vec::with_capacity(config.num_hidden_layers);
+    for layer in 0..config.num_hidden_layers {
+        layers.push(NativeDecoderLayerWeights {
+            input_layernorm: load_native_decoder_tensor_f32(
+                file,
+                options,
+                &format!("model.layers.{layer}.input_layernorm.weight"),
+                &[hidden],
+            )?,
+            post_attention_layernorm: load_native_decoder_tensor_f32(
+                file,
+                options,
+                &format!("model.layers.{layer}.post_attention_layernorm.weight"),
+                &[hidden],
+            )?,
+            q_proj: load_native_decoder_tensor_f32(
+                file,
+                options,
+                &format!("model.layers.{layer}.self_attn.q_proj.weight"),
+                &[hidden, hidden],
+            )?,
+            k_proj: load_native_decoder_tensor_f32(
+                file,
+                options,
+                &format!("model.layers.{layer}.self_attn.k_proj.weight"),
+                &[kv_width, hidden],
+            )?,
+            v_proj: load_native_decoder_tensor_f32(
+                file,
+                options,
+                &format!("model.layers.{layer}.self_attn.v_proj.weight"),
+                &[kv_width, hidden],
+            )?,
+            o_proj: load_native_decoder_tensor_f32(
+                file,
+                options,
+                &format!("model.layers.{layer}.self_attn.o_proj.weight"),
+                &[hidden, hidden],
+            )?,
+            gate_proj: load_native_decoder_tensor_f32(
+                file,
+                options,
+                &format!("model.layers.{layer}.mlp.gate_proj.weight"),
+                &[intermediate, hidden],
+            )?,
+            up_proj: load_native_decoder_tensor_f32(
+                file,
+                options,
+                &format!("model.layers.{layer}.mlp.up_proj.weight"),
+                &[intermediate, hidden],
+            )?,
+            down_proj: load_native_decoder_tensor_f32(
+                file,
+                options,
+                &format!("model.layers.{layer}.mlp.down_proj.weight"),
+                &[hidden, intermediate],
+            )?,
+        });
+    }
+    Ok(NativeDecoderWeights {
+        config,
+        token_embedding,
+        final_norm,
+        lm_head,
+        layers,
+    })
+}
+
+fn load_native_decoder_tensor_f32(
+    file: &RsmfFile,
+    options: &NativeDecoderWeightOptions,
+    tensor_name: &str,
+    expected_shape: &[u64],
+) -> Result<Vec<f32>> {
+    let view = native_decoder_weight_view(file, options, tensor_name)?;
+    if view.shape() != expected_shape {
+        return Err(RuntimeError::NativeDecoderTensorShapeMismatch {
+            tensor_name: tensor_name.to_string(),
+            expected_shape: format_shape(expected_shape),
+            actual_shape: format_shape(view.shape()),
+        });
+    }
+    validate_native_decoder_weight_dtype(view.descriptor)?;
+    if view.layout != LayoutTag::RowMajor {
+        return Err(RuntimeError::NativeDecoderTensorUnsupported {
+            tensor_name: tensor_name.to_string(),
+            reason: format!(
+                "only row-major weights are supported, got {:?}",
+                view.layout
+            ),
+        });
+    }
+    let values =
+        view.decode_f32()
+            .map_err(|error| RuntimeError::NativeDecoderTensorUnsupported {
+                tensor_name: tensor_name.to_string(),
+                reason: error.to_string(),
+            })?;
+    let expected_len = shape_element_count(expected_shape)?;
+    if values.len() != expected_len {
+        return Err(RuntimeError::NativeDecoderTensorUnsupported {
+            tensor_name: tensor_name.to_string(),
+            reason: format!("decoded {} elements, expected {expected_len}", values.len()),
+        });
+    }
+    Ok(values)
+}
+
+fn native_decoder_weight_view<'a>(
+    file: &'a RsmfFile,
+    options: &NativeDecoderWeightOptions,
+    tensor_name: &str,
+) -> Result<TensorView<'a>> {
+    let result = if let Some(variant_idx) = options.tensor_variants.get(tensor_name) {
+        file.tensor_view_variant(tensor_name, *variant_idx)
+    } else {
+        file.tensor_view(tensor_name)
+    };
+    result.map_err(|error| match error {
+        RsmfError::NotFound { what } if what == format!("tensor {tensor_name}") => {
+            RuntimeError::NativeDecoderTensorMissing {
+                tensor_name: tensor_name.to_string(),
+            }
+        }
+        RsmfError::NotFound { what } => RuntimeError::NativeDecoderTensorUnsupported {
+            tensor_name: tensor_name.to_string(),
+            reason: what,
+        },
+        other => RuntimeError::Core(other),
+    })
+}
+
+fn shape_element_count(shape: &[u64]) -> Result<usize> {
+    shape.iter().try_fold(1usize, |count, &dim| {
+        let dim = usize::try_from(dim).map_err(|_| {
+            RuntimeError::Shape(format!(
+                "native decoder dimension {dim} cannot convert to usize"
+            ))
+        })?;
+        count
+            .checked_mul(dim)
+            .ok_or_else(|| RuntimeError::Shape("native decoder element count overflow".to_string()))
+    })
+}
+
+fn native_decoder_cpu_greedy_decode(
+    weights: &NativeDecoderWeights,
+    input_token_ids: &[i64],
+    options: NativeDecoderRunOptions,
+    backend: NativeDecoderBackend,
+) -> Result<NativeDecoderGenerateOutput> {
+    validate_native_decoder_sampling_options(&options.sampling)?;
+    validate_native_decoder_performance_options(&options.performance)?;
+    if input_token_ids.is_empty() {
+        return Err(RuntimeError::NativeDecoderPromptEmpty);
+    }
+    for &token_id in input_token_ids {
+        validate_native_decoder_token_id(token_id, weights.config.vocab_size)?;
+    }
+    let mut token_ids = input_token_ids.to_vec();
+    if options.max_new_tokens == 0 {
+        return Ok(NativeDecoderGenerateOutput {
+            token_ids,
+            generated_token_ids: Vec::new(),
+            logits: Vec::new(),
+            backend,
+        });
+    }
+
+    let mut sampler_rng =
+        NativeDecoderSamplerRng::new(options.sampling.seed.unwrap_or(0x9E37_79B9_7F4A_7C15));
+    let eos_token_ids = if options.eos_token_ids.is_empty() {
+        weights.config.eos_token_ids.clone()
+    } else {
+        options.eos_token_ids
+    };
+    let mut cache =
+        native_decoder_kv_cache_with_performance(&weights.config, &options.performance)?;
+    let mut last_step = None;
+    for &token_id in input_token_ids {
+        last_step = Some(native_decoder_cpu_step(
+            weights,
+            &mut cache,
+            token_id,
+            backend,
+            &options.performance,
+        )?);
+    }
+
+    let mut generated_token_ids = Vec::with_capacity(options.max_new_tokens);
+    let mut logits = Vec::with_capacity(options.max_new_tokens);
+    for step_index in 0..options.max_new_tokens {
+        let step = last_step
+            .take()
+            .ok_or(RuntimeError::NativeDecoderPromptEmpty)?;
+        let next_token_id =
+            select_native_decoder_token(&step.logits, &options.sampling, &mut sampler_rng)?;
+        logits.push(step.logits);
+        generated_token_ids.push(next_token_id);
+        token_ids.push(next_token_id);
+        if eos_token_ids.contains(&next_token_id) {
+            break;
+        }
+        if step_index + 1 < options.max_new_tokens {
+            last_step = Some(native_decoder_cpu_step(
+                weights,
+                &mut cache,
+                next_token_id,
+                backend,
+                &options.performance,
+            )?);
+        }
+    }
+
+    Ok(NativeDecoderGenerateOutput {
+        token_ids,
+        generated_token_ids,
+        logits,
+        backend,
+    })
+}
+
+fn native_decoder_check_reference_logits(
+    weights: &NativeDecoderWeights,
+    check: NativeDecoderReferenceLogitCheck,
+    backend: NativeDecoderBackend,
+) -> Result<NativeDecoderReferenceLogitReport> {
+    validate_native_decoder_performance_options(&check.performance)?;
+    if check.input_token_ids.is_empty() {
+        return Err(RuntimeError::NativeDecoderPromptEmpty);
+    }
+    if check.input_token_ids.len() != check.expected_logits.len() {
+        return Err(RuntimeError::NativeDecoderConfigInvalid {
+            reason: format!(
+                "expected_logits has {} rows, expected {}",
+                check.expected_logits.len(),
+                check.input_token_ids.len()
+            ),
+        });
+    }
+    if !check.tolerance_abs.is_finite() || check.tolerance_abs < 0.0 {
+        return Err(RuntimeError::NativeDecoderConfigInvalid {
+            reason: "tolerance_abs must be finite and non-negative".to_string(),
+        });
+    }
+    let mut cache = native_decoder_kv_cache_with_performance(&weights.config, &check.performance)?;
+    let mut compared_values = 0usize;
+    let mut max_abs_diff = 0.0f32;
+    for (token_id, expected_logits) in check
+        .input_token_ids
+        .iter()
+        .copied()
+        .zip(check.expected_logits.iter())
+    {
+        if expected_logits.len() != weights.config.vocab_size {
+            return Err(RuntimeError::NativeDecoderConfigInvalid {
+                reason: format!(
+                    "expected logits row has {} values, expected vocab size {}",
+                    expected_logits.len(),
+                    weights.config.vocab_size
+                ),
+            });
+        }
+        let output =
+            native_decoder_cpu_step(weights, &mut cache, token_id, backend, &check.performance)?;
+        for (actual, expected) in output.logits.iter().zip(expected_logits.iter()) {
+            let diff = (actual - expected).abs();
+            max_abs_diff = max_abs_diff.max(diff);
+            compared_values += 1;
+        }
+    }
+    if max_abs_diff > check.tolerance_abs {
+        return Err(RuntimeError::NativeDecoderReferenceLogitsMismatch {
+            max_abs_diff,
+            tolerance_abs: check.tolerance_abs,
+        });
+    }
+    Ok(NativeDecoderReferenceLogitReport {
+        compared_logits: check.expected_logits.len(),
+        compared_values,
+        max_abs_diff,
+        tolerance_abs: check.tolerance_abs,
+        backend,
+    })
+}
+
+fn native_decoder_kv_cache_with_performance(
+    config: &NativeDecoderConfig,
+    performance: &NativeDecoderPerformanceOptions,
+) -> Result<NativeDecoderKvCache> {
+    if let Some(page_size) = performance.kv_cache_page_size_tokens {
+        NativeDecoderKvCache::new_paged(config, page_size)
+    } else {
+        Ok(NativeDecoderKvCache::new(config))
+    }
+}
+
+fn append_native_decoder_layer_cache(
+    cache: &mut NativeDecoderLayerKvCache,
+    key: &[f32],
+    value: &[f32],
+    position: usize,
+    kv_width: usize,
+    page_size_tokens: Option<usize>,
+) -> Result<()> {
+    validate_cpu_vector_len("kv_cache", "key", key.len(), kv_width)?;
+    validate_cpu_vector_len("kv_cache", "value", value.len(), kv_width)?;
+    if let Some(page_size) = page_size_tokens {
+        let page_width = cpu_element_count("kv_cache", "page", page_size, kv_width)?;
+        if position % page_size == 0 {
+            cache.keys.reserve(page_width);
+            cache.values.reserve(page_width);
+        }
+    }
+    cache.keys.extend_from_slice(key);
+    cache.values.extend_from_slice(value);
+    Ok(())
+}
+
+fn validate_native_decoder_sampling_options(options: &NativeDecoderSamplingOptions) -> Result<()> {
+    if let Some(temperature) = options.temperature {
+        if !temperature.is_finite() || temperature <= 0.0 {
+            return Err(RuntimeError::NativeDecoderSamplingInvalid {
+                reason: "temperature must be positive and finite".to_string(),
+            });
+        }
+    }
+    if matches!(options.top_k, Some(0)) {
+        return Err(RuntimeError::NativeDecoderSamplingInvalid {
+            reason: "top_k must be greater than zero".to_string(),
+        });
+    }
+    if let Some(top_p) = options.top_p {
+        if !top_p.is_finite() || top_p <= 0.0 || top_p > 1.0 {
+            return Err(RuntimeError::NativeDecoderSamplingInvalid {
+                reason: "top_p must be in (0, 1]".to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_native_decoder_performance_options(
+    options: &NativeDecoderPerformanceOptions,
+) -> Result<()> {
+    if matches!(options.kv_cache_page_size_tokens, Some(0)) {
+        return Err(RuntimeError::NativeDecoderConfigInvalid {
+            reason: "kv_cache_page_size_tokens must be positive".to_string(),
+        });
+    }
+    if matches!(options.cpu_threads, Some(0)) {
+        return Err(RuntimeError::NativeDecoderConfigInvalid {
+            reason: "cpu_threads must be positive".to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn select_native_decoder_token(
+    logits: &[f32],
+    sampling: &NativeDecoderSamplingOptions,
+    rng: &mut NativeDecoderSamplerRng,
+) -> Result<i64> {
+    if sampling.temperature.is_none() {
+        return greedy_argmax_token(logits);
+    }
+    let temperature = sampling
+        .temperature
+        .ok_or_else(|| native_decoder_cpu_shape_error("sample", "temperature missing"))?;
+    let mut candidates = logits
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(token_id, logit)| (token_id, logit / temperature))
+        .collect::<Vec<_>>();
+    candidates.sort_by(|(_, left), (_, right)| right.total_cmp(left));
+    if let Some(top_k) = sampling.top_k {
+        candidates.truncate(top_k.min(candidates.len()));
+    }
+    if candidates.is_empty() {
+        return Err(native_decoder_cpu_shape_error(
+            "sample",
+            "candidate set must not be empty",
+        ));
+    }
+
+    let max_logit = candidates
+        .iter()
+        .map(|(_, logit)| *logit)
+        .fold(f32::NEG_INFINITY, f32::max);
+    let mut probabilities = candidates
+        .into_iter()
+        .map(|(token_id, logit)| (token_id, (logit - max_logit).exp()))
+        .collect::<Vec<_>>();
+    let total = probabilities
+        .iter()
+        .map(|(_, probability)| *probability)
+        .sum::<f32>();
+    if total <= 0.0 || !total.is_finite() {
+        return greedy_argmax_token(logits);
+    }
+    for (_, probability) in &mut probabilities {
+        *probability /= total;
+    }
+    if let Some(top_p) = sampling.top_p {
+        let mut cumulative = 0.0f32;
+        let mut keep = 0usize;
+        for (_, probability) in &probabilities {
+            cumulative += *probability;
+            keep += 1;
+            if cumulative >= top_p {
+                break;
+            }
+        }
+        probabilities.truncate(keep.max(1));
+        let renormalized_total = probabilities
+            .iter()
+            .map(|(_, probability)| *probability)
+            .sum::<f32>();
+        if renormalized_total > 0.0 {
+            for (_, probability) in &mut probabilities {
+                *probability /= renormalized_total;
+            }
+        }
+    }
+
+    let draw = rng.next_unit_f32();
+    let mut cumulative = 0.0f32;
+    for (token_id, probability) in &probabilities {
+        cumulative += *probability;
+        if draw <= cumulative {
+            return i64::try_from(*token_id)
+                .map_err(|_| native_decoder_cpu_shape_error("sample", "token id overflow"));
+        }
+    }
+    probabilities
+        .last()
+        .map(|(token_id, _)| *token_id)
+        .ok_or_else(|| native_decoder_cpu_shape_error("sample", "candidate set must not be empty"))
+        .and_then(|token_id| {
+            i64::try_from(token_id)
+                .map_err(|_| native_decoder_cpu_shape_error("sample", "token id overflow"))
+        })
+}
+
+struct NativeDecoderSamplerRng {
+    state: u64,
+}
+
+impl NativeDecoderSamplerRng {
+    fn new(seed: u64) -> Self {
+        Self {
+            state: seed ^ 0xA076_1D64_78BD_642F,
+        }
+    }
+
+    fn next_unit_f32(&mut self) -> f32 {
+        let mut value = self.state;
+        value ^= value >> 12;
+        value ^= value << 25;
+        value ^= value >> 27;
+        self.state = value;
+        let value = value.wrapping_mul(0x2545_F491_4F6C_DD1D);
+        ((value >> 40) as f32) / ((1u32 << 24) as f32)
+    }
+}
+
+fn native_decoder_cpu_step(
+    weights: &NativeDecoderWeights,
+    cache: &mut NativeDecoderKvCache,
+    token_id: i64,
+    backend: NativeDecoderBackend,
+    performance: &NativeDecoderPerformanceOptions,
+) -> Result<NativeDecoderStepOutput> {
+    let token_index = validate_native_decoder_token_id(token_id, weights.config.vocab_size)?;
+    if cache.layers.len() != weights.config.num_hidden_layers {
+        return Err(native_decoder_cpu_shape_error(
+            "step",
+            format!(
+                "cache has {} layers, expected {}",
+                cache.layers.len(),
+                weights.config.num_hidden_layers
+            ),
+        ));
+    }
+    if cache.position >= weights.config.max_position_embeddings {
+        return Err(native_decoder_cpu_shape_error(
+            "step",
+            format!(
+                "position {} exceeds max_position_embeddings {}",
+                cache.position, weights.config.max_position_embeddings
+            ),
+        ));
+    }
+    let hidden_size = weights.config.hidden_size;
+    let embed_start = token_index
+        .checked_mul(hidden_size)
+        .ok_or_else(|| native_decoder_cpu_shape_error("step", "embedding offset overflow"))?;
+    let embed_end = embed_start
+        .checked_add(hidden_size)
+        .ok_or_else(|| native_decoder_cpu_shape_error("step", "embedding end overflow"))?;
+    let mut hidden_states = weights
+        .token_embedding
+        .get(embed_start..embed_end)
+        .ok_or_else(|| {
+            native_decoder_cpu_shape_error(
+                "step",
+                format!("token embedding missing row {token_index}"),
+            )
+        })?
+        .to_vec();
+
+    let mut layer_updates = Vec::with_capacity(weights.layers.len());
+    for (layer_idx, layer_weights) in weights.layers.iter().enumerate() {
+        let layer_cache = &cache.layers[layer_idx];
+        let step = native_decoder_cpu_llama_cached_step(
+            &weights.config,
+            &hidden_states,
+            cache.position,
+            layer_cache,
+            layer_weights.as_cpu(),
+        )?;
+        hidden_states = step.hidden_states;
+        layer_updates.push((step.key, step.value));
+    }
+    for (layer_cache, (key, value)) in cache.layers.iter_mut().zip(layer_updates) {
+        append_native_decoder_layer_cache(
+            layer_cache,
+            &key,
+            &value,
+            cache.position,
+            cache.kv_width,
+            cache.page_size_tokens,
+        )?;
+    }
+    cache.position += 1;
+
+    let normalized = native_decoder_cpu_rms_norm(
+        &hidden_states,
+        1,
+        hidden_size,
+        &weights.final_norm,
+        weights.config.rms_norm_eps,
+    )?;
+    let lm_head = weights.lm_head.as_ref().unwrap_or(&weights.token_embedding);
+    let logits = native_decoder_cpu_logits(
+        &normalized,
+        hidden_size,
+        lm_head,
+        weights.config.vocab_size,
+        backend,
+        performance,
+    )?;
+    let next_token_id = greedy_argmax_token(&logits)?;
+    Ok(NativeDecoderStepOutput {
+        logits,
+        next_token_id,
+    })
+}
+
+struct NativeDecoderCpuCachedBlockOutput {
+    hidden_states: Vec<f32>,
+    key: Vec<f32>,
+    value: Vec<f32>,
+}
+
+fn native_decoder_cpu_llama_cached_step(
+    config: &NativeDecoderConfig,
+    hidden_states: &[f32],
+    position: usize,
+    cache: &NativeDecoderLayerKvCache,
+    weights: NativeDecoderCpuLayerWeights<'_>,
+) -> Result<NativeDecoderCpuCachedBlockOutput> {
+    if config.family != NativeDecoderFamily::Llama {
+        return Err(RuntimeError::UnsupportedNativeDecoder {
+            family: format!("{:?}", config.family),
+        });
+    }
+    config.validate()?;
+    let hidden_size = config.hidden_size;
+    let intermediate_size = config.intermediate_size;
+    let head_dim = config.head_dim();
+    let kv_width = config.key_value_width();
+    let expected_cache_len = cpu_element_count("llama_cached_step", "cache", position, kv_width)?;
+    validate_cpu_vector_len(
+        "llama_cached_step",
+        "hidden_states",
+        hidden_states.len(),
+        hidden_size,
+    )?;
+    validate_cpu_vector_len(
+        "llama_cached_step",
+        "key_cache",
+        cache.keys.len(),
+        expected_cache_len,
+    )?;
+    validate_cpu_vector_len(
+        "llama_cached_step",
+        "value_cache",
+        cache.values.len(),
+        expected_cache_len,
+    )?;
+
+    let normalized = native_decoder_cpu_rms_norm(
+        hidden_states,
+        1,
+        hidden_size,
+        weights.input_layernorm,
+        config.rms_norm_eps,
+    )?;
+    let mut query =
+        native_decoder_cpu_linear(&normalized, 1, hidden_size, weights.q_proj, hidden_size)?;
+    let mut key = native_decoder_cpu_linear(&normalized, 1, hidden_size, weights.k_proj, kv_width)?;
+    let value = native_decoder_cpu_linear(&normalized, 1, hidden_size, weights.v_proj, kv_width)?;
+    native_decoder_cpu_apply_llama_rope(
+        &mut query,
+        1,
+        config.num_attention_heads,
+        head_dim,
+        position,
+        config.rope_theta,
+    )?;
+    native_decoder_cpu_apply_llama_rope(
+        &mut key,
+        1,
+        config.num_key_value_heads,
+        head_dim,
+        position,
+        config.rope_theta,
+    )?;
+
+    let mut key_context = cache.keys.clone();
+    key_context.extend_from_slice(&key);
+    let mut value_context = cache.values.clone();
+    value_context.extend_from_slice(&value);
+    let attention = native_decoder_cpu_cached_attention(
+        &query,
+        &key_context,
+        &value_context,
+        position + 1,
+        config.num_attention_heads,
+        config.num_key_value_heads,
+        head_dim,
+    )?;
+    let attention_projected =
+        native_decoder_cpu_linear(&attention, 1, hidden_size, weights.o_proj, hidden_size)?;
+    let attention_residual = add_same_shape(
+        "llama_cached_step",
+        hidden_states,
+        &attention_projected,
+        "attention residual",
+    )?;
+    let mlp_normalized = native_decoder_cpu_rms_norm(
+        &attention_residual,
+        1,
+        hidden_size,
+        weights.post_attention_layernorm,
+        config.rms_norm_eps,
+    )?;
+    let gate = native_decoder_cpu_linear(
+        &mlp_normalized,
+        1,
+        hidden_size,
+        weights.gate_proj,
+        intermediate_size,
+    )?;
+    let up = native_decoder_cpu_linear(
+        &mlp_normalized,
+        1,
+        hidden_size,
+        weights.up_proj,
+        intermediate_size,
+    )?;
+    let activated = gate
+        .iter()
+        .zip(up.iter())
+        .map(|(gate, up)| native_decoder_cpu_silu(*gate) * up)
+        .collect::<Vec<_>>();
+    let mlp_projected = native_decoder_cpu_linear(
+        &activated,
+        1,
+        intermediate_size,
+        weights.down_proj,
+        hidden_size,
+    )?;
+    let hidden_states = add_same_shape(
+        "llama_cached_step",
+        &attention_residual,
+        &mlp_projected,
+        "mlp residual",
+    )?;
+
+    Ok(NativeDecoderCpuCachedBlockOutput {
+        hidden_states,
+        key,
+        value,
+    })
+}
+
+fn native_decoder_cpu_logits(
+    normalized: &[f32],
+    hidden_size: usize,
+    lm_head: &[f32],
+    vocab_size: usize,
+    backend: NativeDecoderBackend,
+    performance: &NativeDecoderPerformanceOptions,
+) -> Result<Vec<f32>> {
+    match backend {
+        NativeDecoderBackend::CpuThreaded => native_decoder_cpu_linear_threaded(
+            normalized,
+            1,
+            hidden_size,
+            lm_head,
+            vocab_size,
+            performance.cpu_threads.unwrap_or_else(|| {
+                std::thread::available_parallelism()
+                    .map(usize::from)
+                    .unwrap_or(1)
+            }),
+        ),
+        NativeDecoderBackend::CpuReference
+        | NativeDecoderBackend::Auto
+        | NativeDecoderBackend::Accelerated => {
+            native_decoder_cpu_linear(normalized, 1, hidden_size, lm_head, vocab_size)
+        }
+    }
+}
+
+fn native_decoder_cpu_linear_threaded(
+    input: &[f32],
+    rows: usize,
+    in_features: usize,
+    weight: &[f32],
+    out_features: usize,
+    requested_threads: usize,
+) -> Result<Vec<f32>> {
+    validate_cpu_matrix_len("linear_threaded", "input", input.len(), rows, in_features)?;
+    validate_cpu_matrix_len(
+        "linear_threaded",
+        "weight",
+        weight.len(),
+        out_features,
+        in_features,
+    )?;
+    validate_cpu_positive("linear_threaded", "requested_threads", requested_threads)?;
+    let output_len = cpu_element_count("linear_threaded", "output", rows, out_features)?;
+    if requested_threads == 1 || out_features <= 1 {
+        return native_decoder_cpu_linear(input, rows, in_features, weight, out_features);
+    }
+    let thread_count = requested_threads.min(out_features);
+    let chunk_size = out_features.div_ceil(thread_count);
+    let mut chunks = std::thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for start in (0..out_features).step_by(chunk_size) {
+            let end = start.saturating_add(chunk_size).min(out_features);
+            handles.push(scope.spawn(move || {
+                let mut chunk = vec![0.0f32; rows * (end - start)];
+                for row in 0..rows {
+                    for out_col in start..end {
+                        let mut sum = 0.0f32;
+                        for in_col in 0..in_features {
+                            sum += input[row * in_features + in_col]
+                                * weight[out_col * in_features + in_col];
+                        }
+                        chunk[row * (end - start) + (out_col - start)] = sum;
+                    }
+                }
+                (start, end, chunk)
+            }));
+        }
+        handles
+            .into_iter()
+            .map(|handle| handle.join())
+            .collect::<std::result::Result<Vec<_>, _>>()
+    })
+    .map_err(|_| RuntimeError::Shape("native decoder CPU worker panicked".to_string()))?;
+    chunks.sort_by_key(|(start, _, _)| *start);
+    let mut output = vec![0.0f32; output_len];
+    for (start, end, chunk) in chunks {
+        let width = end - start;
+        for row in 0..rows {
+            let output_start = row * out_features + start;
+            let chunk_start = row * width;
+            output[output_start..output_start + width]
+                .copy_from_slice(&chunk[chunk_start..chunk_start + width]);
+        }
+    }
+    Ok(output)
+}
+
+fn validate_native_decoder_token_id(token_id: i64, vocab_size: usize) -> Result<usize> {
+    let token_index =
+        usize::try_from(token_id).map_err(|_| RuntimeError::NativeDecoderTokenOutOfRange {
+            token_id,
+            vocab_size,
+        })?;
+    if token_index >= vocab_size {
+        Err(RuntimeError::NativeDecoderTokenOutOfRange {
+            token_id,
+            vocab_size,
+        })
+    } else {
+        Ok(token_index)
+    }
+}
+
+fn greedy_argmax_token(logits: &[f32]) -> Result<i64> {
+    let (index, _) = logits
+        .iter()
+        .copied()
+        .enumerate()
+        .max_by(|(_, left), (_, right)| left.total_cmp(right))
+        .ok_or_else(|| native_decoder_cpu_shape_error("greedy", "logits must not be empty"))?;
+    i64::try_from(index).map_err(|_| native_decoder_cpu_shape_error("greedy", "token id overflow"))
 }
 
 /// Configuration for the in-process runtime executor.
@@ -2006,6 +3269,67 @@ impl Engine {
     /// internals.
     pub fn native_decoder_contract(&self) -> Result<NativeDecoderContract> {
         NativeDecoderContract::from_file(&self.file)
+    }
+
+    /// Load native decoder weights from canonical RSMF tensor variants.
+    ///
+    /// The contract is validated first, then selected tensor variants are
+    /// decoded to owned f32 buffers for the native runtime.
+    pub fn native_decoder_weights(&self) -> Result<NativeDecoderWeights> {
+        self.native_decoder_weights_with_options(&NativeDecoderWeightOptions::default())
+    }
+
+    /// Load native decoder weights from selected RSMF tensor variants.
+    ///
+    /// Missing entries in `options.tensor_variants` load canonical variants.
+    /// Selected variants must belong to the requested tensor and decode to the
+    /// expected row-major f32 element count.
+    pub fn native_decoder_weights_with_options(
+        &self,
+        options: &NativeDecoderWeightOptions,
+    ) -> Result<NativeDecoderWeights> {
+        let contract = self.native_decoder_contract()?;
+        load_native_decoder_weights(&self.file, contract.config, options)
+    }
+
+    /// Run native decoder greedy generation.
+    ///
+    /// This R4 path supports the CPU reference backend. `Auto` resolves to
+    /// `CpuReference`; `Accelerated` returns a typed unavailable error until a
+    /// real accelerated backend is implemented.
+    pub fn native_decoder_greedy_decode(
+        &self,
+        input_token_ids: &[i64],
+        options: NativeDecoderRunOptions,
+    ) -> Result<NativeDecoderGenerateOutput> {
+        let backend = resolve_native_decoder_backend(options.backend)?;
+        let weights = self.native_decoder_weights_with_options(&options.weight_options)?;
+        match backend {
+            NativeDecoderBackend::CpuReference | NativeDecoderBackend::CpuThreaded => {
+                native_decoder_cpu_greedy_decode(&weights, input_token_ids, options, backend)
+            }
+            NativeDecoderBackend::Auto | NativeDecoderBackend::Accelerated => {
+                Err(RuntimeError::NativeDecoderBackendUnavailable {
+                    backend: format!("{backend:?}"),
+                    reason: "backend selector did not resolve to an executable backend".to_string(),
+                })
+            }
+        }
+    }
+
+    /// Compare native decoder logits against a caller-supplied reference.
+    ///
+    /// This is intended for local tiny-model fixtures or exported reference
+    /// logits from another runtime. The check feeds `input_token_ids` one step
+    /// at a time and compares each next-token logits row against
+    /// `expected_logits`.
+    pub fn native_decoder_check_reference_logits(
+        &self,
+        check: NativeDecoderReferenceLogitCheck,
+    ) -> Result<NativeDecoderReferenceLogitReport> {
+        let backend = resolve_native_decoder_backend(check.backend)?;
+        let weights = self.native_decoder_weights_with_options(&check.weight_options)?;
+        native_decoder_check_reference_logits(&weights, check, backend)
     }
 
     /// Create a fresh default ONNX Runtime session for compatibility with the
@@ -5093,6 +6417,168 @@ mod tests {
     }
 
     #[test]
+    fn engine_native_decoder_weights_loads_f32_tensors_from_rsmf() {
+        let dir = tempdir().unwrap();
+        let engine = tiny_native_decoder_generation_engine(dir.path().join("native-decode.rsmf"));
+
+        let weights = engine.native_decoder_weights().unwrap();
+        assert_eq!(weights.config.hidden_size, 2);
+        assert_eq!(weights.layers.len(), 1);
+        assert_eq!(weights.token_embedding.len(), 8);
+        assert_eq!(weights.final_norm, vec![1.0, 1.0]);
+        assert!(weights.lm_head.is_some());
+    }
+
+    #[test]
+    fn engine_native_decoder_greedy_decode_generates_expected_tokens() {
+        let dir = tempdir().unwrap();
+        let engine = tiny_native_decoder_generation_engine(dir.path().join("native-decode.rsmf"));
+
+        let output = engine
+            .native_decoder_greedy_decode(
+                &[0],
+                NativeDecoderRunOptions {
+                    max_new_tokens: 3,
+                    ..NativeDecoderRunOptions::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(output.backend, NativeDecoderBackend::CpuReference);
+        assert_eq!(output.generated_token_ids, vec![1, 2]);
+        assert_eq!(output.token_ids, vec![0, 1, 2]);
+        assert_eq!(output.logits.len(), 2);
+        assert!(output.logits[0][1] > output.logits[0][0]);
+        assert!(output.logits[1][2] > output.logits[1][1]);
+    }
+
+    #[test]
+    fn engine_native_decoder_sampling_top_k_one_matches_greedy() {
+        let dir = tempdir().unwrap();
+        let engine = tiny_native_decoder_generation_engine(dir.path().join("native-decode.rsmf"));
+
+        let output = engine
+            .native_decoder_greedy_decode(
+                &[0],
+                NativeDecoderRunOptions {
+                    max_new_tokens: 2,
+                    sampling: NativeDecoderSamplingOptions {
+                        temperature: Some(1.0),
+                        top_k: Some(1),
+                        top_p: Some(1.0),
+                        seed: Some(42),
+                    },
+                    ..NativeDecoderRunOptions::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(output.generated_token_ids, vec![1, 2]);
+    }
+
+    #[test]
+    fn engine_native_decoder_sampling_rejects_invalid_temperature() {
+        let dir = tempdir().unwrap();
+        let engine = tiny_native_decoder_generation_engine(dir.path().join("native-decode.rsmf"));
+
+        let err = engine
+            .native_decoder_greedy_decode(
+                &[0],
+                NativeDecoderRunOptions {
+                    sampling: NativeDecoderSamplingOptions {
+                        temperature: Some(0.0),
+                        ..NativeDecoderSamplingOptions::default()
+                    },
+                    ..NativeDecoderRunOptions::default()
+                },
+            )
+            .unwrap_err();
+
+        assert!(
+            matches!(err, RuntimeError::NativeDecoderSamplingInvalid { reason } if reason.contains("temperature"))
+        );
+    }
+
+    #[test]
+    fn engine_native_decoder_reference_logits_match_tiny_fixture() {
+        let dir = tempdir().unwrap();
+        let engine = tiny_native_decoder_generation_engine(dir.path().join("native-decode.rsmf"));
+        let norm = 1.4142121f32;
+
+        let report = engine
+            .native_decoder_check_reference_logits(NativeDecoderReferenceLogitCheck {
+                input_token_ids: vec![0, 1],
+                expected_logits: vec![vec![0.0, norm, 0.0, -norm], vec![0.0, 0.0, norm, -norm]],
+                tolerance_abs: 1e-5,
+                backend: NativeDecoderBackend::CpuReference,
+                weight_options: NativeDecoderWeightOptions::default(),
+                performance: NativeDecoderPerformanceOptions::default(),
+            })
+            .unwrap();
+
+        assert_eq!(report.compared_logits, 2);
+        assert_eq!(report.compared_values, 8);
+        assert!(report.max_abs_diff <= 1e-5);
+    }
+
+    #[test]
+    fn engine_native_decoder_reference_logits_reports_mismatch() {
+        let dir = tempdir().unwrap();
+        let engine = tiny_native_decoder_generation_engine(dir.path().join("native-decode.rsmf"));
+
+        let err = engine
+            .native_decoder_check_reference_logits(NativeDecoderReferenceLogitCheck {
+                input_token_ids: vec![0],
+                expected_logits: vec![vec![0.0, 0.0, 0.0, 0.0]],
+                tolerance_abs: 1e-6,
+                backend: NativeDecoderBackend::CpuReference,
+                weight_options: NativeDecoderWeightOptions::default(),
+                performance: NativeDecoderPerformanceOptions::default(),
+            })
+            .unwrap_err();
+
+        assert!(
+            matches!(err, RuntimeError::NativeDecoderReferenceLogitsMismatch { max_abs_diff, .. } if max_abs_diff > 1.0)
+        );
+    }
+
+    #[test]
+    fn engine_native_decoder_greedy_decode_rejects_empty_prompt() {
+        let dir = tempdir().unwrap();
+        let engine = tiny_native_decoder_generation_engine(dir.path().join("native-decode.rsmf"));
+
+        let err = engine
+            .native_decoder_greedy_decode(&[], NativeDecoderRunOptions::default())
+            .unwrap_err();
+
+        assert!(matches!(err, RuntimeError::NativeDecoderPromptEmpty));
+    }
+
+    #[test]
+    fn engine_native_decoder_accelerated_dispatch_uses_threaded_cpu_backend() {
+        let dir = tempdir().unwrap();
+        let engine = tiny_native_decoder_generation_engine(dir.path().join("native-decode.rsmf"));
+
+        let output = engine
+            .native_decoder_greedy_decode(
+                &[0],
+                NativeDecoderRunOptions {
+                    max_new_tokens: 2,
+                    backend: NativeDecoderBackend::Accelerated,
+                    performance: NativeDecoderPerformanceOptions {
+                        cpu_threads: Some(2),
+                        ..NativeDecoderPerformanceOptions::default()
+                    },
+                    ..NativeDecoderRunOptions::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(output.backend, NativeDecoderBackend::CpuThreaded);
+        assert_eq!(output.generated_token_ids, vec![1, 2]);
+    }
+
+    #[test]
     fn native_decoder_cpu_rms_norm_matches_reference() {
         let output = native_decoder_cpu_rms_norm(&[3.0, 4.0], 1, 2, &[1.0, 0.5], 1e-6).unwrap();
 
@@ -5122,6 +6608,68 @@ mod tests {
                 .unwrap();
 
         assert_close_slice(&output, &[2.0, 3.0], 1e-6);
+    }
+
+    #[test]
+    fn native_decoder_cpu_cached_attention_attends_over_cache() {
+        let output =
+            native_decoder_cpu_cached_attention(&[1.0], &[0.0, 0.0], &[2.0, 4.0], 2, 1, 1, 1)
+                .unwrap();
+
+        assert_close_slice(&output, &[3.0], 1e-6);
+    }
+
+    #[test]
+    fn native_decoder_paged_kv_cache_tracks_allocated_pages() {
+        let dir = tempdir().unwrap();
+        let engine = tiny_native_decoder_generation_engine(dir.path().join("native-decode.rsmf"));
+        let weights = engine.native_decoder_weights().unwrap();
+        let mut cache = NativeDecoderKvCache::new_paged(&weights.config, 2).unwrap();
+        let performance = NativeDecoderPerformanceOptions {
+            kv_cache_page_size_tokens: Some(2),
+            ..NativeDecoderPerformanceOptions::default()
+        };
+
+        native_decoder_cpu_step(
+            &weights,
+            &mut cache,
+            0,
+            NativeDecoderBackend::CpuReference,
+            &performance,
+        )
+        .unwrap();
+        assert_eq!(cache.position(), 1);
+        assert_eq!(cache.allocated_pages(), 1);
+        native_decoder_cpu_step(
+            &weights,
+            &mut cache,
+            1,
+            NativeDecoderBackend::CpuReference,
+            &performance,
+        )
+        .unwrap();
+        assert_eq!(cache.position(), 2);
+        assert_eq!(cache.allocated_pages(), 1);
+        native_decoder_cpu_step(
+            &weights,
+            &mut cache,
+            2,
+            NativeDecoderBackend::CpuReference,
+            &performance,
+        )
+        .unwrap();
+        assert_eq!(cache.position(), 3);
+        assert_eq!(cache.allocated_pages(), 2);
+    }
+
+    #[test]
+    fn native_decoder_threaded_linear_matches_reference() {
+        let input = vec![1.0, 2.0];
+        let weight = vec![3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        let reference = native_decoder_cpu_linear(&input, 1, 2, &weight, 3).unwrap();
+        let threaded = native_decoder_cpu_linear_threaded(&input, 1, 2, &weight, 3, 2).unwrap();
+
+        assert_close_slice(&threaded, &reference, 1e-6);
     }
 
     #[test]
@@ -7066,6 +8614,33 @@ mod tests {
         Engine::new(RsmfFile::open(path).unwrap()).unwrap()
     }
 
+    fn tiny_native_decoder_generation_engine(path: std::path::PathBuf) -> Engine {
+        let config = tiny_native_decoder_cpu_config();
+        let mut writer = RsmfWriter::new()
+            .with_metadata("model.arch", "llama")
+            .with_asset(AssetInput::new(
+                NATIVE_DECODER_CONFIG_ASSET,
+                tiny_native_decoder_generation_config_json().into_bytes(),
+            ))
+            .with_asset(AssetInput::new(
+                NATIVE_DECODER_TOKENIZER_ASSET,
+                br#"{"model": {"type": "BPE"}}"#.to_vec(),
+            ));
+        for expected in expected_native_decoder_tensors(&config).unwrap() {
+            let values = tiny_native_decoder_generation_tensor_values(
+                &expected.tensor_name,
+                &expected.shape,
+            );
+            writer = writer.with_tensor(native_decoder_tensor_with_values(
+                &expected.tensor_name,
+                expected.shape,
+                values,
+            ));
+        }
+        writer.write_to_path(&path).unwrap();
+        Engine::new(RsmfFile::open(path).unwrap()).unwrap()
+    }
+
     fn tiny_native_decoder_config_json() -> String {
         serde_json::json!({
             "model_type": "llama",
@@ -7076,6 +8651,25 @@ mod tests {
             "num_key_value_heads": 1,
             "vocab_size": 8,
             "max_position_embeddings": 16,
+            "rms_norm_eps": 0.000001,
+            "rope_theta": 10000.0,
+            "bos_token_id": 1,
+            "eos_token_id": 2,
+            "tie_word_embeddings": false
+        })
+        .to_string()
+    }
+
+    fn tiny_native_decoder_generation_config_json() -> String {
+        serde_json::json!({
+            "model_type": "llama",
+            "hidden_size": 2,
+            "intermediate_size": 2,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 1,
+            "num_key_value_heads": 1,
+            "vocab_size": 4,
+            "max_position_embeddings": 8,
             "rms_norm_eps": 0.000001,
             "rope_theta": 10000.0,
             "bos_token_id": 1,
@@ -7102,6 +8696,26 @@ mod tests {
             eos_token_ids: vec![2],
             pad_token_id: None,
         }
+    }
+
+    fn tiny_native_decoder_generation_tensor_values(name: &str, shape: &[u64]) -> Vec<f32> {
+        let elements = shape.iter().product::<u64>() as usize;
+        let mut values = vec![0.0; elements];
+        match name {
+            "model.embed_tokens.weight" => {
+                values.copy_from_slice(&[1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0]);
+            }
+            "model.norm.weight"
+            | "model.layers.0.input_layernorm.weight"
+            | "model.layers.0.post_attention_layernorm.weight" => {
+                values.fill(1.0);
+            }
+            "lm_head.weight" => {
+                values.copy_from_slice(&[0.0, 0.0, 1.0, 0.0, 0.0, 1.0, -1.0, -1.0]);
+            }
+            _ => {}
+        }
+        values
     }
 
     fn tiny_native_decoder_tensor_specs() -> Vec<(String, Vec<u64>)> {
@@ -7151,6 +8765,23 @@ mod tests {
             shard_id: 0,
             metadata: Vec::new(),
             canonical: VariantInput::canonical_raw(vec![0u8; elements * 4]),
+            packed: Vec::new(),
+        }
+    }
+
+    fn native_decoder_tensor_with_values(
+        name: &str,
+        shape: Vec<u64>,
+        values: Vec<f32>,
+    ) -> TensorInput {
+        assert_eq!(values.len(), shape.iter().product::<u64>() as usize);
+        TensorInput {
+            name: name.to_string(),
+            dtype: LogicalDtype::F32,
+            shape,
+            shard_id: 0,
+            metadata: Vec::new(),
+            canonical: VariantInput::canonical_raw(f32_bytes(&values)),
             packed: Vec::new(),
         }
     }
