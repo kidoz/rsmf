@@ -383,17 +383,16 @@ maturin develop -m crates/rsmf-python/Cargo.toml --release
 ```
 
 For local Python tests with `uv`, sync the Python package environment and
-install the optional conversion-test packages:
+include the optional conversion-test packages:
 
 ```sh
 cd crates/rsmf-python
-uv sync --extra dev
-uv pip install torch safetensors
-RSMF_BIN=../../target/debug/rsmf uv run --no-sync python -m pytest tests/test_from_torch.py -q
+uv sync --extra dev --extra torch-test
+uv run --no-sync python -m pytest tests/test_from_torch.py -q
 ```
 
-`RSMF_BIN` pins pytest to the freshly built CLI. Without it, the fixture uses
-`target/release/rsmf` before `target/debug/rsmf` when both binaries exist.
+Set `RSMF_BIN=/path/to/rsmf` only when you need to force a specific CLI binary;
+otherwise the fixture prefers `target/debug/rsmf` for local development.
 
 ### Usage
 

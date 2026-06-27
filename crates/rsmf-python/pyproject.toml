@@ -51,6 +51,10 @@ dev = [
     "pytest>=7",
     "maturin>=1.5,<2.0",
 ]
+torch-test = [
+    "safetensors>=0.8",
+    "torch>=2.12",
+]
 
 [project.urls]
 Homepage = "https://github.com/kidoz/rsmf"

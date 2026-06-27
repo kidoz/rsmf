@@ -11,9 +11,10 @@ format's sections in play:
 The CLI binary is resolved in this order:
 
     1. ``RSMF_BIN`` env var if set,
-    2. the installed binary on ``PATH``,
-    3. the debug build at ``<workspace>/target/debug/rsmf``,
-    4. building via ``cargo build -p rsmf-cli`` as a fallback.
+    2. the debug build at ``<workspace>/target/debug/rsmf``,
+    3. the release build at ``<workspace>/target/release/rsmf``,
+    4. the installed binary on ``PATH``,
+    5. building via ``cargo build -p rsmf-cli`` as a fallback.
 
 If none of those produce a working CLI the fixture emits a loud failure
 rather than skipping, so CI catches regressions in the binding layer.
@@ -39,13 +40,13 @@ def _resolve_rsmf_binary() -> str:
     explicit = os.getenv("RSMF_BIN")
     if explicit and Path(explicit).exists():
         return explicit
+    ws = _workspace_root()
+    for candidate in (ws / "target" / "debug" / "rsmf", ws / "target" / "release" / "rsmf"):
+        if candidate.exists():
+            return str(candidate)
     on_path = shutil.which("rsmf")
     if on_path:
         return on_path
-    ws = _workspace_root()
-    for candidate in (ws / "target" / "release" / "rsmf", ws / "target" / "debug" / "rsmf"):
-        if candidate.exists():
-            return str(candidate)
     # Last resort: build it. Slow on first run, cached afterwards.
     subprocess.run(
         ["cargo", "build", "-p", "rsmf-cli"],
