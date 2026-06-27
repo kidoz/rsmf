@@ -495,7 +495,10 @@ impl RuntimeRequest {
     }
 
     fn effective_tenant_id(&self) -> &str {
-        self.tenant_id.as_deref().unwrap_or(DEFAULT_TENANT_ID)
+        self.tenant_id
+            .as_deref()
+            .filter(|tenant_id| !tenant_id.is_empty())
+            .unwrap_or(DEFAULT_TENANT_ID)
     }
 }
 
@@ -600,7 +603,7 @@ pub struct RuntimeExecutorMetrics {
 }
 
 /// Per-tenant in-process executor admission metrics.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeTenantMetrics {
     /// Tenant identifier.
     pub tenant_id: String,
@@ -1314,6 +1317,7 @@ impl RuntimeExecutor {
         let (sender, receiver) = mpsc::channel();
         let request_id = request.request_id.clone();
         let input_bytes = runtime_inputs_data_bytes(&request.inputs)?;
+        let tenant_id = request.effective_tenant_id().to_string();
         let cancellation = RuntimeCancellationToken::new();
         let mut state = self.inner.lock_state()?;
         if state.closed {
@@ -1335,6 +1339,31 @@ impl RuntimeExecutor {
                 state.metrics.rejected_by_memory =
                     state.metrics.rejected_by_memory.saturating_add(1);
                 return Err(RuntimeError::ExecutorQueueBytesExceeded {
+                    requested_bytes: input_bytes,
+                    queued_bytes,
+                    capacity_bytes,
+                });
+            }
+        }
+        if let Some(capacity) = self.inner.admission.max_queued_requests_per_tenant {
+            let queued_requests = state.tenant_queued_requests(&tenant_id);
+            if queued_requests >= capacity {
+                state.record_tenant_capacity_rejection(&tenant_id);
+                return Err(RuntimeError::ExecutorTenantQueueFull {
+                    tenant_id,
+                    capacity,
+                });
+            }
+        }
+        if let Some(capacity_bytes) = self.inner.admission.max_queued_tensor_bytes_per_tenant {
+            let queued_bytes = state.tenant_queued_tensor_bytes(&tenant_id);
+            let would_queue = queued_bytes.checked_add(input_bytes).ok_or_else(|| {
+                RuntimeError::Shape("tenant queued tensor byte count overflow".to_string())
+            })?;
+            if would_queue > capacity_bytes {
+                state.record_tenant_memory_rejection(&tenant_id);
+                return Err(RuntimeError::ExecutorTenantQueueBytesExceeded {
+                    tenant_id,
                     requested_bytes: input_bytes,
                     queued_bytes,
                     capacity_bytes,
@@ -1394,7 +1423,9 @@ impl RuntimeExecutor {
 
     /// Snapshot cumulative executor metrics.
     pub fn metrics(&self) -> Result<RuntimeExecutorMetrics> {
-        self.inner.lock_state().map(|state| state.metrics.clone())
+        self.inner
+            .lock_state()
+            .map(|state| state.metrics_snapshot())
     }
 
     /// Current number of queued requests.
@@ -1442,6 +1473,8 @@ pub struct RuntimeNetworkRunRequest {
     pub options: Option<SessionOptions>,
     /// Owned runtime inputs.
     pub inputs: RuntimeInputs,
+    /// Optional tenant identifier used for per-tenant admission quotas.
+    pub tenant_id: Option<String>,
     /// Optional request priority. Higher values run first.
     pub priority: Option<i32>,
     /// Optional timeout in milliseconds.
@@ -1452,6 +1485,9 @@ impl RuntimeNetworkRunRequest {
     fn into_runtime_request(self) -> RuntimeRequest {
         let mut request = RuntimeRequest::new(self.request_id, self.graph_idx, self.inputs)
             .with_options(self.options.unwrap_or_default());
+        if let Some(tenant_id) = self.tenant_id {
+            request = request.with_tenant_id(tenant_id);
+        }
         if let Some(priority) = self.priority {
             request = request.with_priority(priority);
         }
@@ -1519,6 +1555,12 @@ pub struct RuntimeNetworkMetrics {
     /// Requests rejected because queued tensor bytes would exceed the configured
     /// budget.
     pub rejected_by_memory: u64,
+    /// Requests rejected because a tenant queue reached its configured
+    /// capacity.
+    pub rejected_by_tenant_capacity: u64,
+    /// Requests rejected because a tenant queued tensor byte budget would be
+    /// exceeded.
+    pub rejected_by_tenant_memory: u64,
     /// Requests currently waiting in the queue.
     pub current_queue_depth: usize,
     /// Maximum queue depth observed by this executor.
@@ -1563,6 +1605,8 @@ pub struct RuntimeNetworkMetrics {
     pub total_queue_time_ms: u128,
     /// Cumulative run time, in milliseconds.
     pub total_run_time_ms: u128,
+    /// Per-tenant queued request and byte accounting.
+    pub tenant_metrics: Vec<RuntimeTenantMetrics>,
 }
 
 impl From<RuntimeExecutorMetrics> for RuntimeNetworkMetrics {
@@ -1575,6 +1619,8 @@ impl From<RuntimeExecutorMetrics> for RuntimeNetworkMetrics {
             cancelled: metrics.cancelled,
             rejected_by_capacity: metrics.rejected_by_capacity,
             rejected_by_memory: metrics.rejected_by_memory,
+            rejected_by_tenant_capacity: metrics.rejected_by_tenant_capacity,
+            rejected_by_tenant_memory: metrics.rejected_by_tenant_memory,
             current_queue_depth: metrics.current_queue_depth,
             max_observed_queue_depth: metrics.max_observed_queue_depth,
             current_queued_tensor_bytes: metrics.current_queued_tensor_bytes,
@@ -1596,6 +1642,7 @@ impl From<RuntimeExecutorMetrics> for RuntimeNetworkMetrics {
             batch_flushes_shutdown: metrics.batch_flushes_shutdown,
             total_queue_time_ms: metrics.total_queue_time.as_millis(),
             total_run_time_ms: metrics.total_run_time.as_millis(),
+            tenant_metrics: metrics.tenant_metrics,
         }
     }
 }
@@ -1995,7 +2042,9 @@ fn network_error_status(error: &RuntimeError) -> (u16, &'static str, &'static st
         RuntimeError::NetworkRequestNotFound { .. } => (404, "Not Found", "not_found"),
         RuntimeError::NetworkRequestAlreadyActive { .. } => (409, "Conflict", "conflict"),
         RuntimeError::ExecutorQueueFull { .. }
-        | RuntimeError::ExecutorQueueBytesExceeded { .. } => {
+        | RuntimeError::ExecutorQueueBytesExceeded { .. }
+        | RuntimeError::ExecutorTenantQueueFull { .. }
+        | RuntimeError::ExecutorTenantQueueBytesExceeded { .. } => {
             (429, "Too Many Requests", "admission_rejected")
         }
         RuntimeError::NetworkProtocol { .. } => (400, "Bad Request", "bad_request"),
@@ -2179,6 +2228,7 @@ impl RuntimeExecutorState {
             .metrics
             .max_observed_queued_tensor_bytes
             .max(self.metrics.current_queued_tensor_bytes);
+        self.record_tenant_queued(queued.tenant_id(), queued.input_bytes);
         self.queue.push(queued);
     }
 
@@ -2189,7 +2239,93 @@ impl RuntimeExecutorState {
             .metrics
             .current_queued_tensor_bytes
             .saturating_sub(queued.input_bytes);
+        self.record_tenant_dequeued(queued.tenant_id(), queued.input_bytes);
         Some(queued)
+    }
+
+    fn metrics_snapshot(&self) -> RuntimeExecutorMetrics {
+        let mut metrics = self.metrics.clone();
+        metrics
+            .tenant_metrics
+            .sort_by(|left, right| left.tenant_id.cmp(&right.tenant_id));
+        metrics
+    }
+
+    fn tenant_queued_requests(&self, tenant_id: &str) -> usize {
+        self.tenant_metrics(tenant_id)
+            .map_or(0, |metrics| metrics.current_queued_requests)
+    }
+
+    fn tenant_queued_tensor_bytes(&self, tenant_id: &str) -> usize {
+        self.tenant_metrics(tenant_id)
+            .map_or(0, |metrics| metrics.current_queued_tensor_bytes)
+    }
+
+    fn tenant_metrics(&self, tenant_id: &str) -> Option<&RuntimeTenantMetrics> {
+        self.metrics
+            .tenant_metrics
+            .iter()
+            .find(|metrics| metrics.tenant_id == tenant_id)
+    }
+
+    fn tenant_metrics_mut(&mut self, tenant_id: &str) -> &mut RuntimeTenantMetrics {
+        if let Some(index) = self
+            .metrics
+            .tenant_metrics
+            .iter()
+            .position(|metrics| metrics.tenant_id == tenant_id)
+        {
+            &mut self.metrics.tenant_metrics[index]
+        } else {
+            self.metrics.tenant_metrics.push(RuntimeTenantMetrics {
+                tenant_id: tenant_id.to_string(),
+                ..RuntimeTenantMetrics::default()
+            });
+            let index = self.metrics.tenant_metrics.len().saturating_sub(1);
+            &mut self.metrics.tenant_metrics[index]
+        }
+    }
+
+    fn record_tenant_queued(&mut self, tenant_id: &str, input_bytes: usize) {
+        let metrics = self.tenant_metrics_mut(tenant_id);
+        metrics.current_queued_requests = metrics.current_queued_requests.saturating_add(1);
+        metrics.max_observed_queued_requests = metrics
+            .max_observed_queued_requests
+            .max(metrics.current_queued_requests);
+        metrics.current_queued_tensor_bytes = metrics
+            .current_queued_tensor_bytes
+            .saturating_add(input_bytes);
+        metrics.max_observed_queued_tensor_bytes = metrics
+            .max_observed_queued_tensor_bytes
+            .max(metrics.current_queued_tensor_bytes);
+    }
+
+    fn record_tenant_dequeued(&mut self, tenant_id: &str, input_bytes: usize) {
+        if let Some(metrics) = self
+            .metrics
+            .tenant_metrics
+            .iter_mut()
+            .find(|metrics| metrics.tenant_id == tenant_id)
+        {
+            metrics.current_queued_requests = metrics.current_queued_requests.saturating_sub(1);
+            metrics.current_queued_tensor_bytes = metrics
+                .current_queued_tensor_bytes
+                .saturating_sub(input_bytes);
+        }
+    }
+
+    fn record_tenant_capacity_rejection(&mut self, tenant_id: &str) {
+        self.metrics.rejected_by_tenant_capacity =
+            self.metrics.rejected_by_tenant_capacity.saturating_add(1);
+        let metrics = self.tenant_metrics_mut(tenant_id);
+        metrics.rejected_by_capacity = metrics.rejected_by_capacity.saturating_add(1);
+    }
+
+    fn record_tenant_memory_rejection(&mut self, tenant_id: &str) {
+        self.metrics.rejected_by_tenant_memory =
+            self.metrics.rejected_by_tenant_memory.saturating_add(1);
+        let metrics = self.tenant_metrics_mut(tenant_id);
+        metrics.rejected_by_memory = metrics.rejected_by_memory.saturating_add(1);
     }
 
     fn record_batch_flush(&mut self, reason: BatchFlushReason) {
@@ -2234,6 +2370,12 @@ struct QueuedRuntimeRequest {
     cancellation: RuntimeCancellationToken,
     input_bytes: usize,
     sender: Sender<Result<RuntimeResponse>>,
+}
+
+impl QueuedRuntimeRequest {
+    fn tenant_id(&self) -> &str {
+        self.request.effective_tenant_id()
+    }
 }
 
 impl PartialEq for QueuedRuntimeRequest {
@@ -4242,6 +4384,7 @@ mod tests {
                 dynamic_batching: None,
                 admission: RuntimeAdmissionConfig {
                     max_queued_tensor_bytes: Some(16),
+                    ..RuntimeAdmissionConfig::default()
                 },
             },
         );
@@ -4281,6 +4424,118 @@ mod tests {
         assert_eq!(metrics.max_active_requests, 1);
         assert_eq!(metrics.max_active_runtime_invocations, 1);
         assert_eq!(metrics.max_active_batch_size, 1);
+    }
+
+    #[test]
+    fn executor_enforces_tenant_queue_capacity_and_releases_on_dispatch() {
+        let dir = tempdir().unwrap();
+        let engine = add_graph_engine(dir.path().join("executor-tenant-capacity.rsmf"));
+        let executor = RuntimeExecutor::new(
+            engine,
+            RuntimeExecutorConfig {
+                worker_threads: 0,
+                queue_capacity: 8,
+                dynamic_batching: None,
+                admission: RuntimeAdmissionConfig {
+                    max_queued_requests_per_tenant: Some(1),
+                    ..RuntimeAdmissionConfig::default()
+                },
+            },
+        );
+
+        let first = executor
+            .submit(add_request("alpha-1", 1.0, 10.0).with_tenant_id("alpha"))
+            .unwrap();
+        let err = executor
+            .submit(add_request("alpha-2", 2.0, 20.0).with_tenant_id("alpha"))
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            RuntimeError::ExecutorTenantQueueFull {
+                tenant_id,
+                capacity: 1,
+            } if tenant_id == "alpha"
+        ));
+
+        let beta = executor
+            .submit(add_request("beta-1", 3.0, 30.0).with_tenant_id("beta"))
+            .unwrap();
+        let metrics = executor.metrics().unwrap();
+        assert_eq!(metrics.submitted, 2);
+        assert_eq!(metrics.rejected_by_tenant_capacity, 1);
+        assert_eq!(tenant_metric(&metrics, "alpha").current_queued_requests, 1);
+        assert_eq!(tenant_metric(&metrics, "alpha").rejected_by_capacity, 1);
+        assert_eq!(tenant_metric(&metrics, "beta").current_queued_requests, 1);
+
+        assert!(executor.execute_next().unwrap());
+        assert_eq!(f32_output(&first.wait().unwrap(), "z"), vec![11.0, 11.0]);
+        let second_alpha = executor
+            .submit(add_request("alpha-3", 4.0, 40.0).with_tenant_id("alpha"))
+            .unwrap();
+        let metrics = executor.metrics().unwrap();
+        assert_eq!(tenant_metric(&metrics, "alpha").current_queued_requests, 1);
+        assert_eq!(
+            tenant_metric(&metrics, "alpha").max_observed_queued_requests,
+            1
+        );
+
+        assert!(executor.execute_next().unwrap());
+        assert_eq!(f32_output(&beta.wait().unwrap(), "z"), vec![33.0, 33.0]);
+        assert!(executor.execute_next().unwrap());
+        assert_eq!(
+            f32_output(&second_alpha.wait().unwrap(), "z"),
+            vec![44.0, 44.0]
+        );
+    }
+
+    #[test]
+    fn executor_enforces_tenant_queued_tensor_byte_budget() {
+        let dir = tempdir().unwrap();
+        let engine = add_graph_engine(dir.path().join("executor-tenant-memory.rsmf"));
+        let executor = RuntimeExecutor::new(
+            engine,
+            RuntimeExecutorConfig {
+                worker_threads: 0,
+                queue_capacity: 8,
+                dynamic_batching: None,
+                admission: RuntimeAdmissionConfig {
+                    max_queued_tensor_bytes_per_tenant: Some(16),
+                    ..RuntimeAdmissionConfig::default()
+                },
+            },
+        );
+
+        let _alpha = executor
+            .submit(add_request("alpha-1", 1.0, 10.0).with_tenant_id("alpha"))
+            .unwrap();
+        let err = executor
+            .submit(add_request("alpha-2", 2.0, 20.0).with_tenant_id("alpha"))
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            RuntimeError::ExecutorTenantQueueBytesExceeded {
+                tenant_id,
+                requested_bytes: 16,
+                queued_bytes: 16,
+                capacity_bytes: 16,
+            } if tenant_id == "alpha"
+        ));
+        let _beta = executor
+            .submit(add_request("beta-1", 3.0, 30.0).with_tenant_id("beta"))
+            .unwrap();
+
+        let metrics = executor.metrics().unwrap();
+        assert_eq!(metrics.submitted, 2);
+        assert_eq!(metrics.rejected_by_tenant_memory, 1);
+        assert_eq!(
+            tenant_metric(&metrics, "alpha").current_queued_tensor_bytes,
+            16
+        );
+        assert_eq!(tenant_metric(&metrics, "alpha").rejected_by_memory, 1);
+        assert_eq!(
+            tenant_metric(&metrics, "beta").current_queued_tensor_bytes,
+            16
+        );
     }
 
     #[test]
@@ -4522,6 +4777,7 @@ mod tests {
                 }),
                 admission: RuntimeAdmissionConfig {
                     max_queued_tensor_bytes: Some(32),
+                    ..RuntimeAdmissionConfig::default()
                 },
             },
         );
@@ -4594,6 +4850,37 @@ mod tests {
         assert_eq!(metrics["submitted"], 1);
         assert_eq!(metrics["completed"], 1);
         assert_eq!(metrics["runtime_invocations"], 1);
+
+        server.shutdown().unwrap();
+    }
+
+    #[test]
+    fn network_server_propagates_tenant_id_to_metrics() {
+        let dir = tempdir().unwrap();
+        let engine = add_graph_engine(dir.path().join("network-tenant.rsmf"));
+        let server = start_test_network_server(engine, RuntimeExecutorConfig::default());
+        let request = serde_json::json!({
+            "request_id": "net-tenant",
+            "tenant_id": "tenant-a",
+            "graph_idx": 0,
+            "inputs": {
+                "x": { "dtype": "f32", "shape": [2], "data": [1.0, 2.0] },
+                "y": { "dtype": "f32", "shape": [2], "data": [10.0, 20.0] }
+            }
+        });
+
+        let (status, body) = http_json(server.local_addr(), "POST", "/v1/run", Some(&request));
+        assert_eq!(status, 200);
+        assert_eq!(body["request_id"], "net-tenant");
+
+        let (status, metrics) = http_json(server.local_addr(), "GET", "/metrics", None);
+        assert_eq!(status, 200);
+        assert_eq!(metrics["tenant_metrics"][0]["tenant_id"], "tenant-a");
+        assert_eq!(
+            metrics["tenant_metrics"][0]["max_observed_queued_requests"],
+            1
+        );
+        assert_eq!(metrics["tenant_metrics"][0]["current_queued_requests"], 0);
 
         server.shutdown().unwrap();
     }
@@ -4693,6 +4980,17 @@ mod tests {
             .parse::<u16>()
             .unwrap();
         (status, serde_json::from_str(body).unwrap())
+    }
+
+    fn tenant_metric<'a>(
+        metrics: &'a RuntimeExecutorMetrics,
+        tenant_id: &str,
+    ) -> &'a RuntimeTenantMetrics {
+        metrics
+            .tenant_metrics
+            .iter()
+            .find(|metrics| metrics.tenant_id == tenant_id)
+            .unwrap()
     }
 
     fn tiny_add_onnx_model() -> Vec<u8> {
