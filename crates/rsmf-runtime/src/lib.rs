@@ -101,6 +101,18 @@ pub enum RuntimeError {
         /// Maximum configured queued input bytes.
         capacity_bytes: usize,
     },
+    /// The runtime executor hard memory-pressure threshold would be exceeded.
+    #[error(
+        "runtime executor hard memory-pressure threshold exceeded; requested {requested_bytes} bytes with {queued_bytes}/{hard_limit_bytes} bytes queued"
+    )]
+    ExecutorMemoryPressureExceeded {
+        /// Bytes in the rejected request's owned inputs.
+        requested_bytes: usize,
+        /// Bytes already queued before the rejected request.
+        queued_bytes: usize,
+        /// Maximum configured hard queued-memory pressure threshold.
+        hard_limit_bytes: usize,
+    },
     /// The runtime executor tenant queue has reached its configured capacity.
     #[error("runtime executor tenant {tenant_id} queue is full; capacity is {capacity}")]
     ExecutorTenantQueueFull {
@@ -197,12 +209,41 @@ pub struct RuntimeAdmissionConfig {
     /// Maximum bytes of owned input tensor data allowed to wait in the queue.
     /// `None` disables queued tensor byte admission.
     pub max_queued_tensor_bytes: Option<usize>,
+    /// Soft and hard queued-memory pressure policy.
+    pub memory_pressure: RuntimeMemoryPressureConfig,
     /// Maximum number of queued requests per tenant. `None` disables this
     /// tenant quota.
     pub max_queued_requests_per_tenant: Option<usize>,
     /// Maximum bytes of owned input tensor data allowed to wait per tenant.
     /// `None` disables this tenant quota.
     pub max_queued_tensor_bytes_per_tenant: Option<usize>,
+}
+
+/// Queued-memory pressure policy for [`RuntimeExecutor`].
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct RuntimeMemoryPressureConfig {
+    /// Queued input bytes at or above this threshold are reported as soft
+    /// pressure. `None` disables soft-pressure reporting.
+    pub soft_queued_tensor_bytes: Option<usize>,
+    /// Queued input bytes above this threshold are rejected with a typed
+    /// hard-pressure error. `None` disables hard-pressure rejection.
+    pub hard_queued_tensor_bytes: Option<usize>,
+    /// Flush dynamic batches early when queued bytes plus the in-flight batch
+    /// reach the soft-pressure threshold.
+    pub flush_dynamic_batches_on_soft_pressure: bool,
+}
+
+/// Current queued-memory pressure level.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeMemoryPressureLevel {
+    /// No configured pressure threshold is active for current queued bytes.
+    #[default]
+    Normal,
+    /// Current queued bytes meet or exceed the configured soft threshold.
+    Soft,
+    /// Current queued bytes meet or exceed the configured hard threshold.
+    Hard,
 }
 
 /// ONNX Runtime graph optimization level.
@@ -548,6 +589,9 @@ pub struct RuntimeExecutorMetrics {
     /// Requests rejected because queued tensor bytes would exceed the configured
     /// budget.
     pub rejected_by_memory: u64,
+    /// Requests rejected because the hard memory-pressure threshold would be
+    /// exceeded.
+    pub rejected_by_memory_pressure: u64,
     /// Requests rejected because a tenant queue reached its configured
     /// capacity.
     pub rejected_by_tenant_capacity: u64,
@@ -562,6 +606,15 @@ pub struct RuntimeExecutorMetrics {
     pub current_queued_tensor_bytes: usize,
     /// Maximum queued owned input tensor bytes observed by this executor.
     pub max_observed_queued_tensor_bytes: usize,
+    /// Current queued-memory pressure level.
+    pub memory_pressure_level: RuntimeMemoryPressureLevel,
+    /// Accepted requests that left queued bytes at or above the configured soft
+    /// pressure threshold.
+    pub memory_pressure_soft_events: u64,
+    /// Requests rejected by the configured hard memory-pressure threshold.
+    pub memory_pressure_hard_rejections: u64,
+    /// Dynamic scheduler flushes caused by queued-memory pressure policy.
+    pub memory_pressure_flushes: u64,
     /// Requests currently executing inside graph runtime calls.
     pub active_requests: usize,
     /// Maximum concurrently active runtime requests observed by this executor.
@@ -1330,11 +1383,11 @@ impl RuntimeExecutor {
                 capacity: self.inner.queue_capacity,
             });
         }
+        let queued_bytes = state.metrics.current_queued_tensor_bytes;
+        let would_queue = queued_bytes
+            .checked_add(input_bytes)
+            .ok_or_else(|| RuntimeError::Shape("queued tensor byte count overflow".to_string()))?;
         if let Some(capacity_bytes) = self.inner.admission.max_queued_tensor_bytes {
-            let queued_bytes = state.metrics.current_queued_tensor_bytes;
-            let would_queue = queued_bytes.checked_add(input_bytes).ok_or_else(|| {
-                RuntimeError::Shape("queued tensor byte count overflow".to_string())
-            })?;
             if would_queue > capacity_bytes {
                 state.metrics.rejected_by_memory =
                     state.metrics.rejected_by_memory.saturating_add(1);
@@ -1342,6 +1395,21 @@ impl RuntimeExecutor {
                     requested_bytes: input_bytes,
                     queued_bytes,
                     capacity_bytes,
+                });
+            }
+        }
+        if let Some(hard_limit_bytes) = self
+            .inner
+            .admission
+            .memory_pressure
+            .hard_queued_tensor_bytes
+        {
+            if would_queue > hard_limit_bytes {
+                state.record_memory_pressure_rejection();
+                return Err(RuntimeError::ExecutorMemoryPressureExceeded {
+                    requested_bytes: input_bytes,
+                    queued_bytes,
+                    hard_limit_bytes,
                 });
             }
         }
@@ -1386,6 +1454,9 @@ impl RuntimeExecutor {
             input_bytes,
             sender,
         });
+        if queued_soft_memory_pressure_active(would_queue, &self.inner.admission) {
+            state.record_soft_memory_pressure_event();
+        }
         state.metrics.submitted = state.metrics.submitted.saturating_add(1);
         drop(state);
         self.inner.available.notify_one();
@@ -1425,7 +1496,7 @@ impl RuntimeExecutor {
     pub fn metrics(&self) -> Result<RuntimeExecutorMetrics> {
         self.inner
             .lock_state()
-            .map(|state| state.metrics_snapshot())
+            .map(|state| state.metrics_snapshot(&self.inner.admission))
     }
 
     /// Current number of queued requests.
@@ -1555,6 +1626,9 @@ pub struct RuntimeNetworkMetrics {
     /// Requests rejected because queued tensor bytes would exceed the configured
     /// budget.
     pub rejected_by_memory: u64,
+    /// Requests rejected because the hard memory-pressure threshold would be
+    /// exceeded.
+    pub rejected_by_memory_pressure: u64,
     /// Requests rejected because a tenant queue reached its configured
     /// capacity.
     pub rejected_by_tenant_capacity: u64,
@@ -1569,6 +1643,15 @@ pub struct RuntimeNetworkMetrics {
     pub current_queued_tensor_bytes: usize,
     /// Maximum queued owned input tensor bytes observed by this executor.
     pub max_observed_queued_tensor_bytes: usize,
+    /// Current queued-memory pressure level.
+    pub memory_pressure_level: RuntimeMemoryPressureLevel,
+    /// Accepted requests that left queued bytes at or above the configured soft
+    /// pressure threshold.
+    pub memory_pressure_soft_events: u64,
+    /// Requests rejected by the configured hard memory-pressure threshold.
+    pub memory_pressure_hard_rejections: u64,
+    /// Dynamic scheduler flushes caused by queued-memory pressure policy.
+    pub memory_pressure_flushes: u64,
     /// Requests currently executing inside graph runtime calls.
     pub active_requests: usize,
     /// Maximum concurrently active runtime requests observed by this executor.
@@ -1619,12 +1702,17 @@ impl From<RuntimeExecutorMetrics> for RuntimeNetworkMetrics {
             cancelled: metrics.cancelled,
             rejected_by_capacity: metrics.rejected_by_capacity,
             rejected_by_memory: metrics.rejected_by_memory,
+            rejected_by_memory_pressure: metrics.rejected_by_memory_pressure,
             rejected_by_tenant_capacity: metrics.rejected_by_tenant_capacity,
             rejected_by_tenant_memory: metrics.rejected_by_tenant_memory,
             current_queue_depth: metrics.current_queue_depth,
             max_observed_queue_depth: metrics.max_observed_queue_depth,
             current_queued_tensor_bytes: metrics.current_queued_tensor_bytes,
             max_observed_queued_tensor_bytes: metrics.max_observed_queued_tensor_bytes,
+            memory_pressure_level: metrics.memory_pressure_level,
+            memory_pressure_soft_events: metrics.memory_pressure_soft_events,
+            memory_pressure_hard_rejections: metrics.memory_pressure_hard_rejections,
+            memory_pressure_flushes: metrics.memory_pressure_flushes,
             active_requests: metrics.active_requests,
             max_active_requests: metrics.max_active_requests,
             active_runtime_invocations: metrics.active_runtime_invocations,
@@ -2043,6 +2131,7 @@ fn network_error_status(error: &RuntimeError) -> (u16, &'static str, &'static st
         RuntimeError::NetworkRequestAlreadyActive { .. } => (409, "Conflict", "conflict"),
         RuntimeError::ExecutorQueueFull { .. }
         | RuntimeError::ExecutorQueueBytesExceeded { .. }
+        | RuntimeError::ExecutorMemoryPressureExceeded { .. }
         | RuntimeError::ExecutorTenantQueueFull { .. }
         | RuntimeError::ExecutorTenantQueueBytesExceeded { .. } => {
             (429, "Too Many Requests", "admission_rejected")
@@ -2243,8 +2332,10 @@ impl RuntimeExecutorState {
         Some(queued)
     }
 
-    fn metrics_snapshot(&self) -> RuntimeExecutorMetrics {
+    fn metrics_snapshot(&self, admission: &RuntimeAdmissionConfig) -> RuntimeExecutorMetrics {
         let mut metrics = self.metrics.clone();
+        metrics.memory_pressure_level =
+            queued_memory_pressure_level(metrics.current_queued_tensor_bytes, admission);
         metrics
             .tenant_metrics
             .sort_by(|left, right| left.tenant_id.cmp(&right.tenant_id));
@@ -2328,6 +2419,20 @@ impl RuntimeExecutorState {
         metrics.rejected_by_memory = metrics.rejected_by_memory.saturating_add(1);
     }
 
+    fn record_memory_pressure_rejection(&mut self) {
+        self.metrics.rejected_by_memory_pressure =
+            self.metrics.rejected_by_memory_pressure.saturating_add(1);
+        self.metrics.memory_pressure_hard_rejections = self
+            .metrics
+            .memory_pressure_hard_rejections
+            .saturating_add(1);
+    }
+
+    fn record_soft_memory_pressure_event(&mut self) {
+        self.metrics.memory_pressure_soft_events =
+            self.metrics.memory_pressure_soft_events.saturating_add(1);
+    }
+
     fn record_batch_flush(&mut self, reason: BatchFlushReason) {
         match reason {
             BatchFlushReason::Full => {
@@ -2340,6 +2445,8 @@ impl RuntimeExecutorState {
             BatchFlushReason::MemoryPressure => {
                 self.metrics.batch_flushes_memory_pressure =
                     self.metrics.batch_flushes_memory_pressure.saturating_add(1);
+                self.metrics.memory_pressure_flushes =
+                    self.metrics.memory_pressure_flushes.saturating_add(1);
             }
             BatchFlushReason::Manual => {
                 self.metrics.batch_flushes_manual =
@@ -2497,17 +2604,50 @@ fn dynamic_batch_memory_pressure(
     batch: &[QueuedRuntimeRequest],
     admission: &RuntimeAdmissionConfig,
 ) -> bool {
-    let Some(capacity_bytes) = admission.max_queued_tensor_bytes else {
-        return false;
-    };
     let batch_bytes = batch.iter().fold(0usize, |total, queued| {
         total.saturating_add(queued.input_bytes)
     });
-    state
+    let queued_with_batch = state
         .metrics
         .current_queued_tensor_bytes
-        .saturating_add(batch_bytes)
-        >= capacity_bytes
+        .saturating_add(batch_bytes);
+    if admission
+        .max_queued_tensor_bytes
+        .is_some_and(|capacity_bytes| queued_with_batch >= capacity_bytes)
+    {
+        return true;
+    }
+    admission
+        .memory_pressure
+        .flush_dynamic_batches_on_soft_pressure
+        && queued_soft_memory_pressure_active(queued_with_batch, admission)
+}
+
+fn queued_soft_memory_pressure_active(
+    queued_bytes: usize,
+    admission: &RuntimeAdmissionConfig,
+) -> bool {
+    admission
+        .memory_pressure
+        .soft_queued_tensor_bytes
+        .is_some_and(|soft_limit_bytes| queued_bytes >= soft_limit_bytes)
+}
+
+fn queued_memory_pressure_level(
+    queued_bytes: usize,
+    admission: &RuntimeAdmissionConfig,
+) -> RuntimeMemoryPressureLevel {
+    if admission
+        .memory_pressure
+        .hard_queued_tensor_bytes
+        .is_some_and(|hard_limit_bytes| queued_bytes >= hard_limit_bytes)
+    {
+        RuntimeMemoryPressureLevel::Hard
+    } else if queued_soft_memory_pressure_active(queued_bytes, admission) {
+        RuntimeMemoryPressureLevel::Soft
+    } else {
+        RuntimeMemoryPressureLevel::Normal
+    }
 }
 
 fn extend_batch_from_state(
@@ -4427,6 +4567,96 @@ mod tests {
     }
 
     #[test]
+    fn executor_hard_memory_pressure_is_enforced_and_reported() {
+        let dir = tempdir().unwrap();
+        let engine = add_graph_engine(dir.path().join("executor-hard-pressure.rsmf"));
+        let executor = RuntimeExecutor::new(
+            engine,
+            RuntimeExecutorConfig {
+                worker_threads: 0,
+                queue_capacity: 4,
+                dynamic_batching: None,
+                admission: RuntimeAdmissionConfig {
+                    memory_pressure: RuntimeMemoryPressureConfig {
+                        hard_queued_tensor_bytes: Some(16),
+                        ..RuntimeMemoryPressureConfig::default()
+                    },
+                    ..RuntimeAdmissionConfig::default()
+                },
+            },
+        );
+
+        let first = executor.submit(add_request("first", 1.0, 10.0)).unwrap();
+        let err = executor
+            .submit(add_request("second", 2.0, 20.0))
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            RuntimeError::ExecutorMemoryPressureExceeded {
+                requested_bytes: 16,
+                queued_bytes: 16,
+                hard_limit_bytes: 16,
+            }
+        ));
+        let metrics = executor.metrics().unwrap();
+        assert_eq!(metrics.submitted, 1);
+        assert_eq!(metrics.rejected_by_memory, 0);
+        assert_eq!(metrics.rejected_by_memory_pressure, 1);
+        assert_eq!(metrics.memory_pressure_hard_rejections, 1);
+        assert_eq!(
+            metrics.memory_pressure_level,
+            RuntimeMemoryPressureLevel::Hard
+        );
+
+        assert!(executor.execute_next().unwrap());
+        assert_eq!(f32_output(&first.wait().unwrap(), "z"), vec![11.0, 11.0]);
+        let metrics = executor.metrics().unwrap();
+        assert_eq!(
+            metrics.memory_pressure_level,
+            RuntimeMemoryPressureLevel::Normal
+        );
+    }
+
+    #[test]
+    fn executor_soft_memory_pressure_is_observable_and_released() {
+        let dir = tempdir().unwrap();
+        let engine = add_graph_engine(dir.path().join("executor-soft-pressure.rsmf"));
+        let executor = RuntimeExecutor::new(
+            engine,
+            RuntimeExecutorConfig {
+                worker_threads: 0,
+                queue_capacity: 4,
+                dynamic_batching: None,
+                admission: RuntimeAdmissionConfig {
+                    memory_pressure: RuntimeMemoryPressureConfig {
+                        soft_queued_tensor_bytes: Some(16),
+                        ..RuntimeMemoryPressureConfig::default()
+                    },
+                    ..RuntimeAdmissionConfig::default()
+                },
+            },
+        );
+
+        let first = executor.submit(add_request("first", 1.0, 10.0)).unwrap();
+        let metrics = executor.metrics().unwrap();
+        assert_eq!(metrics.submitted, 1);
+        assert_eq!(metrics.memory_pressure_soft_events, 1);
+        assert_eq!(
+            metrics.memory_pressure_level,
+            RuntimeMemoryPressureLevel::Soft
+        );
+
+        assert!(executor.execute_next().unwrap());
+        assert_eq!(f32_output(&first.wait().unwrap(), "z"), vec![11.0, 11.0]);
+        let metrics = executor.metrics().unwrap();
+        assert_eq!(metrics.memory_pressure_soft_events, 1);
+        assert_eq!(
+            metrics.memory_pressure_level,
+            RuntimeMemoryPressureLevel::Normal
+        );
+    }
+
+    #[test]
     fn executor_enforces_tenant_queue_capacity_and_releases_on_dispatch() {
         let dir = tempdir().unwrap();
         let engine = add_graph_engine(dir.path().join("executor-tenant-capacity.rsmf"));
@@ -4799,8 +5029,66 @@ mod tests {
         assert_eq!(metrics.batch_flushes_full, 0);
         assert_eq!(metrics.batch_flushes_delay, 0);
         assert_eq!(metrics.batch_flushes_memory_pressure, 1);
+        assert_eq!(metrics.memory_pressure_flushes, 1);
         assert_eq!(metrics.batch_flushes_manual, 0);
         assert_eq!(metrics.batch_flushes_shutdown, 0);
+    }
+
+    #[test]
+    fn executor_flushes_dynamic_batch_on_soft_memory_pressure() {
+        let dir = tempdir().unwrap();
+        let engine = dynamic_add_graph_engine(dir.path().join("executor-soft-pressure-batch.rsmf"));
+        let executor = RuntimeExecutor::new(
+            engine,
+            RuntimeExecutorConfig {
+                worker_threads: 0,
+                queue_capacity: 8,
+                dynamic_batching: Some(DynamicBatchingConfig {
+                    max_batch_size: 4,
+                    max_queue_delay: Duration::from_secs(1),
+                }),
+                admission: RuntimeAdmissionConfig {
+                    memory_pressure: RuntimeMemoryPressureConfig {
+                        soft_queued_tensor_bytes: Some(32),
+                        flush_dynamic_batches_on_soft_pressure: true,
+                        ..RuntimeMemoryPressureConfig::default()
+                    },
+                    ..RuntimeAdmissionConfig::default()
+                },
+            },
+        );
+
+        let first = executor
+            .submit(dynamic_add_request("first", &[1.0, 2.0], &[10.0, 20.0]))
+            .unwrap();
+        let second = executor
+            .submit(dynamic_add_request("second", &[3.0, 4.0], &[30.0, 40.0]))
+            .unwrap();
+
+        let metrics = executor.metrics().unwrap();
+        assert_eq!(metrics.memory_pressure_soft_events, 1);
+        assert_eq!(
+            metrics.memory_pressure_level,
+            RuntimeMemoryPressureLevel::Soft
+        );
+
+        assert!(executor.execute_next().unwrap());
+        assert_eq!(f32_output(&first.wait().unwrap(), "z"), vec![11.0, 22.0]);
+        assert_eq!(f32_output(&second.wait().unwrap(), "z"), vec![33.0, 44.0]);
+
+        let metrics = executor.metrics().unwrap();
+        assert_eq!(metrics.runtime_invocations, 1);
+        assert_eq!(metrics.batches_executed, 1);
+        assert_eq!(metrics.batch_flushes_full, 0);
+        assert_eq!(metrics.batch_flushes_delay, 0);
+        assert_eq!(metrics.batch_flushes_memory_pressure, 1);
+        assert_eq!(metrics.memory_pressure_flushes, 1);
+        assert_eq!(metrics.batch_flushes_manual, 0);
+        assert_eq!(metrics.batch_flushes_shutdown, 0);
+        assert_eq!(
+            metrics.memory_pressure_level,
+            RuntimeMemoryPressureLevel::Normal
+        );
     }
 
     #[test]
