@@ -75,11 +75,12 @@ rsmf-core  (library)           ← format, reader, writer, validator, selection
   temperature, top-k, top-p, deterministic seeds, repetition penalty, minimum
   generation length, stop-token overrides, and optional prompt logits.
   `Engine::native_decoder_tokenizer()` and `Engine::native_decoder_generate_text()`
-  add text-level native decoding for `WordLevel` and limited BPE tokenizer
-  assets. The tokenizer path supports vocab/merges, simple whitespace or
-  ByteLevel pre-tokenization, added special-token ids, adjacent special-token
-  matching, byte fallback through `<0xXX>` vocab entries, NFC/NFD/NFKC/NFKD
-  normalizers, `TemplateProcessing` single/pair post-processors, and a small
+  add text-level native decoding for `WordLevel`, limited BPE, and limited
+  Unigram tokenizer assets. The tokenizer path supports vocab/merges, simple
+  whitespace, ByteLevel, or Metaspace pre-tokenization, added special-token ids,
+  adjacent special-token matching, byte fallback through `<0xXX>` vocab
+  entries, NFC/NFD/NFKC/NFKD normalizers, `TemplateProcessing` single/pair
+  post-processors, score-based Unigram segmentation with `unk_id`, and a small
   ChatML-style chat-template renderer for `tokenizer_config.json` /
   `chat_template.json` assets. Unsupported tokenizer constructs fail with typed
   errors. The first performance slices add real paged KV-cache attention reads, chunked prefill scheduling, threaded final
