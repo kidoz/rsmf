@@ -221,8 +221,9 @@ within a priority level, higher-priority dispatch, pre-dispatch deadline
 expiry, timeout helpers, queued cancellation, typed runtime error propagation,
 opt-in dynamic batching on the leading tensor dimension, per-request queue/run
 timings, queued tensor byte admission, per-tenant queued request/byte quotas,
-live queue/active-runtime pressure metrics, continuous-batching flush metrics,
-cumulative executor metrics, and best-effort interruption of running ORT calls
+soft/hard queued-memory pressure policy, live queue/active-runtime pressure
+metrics, continuous-batching flush metrics, cumulative executor metrics, and
+best-effort interruption of running ORT calls
 through `RunOptions::terminate`. A dependency-light HTTP/1.1 JSON serving
 wrapper exposes health, metrics, synchronous inference, in-flight request
 status, request cancellation, and tenant id propagation. It is intentionally
