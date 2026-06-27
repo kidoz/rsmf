@@ -240,21 +240,22 @@ cargo test -p rsmf-runtime
 Provider-specific device I/O binding and true mmap/device zero-copy residency
 are future runtime milestones.
 
-The native decoder track starts with a contract-only slice:
-`Engine::native_decoder_contract()` reads `config.json`, requires
-`tokenizer.json`, recognizes a LLaMA-style decoder config, and validates the
-expected RSMF tensor names, shapes, and F32/F16/BF16 weight dtypes. It does not
-parse tokenizer internals yet. CPU reference tensor ops cover one
-LLaMA-style decoder block: RMSNorm, row-major linear projection, RoPE, causal
+The native decoder track validates and executes a narrow LLaMA-style decoder
+contract. `Engine::native_decoder_contract()` reads `config.json`, requires
+`tokenizer.json`, recognizes the decoder config, and validates the expected
+RSMF tensor names, shapes, and F32/F16/BF16 weight dtypes. CPU reference tensor
+ops cover one decoder block: RMSNorm, row-major linear projection, RoPE, causal
 grouped-query attention, SwiGLU MLP, and residual additions over supplied f32
 buffers. `Engine::native_decoder_weights()` decodes validated RSMF tensor
 variants into owned f32 weights, and `Engine::native_decoder_greedy_decode()`
 adds a correctness-oriented KV cache, logits, EOS-aware token generation,
 sampling controls (`temperature`, `top_k`, `top_p`, deterministic `seed`,
 repetition penalty, min tokens, stop-token overrides, and optional prompt
-logits), and a backend selector. `Engine::native_decoder_session()` keeps
-decoded weights and tokenizer resident for repeated generation calls. `auto`
-resolves to the CPU reference backend; `accelerated` resolves to
+logits), and a backend selector. `Engine::native_decoder_tokenizer()` and
+`Engine::native_decoder_generate_text()` add the first text-level path for
+`WordLevel` and limited BPE tokenizer assets. `Engine::native_decoder_session()`
+keeps decoded weights and tokenizer resident for repeated generation calls.
+`auto` resolves to the CPU reference backend; `accelerated` resolves to
 `apple_cpu_accelerate` on macOS when the `apple-accelerate` feature is enabled
 and otherwise falls back to CPU reference. The explicit `cpu_threaded` backend
 still provides an in-tree threaded final projection path. Native decoder
@@ -265,11 +266,9 @@ synthetic HF-compatible reference fixture. Performance work has started with
 real paged KV-cache attention reads, chunked prefill scheduling, threaded CPU
 logits, and Criterion benches under `cargo bench -p rsmf-bench --bench
 native_decoder`; Metal/WGPU and CoreML native decoder selectors are explicit
-typed-unavailable hooks until those tracks have real kernels.
-`Engine::native_decoder_tokenizer()` and `Engine::native_decoder_generate_text()`
-add the first text-level path for `WordLevel` and limited BPE tokenizer assets.
-The BPE path covers vocab/merges, simple whitespace or ByteLevel-style
-pre-tokenization, added special tokens, and typed errors for unsupported
+typed-unavailable hooks until those tracks have real kernels. The BPE path
+covers vocab/merges, simple whitespace or ByteLevel-style pre-tokenization,
+added special tokens, and typed errors for unsupported
 normalizers/post-processors; full HuggingFace tokenizer parity remains future
 work.
 
