@@ -101,6 +101,28 @@ pub enum RuntimeError {
         /// Maximum configured queued input bytes.
         capacity_bytes: usize,
     },
+    /// The runtime executor tenant queue has reached its configured capacity.
+    #[error("runtime executor tenant {tenant_id} queue is full; capacity is {capacity}")]
+    ExecutorTenantQueueFull {
+        /// Tenant identifier.
+        tenant_id: String,
+        /// Maximum number of queued requests for this tenant.
+        capacity: usize,
+    },
+    /// The runtime executor tenant queued tensor byte budget would be exceeded.
+    #[error(
+        "runtime executor tenant {tenant_id} queued tensor byte budget exceeded; requested {requested_bytes} bytes with {queued_bytes}/{capacity_bytes} bytes queued"
+    )]
+    ExecutorTenantQueueBytesExceeded {
+        /// Tenant identifier.
+        tenant_id: String,
+        /// Bytes in the rejected request's owned inputs.
+        requested_bytes: usize,
+        /// Bytes already queued for this tenant before the rejected request.
+        queued_bytes: usize,
+        /// Maximum configured queued input bytes for this tenant.
+        capacity_bytes: usize,
+    },
     /// The runtime executor has been closed.
     #[error("runtime executor is closed")]
     ExecutorClosed,
@@ -175,6 +197,12 @@ pub struct RuntimeAdmissionConfig {
     /// Maximum bytes of owned input tensor data allowed to wait in the queue.
     /// `None` disables queued tensor byte admission.
     pub max_queued_tensor_bytes: Option<usize>,
+    /// Maximum number of queued requests per tenant. `None` disables this
+    /// tenant quota.
+    pub max_queued_requests_per_tenant: Option<usize>,
+    /// Maximum bytes of owned input tensor data allowed to wait per tenant.
+    /// `None` disables this tenant quota.
+    pub max_queued_tensor_bytes_per_tenant: Option<usize>,
 }
 
 /// ONNX Runtime graph optimization level.
@@ -408,6 +436,8 @@ pub struct RuntimeRequest {
     pub options: SessionOptions,
     /// Owned runtime inputs.
     pub inputs: RuntimeInputs,
+    /// Optional tenant identifier used for per-tenant admission quotas.
+    pub tenant_id: Option<String>,
     /// Optional deadline. Expired requests fail before graph dispatch.
     pub deadline: Option<Instant>,
     /// Request priority. Higher values run before lower values.
@@ -424,6 +454,7 @@ impl RuntimeRequest {
             graph_idx,
             options: SessionOptions::default(),
             inputs,
+            tenant_id: None,
             deadline: None,
             priority: 0,
         }
@@ -455,7 +486,20 @@ impl RuntimeRequest {
         self.priority = priority;
         self
     }
+
+    /// Set tenant identifier for per-tenant admission quotas.
+    #[must_use]
+    pub fn with_tenant_id(mut self, tenant_id: impl Into<String>) -> Self {
+        self.tenant_id = Some(tenant_id.into());
+        self
+    }
+
+    fn effective_tenant_id(&self) -> &str {
+        self.tenant_id.as_deref().unwrap_or(DEFAULT_TENANT_ID)
+    }
 }
+
+const DEFAULT_TENANT_ID: &str = "default";
 
 /// Per-request timing metadata captured by [`RuntimeExecutor`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -501,6 +545,12 @@ pub struct RuntimeExecutorMetrics {
     /// Requests rejected because queued tensor bytes would exceed the configured
     /// budget.
     pub rejected_by_memory: u64,
+    /// Requests rejected because a tenant queue reached its configured
+    /// capacity.
+    pub rejected_by_tenant_capacity: u64,
+    /// Requests rejected because a tenant queued tensor byte budget would be
+    /// exceeded.
+    pub rejected_by_tenant_memory: u64,
     /// Requests currently waiting in the queue.
     pub current_queue_depth: usize,
     /// Maximum queue depth observed by this executor.
@@ -545,6 +595,29 @@ pub struct RuntimeExecutorMetrics {
     pub total_queue_time: Duration,
     /// Cumulative run time for completed and failed dispatched requests.
     pub total_run_time: Duration,
+    /// Per-tenant queued request and byte accounting.
+    pub tenant_metrics: Vec<RuntimeTenantMetrics>,
+}
+
+/// Per-tenant in-process executor admission metrics.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct RuntimeTenantMetrics {
+    /// Tenant identifier.
+    pub tenant_id: String,
+    /// Requests currently waiting in the queue for this tenant.
+    pub current_queued_requests: usize,
+    /// Maximum queued requests observed for this tenant.
+    pub max_observed_queued_requests: usize,
+    /// Owned input tensor bytes currently waiting in the queue for this tenant.
+    pub current_queued_tensor_bytes: usize,
+    /// Maximum queued owned input tensor bytes observed for this tenant.
+    pub max_observed_queued_tensor_bytes: usize,
+    /// Requests rejected because this tenant queue reached its configured
+    /// capacity.
+    pub rejected_by_capacity: u64,
+    /// Requests rejected because this tenant queued tensor byte budget would be
+    /// exceeded.
+    pub rejected_by_memory: u64,
 }
 
 /// Result of a request cancellation attempt.
