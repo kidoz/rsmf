@@ -854,6 +854,22 @@ impl RsmfWriter {
         self
     }
 
+    /// Replace a global metadata key/value pair.
+    ///
+    /// Removes any existing entries for `key` before appending the new value,
+    /// which keeps manifest metadata unambiguous for source/provenance keys.
+    #[must_use]
+    pub fn with_metadata_replaced(
+        mut self,
+        key: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Self {
+        let key = key.into();
+        self.metadata.retain(|(existing, _)| existing != &key);
+        self.metadata.push((key, value.into()));
+        self
+    }
+
     /// Append a tensor input.
     #[must_use]
     pub fn with_tensor(mut self, t: TensorInput) -> Self {
