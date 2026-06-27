@@ -203,7 +203,7 @@ and owns runtime concerns: graph selection, ORT session options, CPU execution
 provider defaults, cached sessions, graph input/output metadata, and typed
 owned input/output tensors.
 
-R2 adds explicit initializer bindings through `SessionOptions.initializers`,
+It adds explicit initializer bindings through `SessionOptions.initializers`,
 mapping ONNX initializer names to RSMF tensor names. Bindings use canonical
 tensors by default and can opt into a specific global RSMF variant index with
 `InitializerBinding::with_variant`. The CPU path supports raw row-major `F32`,
@@ -215,7 +215,7 @@ still materializes an ORT-owned initializer value during session build.
 `SessionHandle::memory_report` exposes graph payload bytes and
 per-initializer materialized bytes.
 
-R3 starts the runtime server layer with `RuntimeExecutor`: a bounded
+The runtime server layer builds on `RuntimeExecutor`: a bounded
 in-process priority queue around `Engine::run`. It supports FIFO ordering
 within a priority level, higher-priority dispatch, pre-dispatch deadline
 expiry, timeout helpers, queued cancellation, typed runtime error propagation,
@@ -223,8 +223,10 @@ opt-in dynamic batching on the leading tensor dimension, per-request queue/run
 timings, queued tensor byte admission, live queue/active-runtime pressure
 metrics, continuous-batching flush metrics, cumulative executor metrics, and
 best-effort interruption of running ORT calls through `RunOptions::terminate`.
-It is intentionally graph-runtime agnostic so native decoder execution can
-share the same control plane later.
+A dependency-light HTTP/1.1 JSON serving wrapper exposes health, metrics,
+synchronous inference, in-flight request status, and request cancellation. It
+is intentionally graph-runtime agnostic so native decoder execution can share
+the same control plane later.
 
 Build it explicitly:
 

@@ -45,8 +45,11 @@ rsmf-core  (library)           ← format, reader, writer, validator, selection
   active requests, batch pressure, scheduler flush reasons, and cumulative
   metrics, with optional queued tensor byte admission. Already-running ORT
   calls receive a best-effort `RunOptions::terminate` signal through request
-  cancellation tokens. It stays graph-runtime agnostic for later native decoder
-  paths.
+  cancellation tokens. `RuntimeNetworkServer` exposes a std-library HTTP/1.1
+  JSON wrapper for `/health`, `/metrics`, `POST /v1/run`,
+  `GET /v1/requests/{id}`, and `DELETE /v1/requests/{id}` without adding a web
+  framework dependency. It stays graph-runtime agnostic for later native
+  decoder paths.
 - `rsmf-moe-runtime` is a proof-of-concept runtime for one MoE layer: host-side
   top-1 gating, token batching by destination expert, placement-aware expert
   shard lookup, WGPU expert matmuls when available, and a CPU reference path.
