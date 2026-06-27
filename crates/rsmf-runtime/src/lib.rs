@@ -910,6 +910,139 @@ pub struct NativeDecoderReferenceLogitReport {
     pub backend: NativeDecoderBackend,
 }
 
+/// Minimal tokenizer contract supported by the native decoder text API.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeDecoderTokenizer {
+    /// Tokenizer model kind from `tokenizer.json`.
+    pub model_type: String,
+    /// Token string to token id map.
+    pub vocab: HashMap<String, i64>,
+    id_to_token: HashMap<i64, String>,
+    unk_token: Option<String>,
+}
+
+impl NativeDecoderTokenizer {
+    fn from_json(bytes: &[u8]) -> Result<Self> {
+        let raw: NativeDecoderTokenizerJson = serde_json::from_slice(bytes).map_err(|error| {
+            RuntimeError::NativeDecoderTokenizerInvalid {
+                reason: error.to_string(),
+            }
+        })?;
+        if raw.model.tokenizer_type != "WordLevel" {
+            return Err(RuntimeError::NativeDecoderTokenizerInvalid {
+                reason: format!(
+                    "only WordLevel tokenizer.json assets are supported, got {}",
+                    raw.model.tokenizer_type
+                ),
+            });
+        }
+        if raw.model.vocab.is_empty() {
+            return Err(RuntimeError::NativeDecoderTokenizerInvalid {
+                reason: "tokenizer vocab must not be empty".to_string(),
+            });
+        }
+        let mut id_to_token = HashMap::with_capacity(raw.model.vocab.len());
+        for (token, token_id) in &raw.model.vocab {
+            if id_to_token.insert(*token_id, token.clone()).is_some() {
+                return Err(RuntimeError::NativeDecoderTokenizerInvalid {
+                    reason: format!("duplicate tokenizer id {token_id}"),
+                });
+            }
+        }
+        if let Some(unk_token) = &raw.model.unk_token {
+            if !raw.model.vocab.contains_key(unk_token) {
+                return Err(RuntimeError::NativeDecoderTokenizerInvalid {
+                    reason: format!("unk_token {unk_token} is not present in vocab"),
+                });
+            }
+        }
+        Ok(Self {
+            model_type: raw.model.tokenizer_type,
+            vocab: raw.model.vocab,
+            id_to_token,
+            unk_token: raw.model.unk_token,
+        })
+    }
+
+    /// Encode text by whitespace token lookup.
+    ///
+    /// This R4.7 tokenizer slice intentionally supports only simple WordLevel
+    /// tokenizers. Unknown tokens use `unk_token` when configured; otherwise a
+    /// typed error is returned.
+    pub fn encode(&self, text: &str) -> Result<Vec<i64>> {
+        let mut token_ids = Vec::new();
+        for token in text.split_whitespace() {
+            if let Some(token_id) = self.vocab.get(token) {
+                token_ids.push(*token_id);
+            } else if let Some(unk_token) = &self.unk_token {
+                let token_id = self.vocab.get(unk_token).copied().ok_or_else(|| {
+                    RuntimeError::NativeDecoderTokenizerTokenUnknown {
+                        token: token.to_string(),
+                    }
+                })?;
+                token_ids.push(token_id);
+            } else {
+                return Err(RuntimeError::NativeDecoderTokenizerTokenUnknown {
+                    token: token.to_string(),
+                });
+            }
+        }
+        if token_ids.is_empty() {
+            return Err(RuntimeError::NativeDecoderPromptEmpty);
+        }
+        Ok(token_ids)
+    }
+
+    /// Decode token ids by joining WordLevel tokens with spaces.
+    pub fn decode(&self, token_ids: &[i64]) -> Result<String> {
+        token_ids
+            .iter()
+            .map(|token_id| {
+                self.id_to_token.get(token_id).cloned().ok_or_else(|| {
+                    RuntimeError::NativeDecoderTokenizerTokenUnknown {
+                        token: token_id.to_string(),
+                    }
+                })
+            })
+            .collect::<Result<Vec<_>>>()
+            .map(|tokens| tokens.join(" "))
+    }
+}
+
+/// Output from native decoder text generation.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NativeDecoderTextGenerateOutput {
+    /// Original prompt string.
+    pub prompt: String,
+    /// Prompt token ids followed by generated token ids.
+    pub token_ids: Vec<i64>,
+    /// Newly generated token ids only.
+    pub generated_token_ids: Vec<i64>,
+    /// Decoded generated text only.
+    pub generated_text: String,
+    /// Decoded prompt plus generated text.
+    pub text: String,
+    /// Per-generation-step logits, one row per generated token.
+    pub logits: Vec<Vec<f32>>,
+    /// Backend actually used by this run.
+    pub backend: NativeDecoderBackend,
+}
+
+#[derive(Debug, Deserialize)]
+struct NativeDecoderTokenizerJson {
+    model: NativeDecoderTokenizerModelJson,
+}
+
+#[derive(Debug, Deserialize)]
+struct NativeDecoderTokenizerModelJson {
+    #[serde(rename = "type")]
+    tokenizer_type: String,
+    #[serde(default)]
+    vocab: HashMap<String, i64>,
+    #[serde(default)]
+    unk_token: Option<String>,
+}
+
 /// Owned LLaMA-style layer weights decoded for native decoder execution.
 #[derive(Debug, Clone, PartialEq)]
 pub struct NativeDecoderLayerWeights {
@@ -3292,11 +3425,25 @@ impl Engine {
         load_native_decoder_weights(&self.file, contract.config, options)
     }
 
-    /// Run native decoder greedy generation.
+    /// Load the native decoder tokenizer from `tokenizer.json`.
     ///
-    /// This R4 path supports the CPU reference backend. `Auto` resolves to
-    /// `CpuReference`; `Accelerated` returns a typed unavailable error until a
-    /// real accelerated backend is implemented.
+    /// R4.7 supports simple `WordLevel` tokenizer JSON assets with a `vocab`
+    /// map and optional `unk_token`.
+    pub fn native_decoder_tokenizer(&self) -> Result<NativeDecoderTokenizer> {
+        let tokenizer_asset = self
+            .file
+            .asset(NATIVE_DECODER_TOKENIZER_ASSET)
+            .ok_or_else(|| RuntimeError::NativeDecoderAssetMissing {
+                asset_name: NATIVE_DECODER_TOKENIZER_ASSET.to_string(),
+            })?;
+        NativeDecoderTokenizer::from_json(tokenizer_asset.bytes)
+    }
+
+    /// Run native decoder token-id generation.
+    ///
+    /// Defaults preserve greedy CPU-reference generation. Sampling options can
+    /// enable deterministic top-k/top-p sampling, and `Accelerated` resolves to
+    /// the in-tree threaded CPU backend in this build.
     pub fn native_decoder_greedy_decode(
         &self,
         input_token_ids: &[i64],
@@ -3315,6 +3462,32 @@ impl Engine {
                 })
             }
         }
+    }
+
+    /// Generate text with the native decoder tokenizer and token-id runtime.
+    ///
+    /// The prompt is encoded by [`NativeDecoderTokenizer`], passed to
+    /// [`Self::native_decoder_greedy_decode`], and generated token ids are
+    /// decoded back to text.
+    pub fn native_decoder_generate_text(
+        &self,
+        prompt: &str,
+        options: NativeDecoderRunOptions,
+    ) -> Result<NativeDecoderTextGenerateOutput> {
+        let tokenizer = self.native_decoder_tokenizer()?;
+        let prompt_token_ids = tokenizer.encode(prompt)?;
+        let output = self.native_decoder_greedy_decode(&prompt_token_ids, options)?;
+        let generated_text = tokenizer.decode(&output.generated_token_ids)?;
+        let text = tokenizer.decode(&output.token_ids)?;
+        Ok(NativeDecoderTextGenerateOutput {
+            prompt: prompt.to_string(),
+            token_ids: output.token_ids,
+            generated_token_ids: output.generated_token_ids,
+            generated_text,
+            text,
+            logits: output.logits,
+            backend: output.backend,
+        })
     }
 
     /// Compare native decoder logits against a caller-supplied reference.
@@ -6430,6 +6603,45 @@ mod tests {
     }
 
     #[test]
+    fn engine_native_decoder_tokenizer_encodes_and_decodes_wordlevel_text() {
+        let dir = tempdir().unwrap();
+        let engine = tiny_native_decoder_generation_engine(dir.path().join("native-decode.rsmf"));
+
+        let tokenizer = engine.native_decoder_tokenizer().unwrap();
+        assert_eq!(tokenizer.model_type, "WordLevel");
+        assert_eq!(tokenizer.encode("zero one").unwrap(), vec![0, 1]);
+        assert_eq!(tokenizer.decode(&[0, 1, 2]).unwrap(), "zero one two");
+    }
+
+    #[test]
+    fn engine_native_decoder_tokenizer_rejects_unsupported_model_type() {
+        let dir = tempdir().unwrap();
+        let engine = tiny_native_decoder_engine(
+            dir.path().join("native-decoder-bpe-tokenizer.rsmf"),
+            NativeDecoderFixtureOptions::default(),
+        );
+
+        let err = engine.native_decoder_tokenizer().unwrap_err();
+
+        assert!(
+            matches!(err, RuntimeError::NativeDecoderTokenizerInvalid { reason } if reason.contains("only WordLevel"))
+        );
+    }
+
+    #[test]
+    fn engine_native_decoder_tokenizer_rejects_unknown_token_without_unk() {
+        let dir = tempdir().unwrap();
+        let engine = tiny_native_decoder_generation_engine(dir.path().join("native-decode.rsmf"));
+        let tokenizer = engine.native_decoder_tokenizer().unwrap();
+
+        let err = tokenizer.encode("missing").unwrap_err();
+
+        assert!(
+            matches!(err, RuntimeError::NativeDecoderTokenizerTokenUnknown { token } if token == "missing")
+        );
+    }
+
+    #[test]
     fn engine_native_decoder_greedy_decode_generates_expected_tokens() {
         let dir = tempdir().unwrap();
         let engine = tiny_native_decoder_generation_engine(dir.path().join("native-decode.rsmf"));
@@ -6450,6 +6662,28 @@ mod tests {
         assert_eq!(output.logits.len(), 2);
         assert!(output.logits[0][1] > output.logits[0][0]);
         assert!(output.logits[1][2] > output.logits[1][1]);
+    }
+
+    #[test]
+    fn engine_native_decoder_generate_text_decodes_generated_tokens() {
+        let dir = tempdir().unwrap();
+        let engine = tiny_native_decoder_generation_engine(dir.path().join("native-decode.rsmf"));
+
+        let output = engine
+            .native_decoder_generate_text(
+                "zero",
+                NativeDecoderRunOptions {
+                    max_new_tokens: 3,
+                    ..NativeDecoderRunOptions::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(output.prompt, "zero");
+        assert_eq!(output.generated_token_ids, vec![1, 2]);
+        assert_eq!(output.generated_text, "one two");
+        assert_eq!(output.text, "zero one two");
+        assert_eq!(output.backend, NativeDecoderBackend::CpuReference);
     }
 
     #[test]
@@ -8624,7 +8858,7 @@ mod tests {
             ))
             .with_asset(AssetInput::new(
                 NATIVE_DECODER_TOKENIZER_ASSET,
-                br#"{"model": {"type": "BPE"}}"#.to_vec(),
+                tiny_native_decoder_tokenizer_json().into_bytes(),
             ));
         for expected in expected_native_decoder_tensors(&config).unwrap() {
             let values = tiny_native_decoder_generation_tensor_values(
@@ -8675,6 +8909,21 @@ mod tests {
             "bos_token_id": 1,
             "eos_token_id": 2,
             "tie_word_embeddings": false
+        })
+        .to_string()
+    }
+
+    fn tiny_native_decoder_tokenizer_json() -> String {
+        serde_json::json!({
+            "model": {
+                "type": "WordLevel",
+                "vocab": {
+                    "zero": 0,
+                    "one": 1,
+                    "two": 2,
+                    "minus": 3
+                }
+            }
         })
         .to_string()
     }
