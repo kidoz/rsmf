@@ -90,6 +90,8 @@ installed; it uses `torch.load(..., weights_only=True)` so arbitrary-code
 execution on pickle load is blocked by default. Override the interpreter
 with `RSMF_PYTHON_BIN=/path/to/python3`; set `RSMF_ALLOW_UNSAFE_PICKLE=1`
 only for checkpoints you trust that the safe loader rejects.
+Converted files carry `source=torch`, `rsmf.source_format=torch`,
+`rsmf.intermediate_format=safetensors`, and `torch.*` provenance metadata.
 
 ### Stream multi-hundred-GB checkpoints without buffering
 

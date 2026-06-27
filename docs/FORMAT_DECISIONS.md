@@ -161,7 +161,9 @@ tensor/graph/asset model.
   `safetensors.torch.save_file` into a temp file, then delegates to the
   existing safetensors pipeline. The safe loader blocks arbitrary code
   execution; `RSMF_ALLOW_UNSAFE_PICKLE=1` opts back in for trusted files
-  the safe loader refuses. Pure-Rust pickle parsing is a follow-up.
+  the safe loader refuses. Artifacts are marked with `source=torch`,
+  `rsmf.source_format=torch`, `rsmf.intermediate_format=safetensors`,
+  and `torch.*` provenance metadata. Pure-Rust pickle parsing is a follow-up.
 - **ONNX `.onnx`** uses a `python3` subprocess with the `onnx` package to extract
   initializers (tensors) from the graph and save them to a safetensors
   temp file, which is then ingested.
