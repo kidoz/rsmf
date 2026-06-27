@@ -24,6 +24,20 @@ pip install maturin
 maturin develop --release
 ```
 
+## Local tests
+
+Use the package-local `uv` environment for pytest:
+
+```sh
+uv sync --extra dev
+uv pip install torch safetensors
+RSMF_BIN=../../target/debug/rsmf uv run --no-sync python -m pytest tests/test_from_torch.py -q
+```
+
+`torch` and `safetensors` are optional test dependencies for the
+`rsmf pack --from-torch` path. `RSMF_BIN` keeps pytest on the current debug CLI
+instead of an older `target/release/rsmf` binary.
+
 ## Usage
 
 ```python
