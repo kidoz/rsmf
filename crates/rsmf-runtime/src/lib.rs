@@ -170,6 +170,42 @@ pub enum RuntimeError {
         /// Human-readable protocol error.
         reason: String,
     },
+    /// A network request used an unsupported protocol version.
+    #[error("unsupported runtime network protocol version {version}; expected {supported_version}")]
+    NetworkProtocolVersion {
+        /// Requested protocol version.
+        version: u32,
+        /// Supported protocol version.
+        supported_version: u32,
+    },
+    /// A network request header block exceeded the configured limit.
+    #[error("runtime network request headers exceed {limit_bytes} bytes")]
+    NetworkRequestHeadersTooLarge {
+        /// Maximum configured header bytes.
+        limit_bytes: usize,
+    },
+    /// A network request body exceeded the configured limit.
+    #[error("runtime network request body is {requested_bytes} bytes, limit is {limit_bytes}")]
+    NetworkRequestBodyTooLarge {
+        /// Request body bytes declared by content-length.
+        requested_bytes: usize,
+        /// Maximum configured body bytes.
+        limit_bytes: usize,
+    },
+    /// A network response body exceeded the configured limit.
+    #[error("runtime network response body is {response_bytes} bytes, limit is {limit_bytes}")]
+    NetworkResponseBodyTooLarge {
+        /// Serialized response body bytes.
+        response_bytes: usize,
+        /// Maximum configured response bytes.
+        limit_bytes: usize,
+    },
+    /// A network operation timed out.
+    #[error("runtime network operation timed out during {operation}")]
+    NetworkTimeout {
+        /// Operation that timed out.
+        operation: &'static str,
+    },
     /// A network request id is already active.
     #[error("runtime network request {request_id} is already active")]
     NetworkRequestAlreadyActive {
@@ -1514,20 +1550,35 @@ impl Drop for RuntimeExecutor {
     }
 }
 
+/// Current JSON network protocol version.
+pub const RUNTIME_NETWORK_PROTOCOL_VERSION: u32 = 1;
+
 /// Configuration for the dependency-light HTTP/1.1 network serving API.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeNetworkServerConfig {
     /// Address to bind. Use port `0` to request an OS-assigned port.
     pub bind_addr: SocketAddr,
+    /// Maximum accepted HTTP request header size in bytes.
+    pub max_header_bytes: usize,
     /// Maximum accepted request body size in bytes.
     pub max_body_bytes: usize,
+    /// Maximum serialized response body size in bytes.
+    pub max_response_body_bytes: usize,
+    /// Per-connection read timeout.
+    pub read_timeout: Duration,
+    /// Per-connection write timeout.
+    pub write_timeout: Duration,
 }
 
 impl Default for RuntimeNetworkServerConfig {
     fn default() -> Self {
         Self {
             bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            max_header_bytes: 16 * 1024,
             max_body_bytes: 16 * 1024 * 1024,
+            max_response_body_bytes: 64 * 1024 * 1024,
+            read_timeout: Duration::from_secs(10),
+            write_timeout: Duration::from_secs(10),
         }
     }
 }
@@ -1535,6 +1586,8 @@ impl Default for RuntimeNetworkServerConfig {
 /// JSON request accepted by `POST /v1/run`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RuntimeNetworkRunRequest {
+    /// Optional protocol version. Omitted means the current protocol version.
+    pub protocol_version: Option<u32>,
     /// Caller-provided request identifier.
     pub request_id: String,
     /// Graph payload index.
@@ -1553,7 +1606,9 @@ pub struct RuntimeNetworkRunRequest {
 }
 
 impl RuntimeNetworkRunRequest {
-    fn into_runtime_request(self) -> RuntimeRequest {
+    fn into_runtime_request(self) -> Result<RuntimeRequest> {
+        validate_network_protocol_version(self.protocol_version)?;
+        validate_network_request_id(&self.request_id)?;
         let mut request = RuntimeRequest::new(self.request_id, self.graph_idx, self.inputs)
             .with_options(self.options.unwrap_or_default());
         if let Some(tenant_id) = self.tenant_id {
@@ -1565,7 +1620,7 @@ impl RuntimeNetworkRunRequest {
         if let Some(timeout_ms) = self.timeout_ms {
             request = request.with_timeout(Duration::from_millis(timeout_ms));
         }
-        request
+        Ok(request)
     }
 }
 
@@ -1590,6 +1645,8 @@ impl RuntimeNetworkTimings {
 /// JSON response returned by `POST /v1/run`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RuntimeNetworkRunResponse {
+    /// Network protocol version used for this response.
+    pub protocol_version: u32,
     /// Caller-provided request identifier.
     pub request_id: String,
     /// Owned graph outputs.
@@ -1601,6 +1658,7 @@ pub struct RuntimeNetworkRunResponse {
 impl RuntimeNetworkRunResponse {
     fn from_response(response: RuntimeResponse) -> Self {
         Self {
+            protocol_version: RUNTIME_NETWORK_PROTOCOL_VERSION,
             request_id: response.request_id,
             outputs: response.outputs,
             timings: RuntimeNetworkTimings::from_timings(&response.timings),
@@ -1611,6 +1669,8 @@ impl RuntimeNetworkRunResponse {
 /// JSON metrics snapshot returned by `GET /metrics`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeNetworkMetrics {
+    /// Network protocol version used for this response.
+    pub protocol_version: u32,
     /// Requests accepted into the queue.
     pub submitted: u64,
     /// Requests completed successfully.
@@ -1695,6 +1755,7 @@ pub struct RuntimeNetworkMetrics {
 impl From<RuntimeExecutorMetrics> for RuntimeNetworkMetrics {
     fn from(metrics: RuntimeExecutorMetrics) -> Self {
         Self {
+            protocol_version: RUNTIME_NETWORK_PROTOCOL_VERSION,
             submitted: metrics.submitted,
             completed: metrics.completed,
             failed: metrics.failed,
@@ -1804,9 +1865,9 @@ impl RuntimeNetworkServer {
         let shutdown = Arc::new(AtomicBool::new(false));
         let thread_shutdown = Arc::clone(&shutdown);
         let executor = Arc::clone(&self.executor);
-        let max_body_bytes = self.config.max_body_bytes;
+        let limits = RuntimeNetworkLimits::from(&self.config);
         let thread = std::thread::spawn(move || {
-            network_accept_loop(listener, executor, state, thread_shutdown, max_body_bytes);
+            network_accept_loop(listener, executor, state, thread_shutdown, limits);
         });
         Ok(RuntimeNetworkServerHandle {
             local_addr,
@@ -1819,6 +1880,27 @@ impl RuntimeNetworkServer {
 #[derive(Default)]
 struct RuntimeNetworkServerState {
     inflight: Mutex<HashMap<String, Option<RuntimeCancellationToken>>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RuntimeNetworkLimits {
+    max_header_bytes: usize,
+    max_body_bytes: usize,
+    max_response_body_bytes: usize,
+    read_timeout: Duration,
+    write_timeout: Duration,
+}
+
+impl From<&RuntimeNetworkServerConfig> for RuntimeNetworkLimits {
+    fn from(config: &RuntimeNetworkServerConfig) -> Self {
+        Self {
+            max_header_bytes: config.max_header_bytes,
+            max_body_bytes: config.max_body_bytes,
+            max_response_body_bytes: config.max_response_body_bytes,
+            read_timeout: config.read_timeout,
+            write_timeout: config.write_timeout,
+        }
+    }
 }
 
 impl RuntimeNetworkServerState {
@@ -1869,6 +1951,7 @@ impl RuntimeNetworkServerState {
 struct RuntimeHttpRequest {
     method: String,
     path: String,
+    content_type: Option<String>,
     body: Vec<u8>,
 }
 
@@ -1877,7 +1960,7 @@ fn network_accept_loop(
     executor: Arc<RuntimeExecutor>,
     state: Arc<RuntimeNetworkServerState>,
     shutdown: Arc<AtomicBool>,
-    max_body_bytes: usize,
+    limits: RuntimeNetworkLimits,
 ) {
     while !shutdown.load(AtomicOrdering::Acquire) {
         match listener.accept() {
@@ -1885,7 +1968,7 @@ fn network_accept_loop(
                 let executor = Arc::clone(&executor);
                 let state = Arc::clone(&state);
                 std::thread::spawn(move || {
-                    handle_network_connection(stream, executor, state, max_body_bytes);
+                    handle_network_connection(stream, executor, state, limits);
                 });
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -1900,23 +1983,18 @@ fn handle_network_connection(
     mut stream: TcpStream,
     executor: Arc<RuntimeExecutor>,
     state: Arc<RuntimeNetworkServerState>,
-    max_body_bytes: usize,
+    limits: RuntimeNetworkLimits,
 ) {
-    let response = read_http_request(&mut stream, max_body_bytes)
+    let response = read_http_request(&mut stream, limits)
         .and_then(|request| route_network_request(request, &executor, &state));
     match response {
         Ok(body) => {
-            let _ = write_json_response(&mut stream, 200, "OK", &body);
+            if let Err(error) = write_json_response(&mut stream, 200, "OK", &body, limits) {
+                let _ = write_network_error_response(&mut stream, &error, limits);
+            }
         }
         Err(error) => {
-            let (status, reason, code) = network_error_status(&error);
-            let body = serde_json::json!({
-                "error": {
-                    "code": code,
-                    "message": error.to_string()
-                }
-            });
-            let _ = write_json_response(&mut stream, status, reason, &body);
+            let _ = write_network_error_response(&mut stream, &error, limits);
         }
     }
 }
@@ -1927,12 +2005,18 @@ fn route_network_request(
     state: &RuntimeNetworkServerState,
 ) -> Result<serde_json::Value> {
     match (request.method.as_str(), request.path.as_str()) {
-        ("GET", "/health") => Ok(serde_json::json!({ "status": "ok" })),
+        ("GET", "/health") => Ok(serde_json::json!({
+            "status": "ok",
+            "protocol_version": RUNTIME_NETWORK_PROTOCOL_VERSION
+        })),
         ("GET", "/metrics") => {
             let metrics = RuntimeNetworkMetrics::from(executor.metrics()?);
             serde_json::to_value(metrics).map_err(network_json_error)
         }
-        ("POST", "/v1/run") => handle_network_run(request.body, executor, state),
+        ("POST", "/v1/run") => {
+            validate_json_content_type(request.content_type.as_deref())?;
+            handle_network_run(request.body, executor, state)
+        }
         _ if request.method == "GET" && request.path.starts_with("/v1/requests/") => {
             let request_id = network_request_id_from_path(&request.path)?;
             let cancellation = state.cancellation(request_id)?;
@@ -1978,8 +2062,15 @@ fn handle_network_run(
     let request: RuntimeNetworkRunRequest =
         serde_json::from_slice(&body).map_err(network_json_error)?;
     let request_id = request.request_id.clone();
+    validate_network_request_id(&request_id)?;
     state.reserve(&request_id)?;
-    let runtime_request = request.into_runtime_request();
+    let runtime_request = match request.into_runtime_request() {
+        Ok(request) => request,
+        Err(error) => {
+            state.remove(&request_id);
+            return Err(error);
+        }
+    };
     let handle = match executor.submit(runtime_request) {
         Ok(handle) => handle,
         Err(error) => {
@@ -2009,18 +2100,61 @@ fn network_request_id_from_path(path: &str) -> Result<&str> {
     Ok(request_id)
 }
 
-fn read_http_request(stream: &mut TcpStream, max_body_bytes: usize) -> Result<RuntimeHttpRequest> {
+fn validate_network_request_id(request_id: &str) -> Result<()> {
+    if request_id.is_empty() || request_id.contains('/') {
+        return Err(RuntimeError::NetworkProtocol {
+            reason: "request_id must be non-empty and must not contain '/'".to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_network_protocol_version(protocol_version: Option<u32>) -> Result<()> {
+    let Some(version) = protocol_version else {
+        return Ok(());
+    };
+    if version != RUNTIME_NETWORK_PROTOCOL_VERSION {
+        return Err(RuntimeError::NetworkProtocolVersion {
+            version,
+            supported_version: RUNTIME_NETWORK_PROTOCOL_VERSION,
+        });
+    }
+    Ok(())
+}
+
+fn validate_json_content_type(content_type: Option<&str>) -> Result<()> {
+    let Some(content_type) = content_type else {
+        return Ok(());
+    };
+    let media_type = content_type
+        .split(';')
+        .next()
+        .map(str::trim)
+        .unwrap_or_default();
+    if media_type.eq_ignore_ascii_case("application/json") {
+        Ok(())
+    } else {
+        Err(RuntimeError::NetworkProtocol {
+            reason: "content-type must be application/json".to_string(),
+        })
+    }
+}
+
+fn read_http_request(
+    stream: &mut TcpStream,
+    limits: RuntimeNetworkLimits,
+) -> Result<RuntimeHttpRequest> {
     stream
-        .set_read_timeout(Some(Duration::from_secs(10)))
+        .set_read_timeout(Some(limits.read_timeout))
         .map_err(|e| network_io_error("configure connection read timeout", e))?;
     let mut buffer = Vec::new();
     let header_end = loop {
         if let Some(header_end) = find_header_end(&buffer) {
             break header_end;
         }
-        if buffer.len() > 16 * 1024 {
-            return Err(RuntimeError::NetworkProtocol {
-                reason: "HTTP request headers exceed 16 KiB".to_string(),
+        if buffer.len() > limits.max_header_bytes {
+            return Err(RuntimeError::NetworkRequestHeadersTooLarge {
+                limit_bytes: limits.max_header_bytes,
             });
         }
         let mut chunk = [0u8; 1024];
@@ -2062,8 +2196,19 @@ fn read_http_request(stream: &mut TcpStream, max_body_bytes: usize) -> Result<Ru
         .ok_or_else(|| RuntimeError::NetworkProtocol {
             reason: "missing HTTP version".to_string(),
         })?;
+    if _version != "HTTP/1.1" {
+        return Err(RuntimeError::NetworkProtocol {
+            reason: "HTTP version must be HTTP/1.1".to_string(),
+        });
+    }
+    if request_parts.next().is_some() {
+        return Err(RuntimeError::NetworkProtocol {
+            reason: "malformed HTTP request line".to_string(),
+        });
+    }
 
     let mut content_length = 0usize;
+    let mut content_type = None;
     for line in lines {
         if let Some((name, value)) = line.split_once(':')
             && name.trim().eq_ignore_ascii_case("content-length")
@@ -2075,11 +2220,23 @@ fn read_http_request(stream: &mut TcpStream, max_body_bytes: usize) -> Result<Ru
                     .map_err(|error| RuntimeError::NetworkProtocol {
                         reason: format!("invalid content-length: {error}"),
                     })?;
+        } else if let Some((name, value)) = line.split_once(':')
+            && name.trim().eq_ignore_ascii_case("content-type")
+        {
+            content_type = Some(value.trim().to_string());
+        } else if let Some((name, value)) = line.split_once(':')
+            && name.trim().eq_ignore_ascii_case("transfer-encoding")
+            && !value.trim().eq_ignore_ascii_case("identity")
+        {
+            return Err(RuntimeError::NetworkProtocol {
+                reason: "transfer-encoding is not supported".to_string(),
+            });
         }
     }
-    if content_length > max_body_bytes {
-        return Err(RuntimeError::NetworkProtocol {
-            reason: format!("request body is {content_length} bytes, limit is {max_body_bytes}"),
+    if content_length > limits.max_body_bytes {
+        return Err(RuntimeError::NetworkRequestBodyTooLarge {
+            requested_bytes: content_length,
+            limit_bytes: limits.max_body_bytes,
         });
     }
 
@@ -2100,6 +2257,7 @@ fn read_http_request(stream: &mut TcpStream, max_body_bytes: usize) -> Result<Ru
     Ok(RuntimeHttpRequest {
         method,
         path,
+        content_type,
         body: buffer[body_start..body_start + content_length].to_vec(),
     })
 }
@@ -2113,8 +2271,18 @@ fn write_json_response(
     status: u16,
     reason: &str,
     body: &serde_json::Value,
+    limits: RuntimeNetworkLimits,
 ) -> Result<()> {
     let body = serde_json::to_vec(body).map_err(network_json_error)?;
+    if body.len() > limits.max_response_body_bytes {
+        return Err(RuntimeError::NetworkResponseBodyTooLarge {
+            response_bytes: body.len(),
+            limit_bytes: limits.max_response_body_bytes,
+        });
+    }
+    stream
+        .set_write_timeout(Some(limits.write_timeout))
+        .map_err(|e| network_io_error("configure connection write timeout", e))?;
     let header = format!(
         "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
         body.len()
@@ -2125,10 +2293,31 @@ fn write_json_response(
         .map_err(|e| network_io_error("write network response", e))
 }
 
+fn write_network_error_response(
+    stream: &mut TcpStream,
+    error: &RuntimeError,
+    limits: RuntimeNetworkLimits,
+) -> Result<()> {
+    let (status, reason, code) = network_error_status(error);
+    let body = serde_json::json!({
+        "error": {
+            "code": code,
+            "message": network_public_error_message(error)
+        }
+    });
+    write_json_response(stream, status, reason, &body, limits)
+}
+
 fn network_error_status(error: &RuntimeError) -> (u16, &'static str, &'static str) {
     match error {
         RuntimeError::NetworkRequestNotFound { .. } => (404, "Not Found", "not_found"),
         RuntimeError::NetworkRequestAlreadyActive { .. } => (409, "Conflict", "conflict"),
+        RuntimeError::NetworkRequestBodyTooLarge { .. } => {
+            (413, "Payload Too Large", "payload_too_large")
+        }
+        RuntimeError::NetworkRequestHeadersTooLarge { .. } => {
+            (431, "Request Header Fields Too Large", "headers_too_large")
+        }
         RuntimeError::ExecutorQueueFull { .. }
         | RuntimeError::ExecutorQueueBytesExceeded { .. }
         | RuntimeError::ExecutorMemoryPressureExceeded { .. }
@@ -2136,16 +2325,29 @@ fn network_error_status(error: &RuntimeError) -> (u16, &'static str, &'static st
         | RuntimeError::ExecutorTenantQueueBytesExceeded { .. } => {
             (429, "Too Many Requests", "admission_rejected")
         }
+        RuntimeError::NetworkProtocolVersion { .. } => {
+            (400, "Bad Request", "unsupported_protocol_version")
+        }
         RuntimeError::NetworkProtocol { .. } => (400, "Bad Request", "bad_request"),
         RuntimeError::RequestDeadlineExceeded { .. } => {
             (408, "Request Timeout", "deadline_expired")
         }
+        RuntimeError::NetworkTimeout { .. } => (408, "Request Timeout", "network_timeout"),
         RuntimeError::RequestCancelled { .. } => (499, "Client Closed Request", "cancelled"),
+        RuntimeError::NetworkResponseBodyTooLarge { .. } => {
+            (500, "Internal Server Error", "response_too_large")
+        }
         _ => (500, "Internal Server Error", "runtime_error"),
     }
 }
 
 fn network_io_error(operation: &'static str, error: std::io::Error) -> RuntimeError {
+    if matches!(
+        error.kind(),
+        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+    ) {
+        return RuntimeError::NetworkTimeout { operation };
+    }
     RuntimeError::NetworkIo {
         operation,
         message: error.to_string(),
@@ -2155,6 +2357,46 @@ fn network_io_error(operation: &'static str, error: std::io::Error) -> RuntimeEr
 fn network_json_error(error: serde_json::Error) -> RuntimeError {
     RuntimeError::NetworkProtocol {
         reason: error.to_string(),
+    }
+}
+
+fn network_public_error_message(error: &RuntimeError) -> String {
+    match error {
+        RuntimeError::NetworkProtocol { reason } => reason.clone(),
+        RuntimeError::NetworkProtocolVersion {
+            version,
+            supported_version,
+        } => format!(
+            "unsupported protocol version {version}; supported version is {supported_version}"
+        ),
+        RuntimeError::NetworkRequestBodyTooLarge {
+            requested_bytes,
+            limit_bytes,
+        } => {
+            format!("request body is {requested_bytes} bytes, limit is {limit_bytes}")
+        }
+        RuntimeError::NetworkRequestHeadersTooLarge { limit_bytes } => {
+            format!("request headers exceed {limit_bytes} bytes")
+        }
+        RuntimeError::NetworkRequestNotFound { .. } => "request not found".to_string(),
+        RuntimeError::NetworkRequestAlreadyActive { .. } => {
+            "request id is already active".to_string()
+        }
+        RuntimeError::RequestDeadlineExceeded { .. } => "request deadline expired".to_string(),
+        RuntimeError::RequestCancelled { .. } => "request was cancelled".to_string(),
+        RuntimeError::ExecutorQueueFull { .. }
+        | RuntimeError::ExecutorQueueBytesExceeded { .. }
+        | RuntimeError::ExecutorMemoryPressureExceeded { .. }
+        | RuntimeError::ExecutorTenantQueueFull { .. }
+        | RuntimeError::ExecutorTenantQueueBytesExceeded { .. } => {
+            "request rejected by admission control".to_string()
+        }
+        RuntimeError::NetworkTimeout { .. } => "network operation timed out".to_string(),
+        RuntimeError::NetworkResponseBodyTooLarge { .. } => {
+            "response exceeded configured size limit".to_string()
+        }
+        RuntimeError::NetworkIo { .. } => "network I/O error".to_string(),
+        _ => "runtime request failed".to_string(),
     }
 }
 
@@ -5100,9 +5342,11 @@ mod tests {
         let (status, body) = http_json(server.local_addr(), "GET", "/health", None);
         assert_eq!(status, 200);
         assert_eq!(body["status"], "ok");
+        assert_eq!(body["protocol_version"], RUNTIME_NETWORK_PROTOCOL_VERSION);
 
         let (status, body) = http_json(server.local_addr(), "GET", "/metrics", None);
         assert_eq!(status, 200);
+        assert_eq!(body["protocol_version"], RUNTIME_NETWORK_PROTOCOL_VERSION);
         assert_eq!(body["submitted"], 0);
         assert_eq!(body["runtime_invocations"], 0);
 
@@ -5115,6 +5359,7 @@ mod tests {
         let engine = add_graph_engine(dir.path().join("network-run.rsmf"));
         let server = start_test_network_server(engine, RuntimeExecutorConfig::default());
         let request = serde_json::json!({
+            "protocol_version": RUNTIME_NETWORK_PROTOCOL_VERSION,
             "request_id": "net-run",
             "graph_idx": 0,
             "inputs": {
@@ -5125,6 +5370,7 @@ mod tests {
 
         let (status, body) = http_json(server.local_addr(), "POST", "/v1/run", Some(&request));
         assert_eq!(status, 200);
+        assert_eq!(body["protocol_version"], RUNTIME_NETWORK_PROTOCOL_VERSION);
         assert_eq!(body["request_id"], "net-run");
         assert_eq!(body["outputs"]["z"]["dtype"], "f32");
         assert_eq!(body["outputs"]["z"]["shape"], serde_json::json!([2]));
@@ -5138,6 +5384,144 @@ mod tests {
         assert_eq!(metrics["submitted"], 1);
         assert_eq!(metrics["completed"], 1);
         assert_eq!(metrics["runtime_invocations"], 1);
+
+        server.shutdown().unwrap();
+    }
+
+    #[test]
+    fn network_server_rejects_unsupported_protocol_version() {
+        let dir = tempdir().unwrap();
+        let engine = add_graph_engine(dir.path().join("network-protocol-version.rsmf"));
+        let server = start_test_network_server(engine, RuntimeExecutorConfig::default());
+        let request = serde_json::json!({
+            "protocol_version": RUNTIME_NETWORK_PROTOCOL_VERSION + 1,
+            "request_id": "net-version",
+            "graph_idx": 0,
+            "inputs": {
+                "x": { "dtype": "f32", "shape": [2], "data": [1.0, 2.0] },
+                "y": { "dtype": "f32", "shape": [2], "data": [10.0, 20.0] }
+            }
+        });
+
+        let (status, body) = http_json(server.local_addr(), "POST", "/v1/run", Some(&request));
+        assert_eq!(status, 400);
+        assert_eq!(body["error"]["code"], "unsupported_protocol_version");
+        assert_eq!(
+            body["error"]["message"],
+            "unsupported protocol version 2; supported version is 1"
+        );
+
+        let (status, metrics) = http_json(server.local_addr(), "GET", "/metrics", None);
+        assert_eq!(status, 200);
+        assert_eq!(metrics["submitted"], 0);
+
+        server.shutdown().unwrap();
+    }
+
+    #[test]
+    fn network_server_rejects_oversized_request_body() {
+        let dir = tempdir().unwrap();
+        let engine = add_graph_engine(dir.path().join("network-body-limit.rsmf"));
+        let server = start_test_network_server_with_network_config(
+            engine,
+            RuntimeExecutorConfig::default(),
+            RuntimeNetworkServerConfig {
+                max_body_bytes: 8,
+                ..RuntimeNetworkServerConfig::default()
+            },
+        );
+        let (status, body) = http_raw_json(
+            server.local_addr(),
+            "POST /v1/run HTTP/1.1\r\nhost: test\r\ncontent-type: application/json\r\ncontent-length: 9\r\nconnection: close\r\n\r\n123456789",
+        );
+
+        assert_eq!(status, 413);
+        assert_eq!(body["error"]["code"], "payload_too_large");
+        assert_eq!(
+            body["error"]["message"],
+            "request body is 9 bytes, limit is 8"
+        );
+
+        server.shutdown().unwrap();
+    }
+
+    #[test]
+    fn network_server_rejects_unsupported_content_type() {
+        let dir = tempdir().unwrap();
+        let engine = add_graph_engine(dir.path().join("network-content-type.rsmf"));
+        let server = start_test_network_server(engine, RuntimeExecutorConfig::default());
+        let body = serde_json::json!({
+            "request_id": "net-content-type",
+            "graph_idx": 0,
+            "inputs": {
+                "x": { "dtype": "f32", "shape": [2], "data": [1.0, 2.0] },
+                "y": { "dtype": "f32", "shape": [2], "data": [10.0, 20.0] }
+            }
+        })
+        .to_string();
+        let request = format!(
+            "POST /v1/run HTTP/1.1\r\nhost: test\r\ncontent-type: text/plain\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let (status, body) = http_raw_json(server.local_addr(), &request);
+
+        assert_eq!(status, 400);
+        assert_eq!(body["error"]["code"], "bad_request");
+        assert_eq!(
+            body["error"]["message"],
+            "content-type must be application/json"
+        );
+
+        server.shutdown().unwrap();
+    }
+
+    #[test]
+    fn network_server_sanitizes_runtime_error_response() {
+        let dir = tempdir().unwrap();
+        let engine = add_graph_engine(dir.path().join("network-sanitized-error.rsmf"));
+        let server = start_test_network_server(engine, RuntimeExecutorConfig::default());
+        let request = serde_json::json!({
+            "request_id": "net-runtime-error",
+            "graph_idx": 99,
+            "inputs": {}
+        });
+
+        let (status, body) = http_json(server.local_addr(), "POST", "/v1/run", Some(&request));
+        assert_eq!(status, 500);
+        assert_eq!(body["error"]["code"], "runtime_error");
+        assert_eq!(body["error"]["message"], "runtime request failed");
+
+        server.shutdown().unwrap();
+    }
+
+    #[test]
+    fn network_server_enforces_response_body_limit() {
+        let dir = tempdir().unwrap();
+        let engine = add_graph_engine(dir.path().join("network-response-limit.rsmf"));
+        let server = start_test_network_server_with_network_config(
+            engine,
+            RuntimeExecutorConfig::default(),
+            RuntimeNetworkServerConfig {
+                max_response_body_bytes: 128,
+                ..RuntimeNetworkServerConfig::default()
+            },
+        );
+        let request = serde_json::json!({
+            "request_id": "net-response-limit",
+            "graph_idx": 0,
+            "inputs": {
+                "x": { "dtype": "f32", "shape": [2], "data": [1.0, 2.0] },
+                "y": { "dtype": "f32", "shape": [2], "data": [10.0, 20.0] }
+            }
+        });
+
+        let (status, body) = http_json(server.local_addr(), "POST", "/v1/run", Some(&request));
+        assert_eq!(status, 500);
+        assert_eq!(body["error"]["code"], "response_too_large");
+        assert_eq!(
+            body["error"]["message"],
+            "response exceeded configured size limit"
+        );
 
         server.shutdown().unwrap();
     }
@@ -5230,9 +5614,21 @@ mod tests {
         engine: Engine,
         executor_config: RuntimeExecutorConfig,
     ) -> RuntimeNetworkServerHandle {
+        start_test_network_server_with_network_config(
+            engine,
+            executor_config,
+            RuntimeNetworkServerConfig::default(),
+        )
+    }
+
+    fn start_test_network_server_with_network_config(
+        engine: Engine,
+        executor_config: RuntimeExecutorConfig,
+        network_config: RuntimeNetworkServerConfig,
+    ) -> RuntimeNetworkServerHandle {
         RuntimeNetworkServer::new(
             RuntimeExecutor::new(engine, executor_config),
-            RuntimeNetworkServerConfig::default(),
+            network_config,
         )
         .start()
         .unwrap()
@@ -5253,6 +5649,10 @@ mod tests {
             "{method} {path} HTTP/1.1\r\nhost: {addr}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
             body.len()
         );
+        http_raw_json(addr, &request)
+    }
+
+    fn http_raw_json(addr: SocketAddr, request: &str) -> (u16, serde_json::Value) {
         let mut stream = TcpStream::connect(addr).unwrap();
         stream.write_all(request.as_bytes()).unwrap();
         let mut response = String::new();
