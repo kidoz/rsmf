@@ -92,18 +92,23 @@ Source: `crates/rsmf-bench/benches/moe_dispatch.rs`.
 
 ### Native decoder CPU path
 
-The native decoder path in `crates/rsmf-runtime` is currently validated by
-unit tests rather than Criterion benches. Covered behavior includes deterministic
-sampling, reference-logit checks, page-sized KV-cache allocation accounting, and
-threaded CPU final-projection equivalence:
+Measures the public native decoder token-generation API over a deterministic
+tiny LLaMA-style fixture:
+
+- CPU reference token generation,
+- threaded CPU final-logits projection,
+- paged KV-cache attention reads with page size 1,
+- prompt length 3 with chunked prefill scheduling.
 
 ```sh
-cargo test -p rsmf-runtime native_decoder
+cargo bench -p rsmf-bench --bench native_decoder
 ```
 
-Add a Criterion bench before making performance claims about threaded logits,
-prompt length scaling, cache allocation behavior, or future paged-attention
-kernels.
+The current bench intentionally measures the stable `Engine` API, including
+weight loading. Add a lower-level bench if future optimized weight residency or
+step-level APIs need isolated measurement.
+
+Source: `crates/rsmf-bench/benches/native_decoder.rs`.
 
 ## Methodology
 
