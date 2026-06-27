@@ -107,6 +107,10 @@ fn executor_rejects_expired_deadline_before_runtime_dispatch() {
     assert_eq!(metrics.failed, 1);
     assert_eq!(metrics.deadline_expired, 1);
     assert_eq!(metrics.cancelled, 0);
+    assert_eq!(metrics.current_active_input_tensor_bytes, 0);
+    assert_eq!(metrics.current_active_output_tensor_bytes, 0);
+    assert_eq!(metrics.max_observed_active_input_tensor_bytes, 0);
+    assert_eq!(metrics.max_observed_active_output_tensor_bytes, 0);
 }
 
 #[test]
@@ -173,6 +177,10 @@ fn executor_cancels_queued_request_before_runtime_dispatch() {
     assert_eq!(metrics.failed, 1);
     assert_eq!(metrics.deadline_expired, 0);
     assert_eq!(metrics.cancelled, 1);
+    assert_eq!(metrics.current_active_input_tensor_bytes, 0);
+    assert_eq!(metrics.current_active_output_tensor_bytes, 0);
+    assert_eq!(metrics.max_observed_active_input_tensor_bytes, 0);
+    assert_eq!(metrics.max_observed_active_output_tensor_bytes, 0);
 }
 
 #[test]
@@ -265,13 +273,9 @@ fn executor_preserves_runtime_errors() {
             admission: RuntimeAdmissionConfig::default(),
         },
     );
-    let handle = executor
-        .submit(RuntimeRequest::new(
-            "missing-graph",
-            99,
-            RuntimeInputs::new(),
-        ))
-        .unwrap();
+    let mut request = add_request("missing-graph", 1.0, 10.0);
+    request.graph_idx = 99;
+    let handle = executor.submit(request).unwrap();
 
     assert!(executor.execute_next().unwrap());
     let err = handle.wait().unwrap_err();
@@ -288,6 +292,10 @@ fn executor_preserves_runtime_errors() {
     assert_eq!(metrics.failed, 1);
     assert_eq!(metrics.deadline_expired, 0);
     assert_eq!(metrics.cancelled, 0);
+    assert_eq!(metrics.current_active_input_tensor_bytes, 0);
+    assert_eq!(metrics.current_active_output_tensor_bytes, 0);
+    assert_eq!(metrics.max_observed_active_input_tensor_bytes, 16);
+    assert_eq!(metrics.max_observed_active_output_tensor_bytes, 0);
 }
 
 #[test]
@@ -374,6 +382,10 @@ fn executor_memory_budget_is_enforced_and_reported() {
     assert_eq!(metrics.max_active_requests, 1);
     assert_eq!(metrics.max_active_runtime_invocations, 1);
     assert_eq!(metrics.max_active_batch_size, 1);
+    assert_eq!(metrics.current_active_input_tensor_bytes, 0);
+    assert_eq!(metrics.current_active_output_tensor_bytes, 0);
+    assert_eq!(metrics.max_observed_active_input_tensor_bytes, 16);
+    assert_eq!(metrics.max_observed_active_output_tensor_bytes, 8);
 }
 
 #[test]
@@ -629,6 +641,10 @@ fn executor_batches_compatible_requests() {
     assert_eq!(metrics.max_active_requests, 2);
     assert_eq!(metrics.max_active_runtime_invocations, 1);
     assert_eq!(metrics.max_active_batch_size, 2);
+    assert_eq!(metrics.current_active_input_tensor_bytes, 0);
+    assert_eq!(metrics.current_active_output_tensor_bytes, 0);
+    assert_eq!(metrics.max_observed_active_input_tensor_bytes, 32);
+    assert_eq!(metrics.max_observed_active_output_tensor_bytes, 16);
 }
 
 #[test]

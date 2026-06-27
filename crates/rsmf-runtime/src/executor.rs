@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::tensor::{
     merge_runtime_tensors, request_leading_batch_size, runtime_inputs_data_bytes,
-    split_runtime_outputs, tensors_are_batch_compatible,
+    runtime_outputs_data_bytes, split_runtime_outputs, tensors_are_batch_compatible,
 };
 use crate::{
     Engine, Result, RuntimeError, RuntimeInputs, RuntimeOutputs, SessionOptions, ort_error,
@@ -246,6 +246,15 @@ pub struct RuntimeExecutorMetrics {
     pub current_queued_tensor_bytes: usize,
     /// Maximum queued owned input tensor bytes observed by this executor.
     pub max_observed_queued_tensor_bytes: usize,
+    /// Owned input tensor bytes currently executing inside graph runtime calls.
+    pub current_active_input_tensor_bytes: usize,
+    /// Maximum active owned input tensor bytes observed by this executor.
+    pub max_observed_active_input_tensor_bytes: usize,
+    /// Owned output tensor bytes currently being materialized from active graph
+    /// runtime calls.
+    pub current_active_output_tensor_bytes: usize,
+    /// Maximum active owned output tensor bytes observed by this executor.
+    pub max_observed_active_output_tensor_bytes: usize,
     /// Current queued-memory pressure level.
     pub memory_pressure_level: RuntimeMemoryPressureLevel,
     /// Accepted requests that left queued bytes at or above the configured soft
@@ -779,7 +788,7 @@ impl RuntimeExecutorInner {
         }
     }
 
-    fn record_runtime_start(&self, batch_size: usize) {
+    fn record_runtime_start(&self, batch_size: usize, input_bytes: usize) {
         if let Ok(mut state) = self.state.lock() {
             state.metrics.active_runtime_invocations =
                 state.metrics.active_runtime_invocations.saturating_add(1);
@@ -799,17 +808,41 @@ impl RuntimeExecutorInner {
                 .metrics
                 .max_active_batch_size
                 .max(state.metrics.active_batch_size);
+            state.metrics.current_active_input_tensor_bytes = state
+                .metrics
+                .current_active_input_tensor_bytes
+                .saturating_add(input_bytes);
+            state.metrics.max_observed_active_input_tensor_bytes = state
+                .metrics
+                .max_observed_active_input_tensor_bytes
+                .max(state.metrics.current_active_input_tensor_bytes);
         }
     }
 
-    fn record_runtime_finish(&self, batch_size: usize) {
+    fn record_runtime_finish(&self, batch_size: usize, input_bytes: usize, output_bytes: usize) {
         if let Ok(mut state) = self.state.lock() {
+            state.metrics.current_active_output_tensor_bytes = state
+                .metrics
+                .current_active_output_tensor_bytes
+                .saturating_add(output_bytes);
+            state.metrics.max_observed_active_output_tensor_bytes = state
+                .metrics
+                .max_observed_active_output_tensor_bytes
+                .max(state.metrics.current_active_output_tensor_bytes);
             state.metrics.active_runtime_invocations =
                 state.metrics.active_runtime_invocations.saturating_sub(1);
             state.metrics.active_requests =
                 state.metrics.active_requests.saturating_sub(batch_size);
             state.metrics.active_batch_size =
                 state.metrics.active_batch_size.saturating_sub(batch_size);
+            state.metrics.current_active_input_tensor_bytes = state
+                .metrics
+                .current_active_input_tensor_bytes
+                .saturating_sub(input_bytes);
+            state.metrics.current_active_output_tensor_bytes = state
+                .metrics
+                .current_active_output_tensor_bytes
+                .saturating_sub(output_bytes);
         }
     }
 
@@ -1273,6 +1306,7 @@ fn prepare_queued_request(
         queued_at: queued.queued_at,
         request: queued.request,
         cancellation: queued.cancellation,
+        input_bytes: queued.input_bytes,
         sender: queued.sender,
     })
 }
@@ -1281,6 +1315,7 @@ struct PreparedRuntimeRequest {
     queued_at: Instant,
     request: RuntimeRequest,
     cancellation: RuntimeCancellationToken,
+    input_bytes: usize,
     sender: Sender<Result<RuntimeResponse>>,
 }
 
@@ -1288,14 +1323,18 @@ fn execute_prepared_single(inner: &RuntimeExecutorInner, prepared: PreparedRunti
     let started_at = Instant::now();
     let queue_time = started_at.saturating_duration_since(prepared.queued_at);
     let request_id = prepared.request.request_id;
-    inner.record_runtime_start(1);
+    let input_bytes = prepared.input_bytes;
+    inner.record_runtime_start(1, input_bytes);
     let result = inner.engine.run_with_cancellations(
         prepared.request.graph_idx,
         prepared.request.options,
         prepared.request.inputs,
         &[&prepared.cancellation],
     );
-    inner.record_runtime_finish(1);
+    let output_bytes = result.as_ref().map_or(0, |outputs| {
+        runtime_outputs_data_bytes(outputs).unwrap_or(0)
+    });
+    inner.record_runtime_finish(1, input_bytes, output_bytes);
     let finished_at = Instant::now();
     let run_time = finished_at.saturating_duration_since(started_at);
     prepared.cancellation.mark_completed();
@@ -1350,6 +1389,7 @@ fn run_prepared_batch(
     prepared: &[PreparedRuntimeRequest],
 ) -> std::result::Result<(), ()> {
     let (inputs, batch_sizes) = merge_prepared_inputs(prepared).map_err(|_| ())?;
+    let input_bytes = runtime_inputs_data_bytes(&inputs).map_err(|_| ())?;
     let graph_idx = prepared[0].request.graph_idx;
     let options = prepared[0].request.options.clone();
     let cancellations = prepared
@@ -1357,11 +1397,14 @@ fn run_prepared_batch(
         .map(|request| &request.cancellation)
         .collect::<Vec<_>>();
     let started_at = Instant::now();
-    inner.record_runtime_start(prepared.len());
+    inner.record_runtime_start(prepared.len(), input_bytes);
     let outputs = inner
         .engine
         .run_with_cancellations(graph_idx, options, inputs, &cancellations);
-    inner.record_runtime_finish(prepared.len());
+    let output_bytes = outputs.as_ref().map_or(0, |outputs| {
+        runtime_outputs_data_bytes(outputs).unwrap_or(0)
+    });
+    inner.record_runtime_finish(prepared.len(), input_bytes, output_bytes);
     let outputs = outputs.map_err(|_| ())?;
     let finished_at = Instant::now();
     let run_time = finished_at.saturating_duration_since(started_at);

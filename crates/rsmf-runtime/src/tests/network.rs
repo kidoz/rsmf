@@ -58,6 +58,10 @@ fn network_server_runs_json_inference_request() {
     assert_eq!(metrics["submitted"], 1);
     assert_eq!(metrics["completed"], 1);
     assert_eq!(metrics["runtime_invocations"], 1);
+    assert_eq!(metrics["current_active_input_tensor_bytes"], 0);
+    assert_eq!(metrics["current_active_output_tensor_bytes"], 0);
+    assert_eq!(metrics["max_observed_active_input_tensor_bytes"], 16);
+    assert_eq!(metrics["max_observed_active_output_tensor_bytes"], 8);
 
     server.shutdown().unwrap();
 }

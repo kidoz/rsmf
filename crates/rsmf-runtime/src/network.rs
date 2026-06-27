@@ -163,6 +163,15 @@ pub struct RuntimeNetworkMetrics {
     pub current_queued_tensor_bytes: usize,
     /// Maximum queued owned input tensor bytes observed by this executor.
     pub max_observed_queued_tensor_bytes: usize,
+    /// Owned input tensor bytes currently executing inside graph runtime calls.
+    pub current_active_input_tensor_bytes: usize,
+    /// Maximum active owned input tensor bytes observed by this executor.
+    pub max_observed_active_input_tensor_bytes: usize,
+    /// Owned output tensor bytes currently being materialized from active graph
+    /// runtime calls.
+    pub current_active_output_tensor_bytes: usize,
+    /// Maximum active owned output tensor bytes observed by this executor.
+    pub max_observed_active_output_tensor_bytes: usize,
     /// Current queued-memory pressure level.
     pub memory_pressure_level: RuntimeMemoryPressureLevel,
     /// Accepted requests that left queued bytes at or above the configured soft
@@ -230,6 +239,11 @@ impl From<RuntimeExecutorMetrics> for RuntimeNetworkMetrics {
             max_observed_queue_depth: metrics.max_observed_queue_depth,
             current_queued_tensor_bytes: metrics.current_queued_tensor_bytes,
             max_observed_queued_tensor_bytes: metrics.max_observed_queued_tensor_bytes,
+            current_active_input_tensor_bytes: metrics.current_active_input_tensor_bytes,
+            max_observed_active_input_tensor_bytes: metrics.max_observed_active_input_tensor_bytes,
+            current_active_output_tensor_bytes: metrics.current_active_output_tensor_bytes,
+            max_observed_active_output_tensor_bytes: metrics
+                .max_observed_active_output_tensor_bytes,
             memory_pressure_level: metrics.memory_pressure_level,
             memory_pressure_soft_events: metrics.memory_pressure_soft_events,
             memory_pressure_hard_rejections: metrics.memory_pressure_hard_rejections,

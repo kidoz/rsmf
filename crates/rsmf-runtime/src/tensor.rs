@@ -157,7 +157,14 @@ pub(crate) fn runtime_inputs_data_bytes(inputs: &RuntimeInputs) -> Result<usize>
     })
 }
 
-fn runtime_tensor_data_bytes(tensor: &RuntimeTensor) -> Result<usize> {
+pub(crate) fn runtime_outputs_data_bytes(outputs: &RuntimeOutputs) -> Result<usize> {
+    outputs.values().try_fold(0usize, |acc, tensor| {
+        acc.checked_add(runtime_tensor_data_bytes(tensor)?)
+            .ok_or_else(|| RuntimeError::Shape("runtime output byte count overflow".to_string()))
+    })
+}
+
+pub(crate) fn runtime_tensor_data_bytes(tensor: &RuntimeTensor) -> Result<usize> {
     match tensor {
         RuntimeTensor::F32 { data, .. } => runtime_tensor_data_bytes_for::<f32>(data.len()),
         RuntimeTensor::F64 { data, .. } => runtime_tensor_data_bytes_for::<f64>(data.len()),
