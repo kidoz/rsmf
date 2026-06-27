@@ -7,6 +7,7 @@
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
 use std::fmt::Debug;
+use std::sync::atomic::{AtomicU8, Ordering as AtomicOrdering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::JoinHandle;
@@ -97,6 +98,12 @@ pub enum RuntimeError {
     /// A request deadline expired before runtime dispatch.
     #[error("runtime request {request_id} deadline expired before dispatch")]
     RequestDeadlineExceeded {
+        /// Caller-provided request identifier.
+        request_id: String,
+    },
+    /// A queued request was cancelled before runtime dispatch.
+    #[error("runtime request {request_id} was cancelled before dispatch")]
+    RequestCancelled {
         /// Caller-provided request identifier.
         request_id: String,
     },
@@ -359,6 +366,12 @@ impl RuntimeRequest {
         self
     }
 
+    /// Set a timeout relative to the current instant.
+    #[must_use]
+    pub fn with_timeout(self, timeout: Duration) -> Self {
+        self.with_deadline(Instant::now() + timeout)
+    }
+
     /// Set request priority. Higher values run first.
     #[must_use]
     pub fn with_priority(mut self, priority: i32) -> Self {
@@ -404,16 +417,99 @@ pub struct RuntimeExecutorMetrics {
     pub failed: u64,
     /// Requests rejected because their deadline expired before dispatch.
     pub deadline_expired: u64,
+    /// Requests cancelled before dispatch.
+    pub cancelled: u64,
     /// Cumulative queue time for completed and failed dispatched requests.
     pub total_queue_time: Duration,
     /// Cumulative run time for completed and failed dispatched requests.
     pub total_run_time: Duration,
 }
 
+/// Result of a request cancellation attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeCancellationResult {
+    /// The request was queued and is now marked for cancellation.
+    Cancelled,
+    /// The request had already been marked for cancellation.
+    AlreadyCancelled,
+    /// The request has already started runtime execution and cannot currently
+    /// be interrupted.
+    AlreadyRunning,
+    /// The request already completed.
+    AlreadyCompleted,
+}
+
+/// Shared cancellation token for a submitted runtime request.
+#[derive(Debug, Clone)]
+pub struct RuntimeCancellationToken {
+    state: Arc<AtomicU8>,
+}
+
+impl RuntimeCancellationToken {
+    fn new() -> Self {
+        Self {
+            state: Arc::new(AtomicU8::new(REQUEST_QUEUED)),
+        }
+    }
+
+    /// Attempt to cancel the request before runtime dispatch.
+    ///
+    /// Cancellation is currently guaranteed only while the request is still
+    /// queued. Already-running ORT executions are reported as
+    /// [`RuntimeCancellationResult::AlreadyRunning`] and continue to their
+    /// normal result.
+    #[must_use]
+    pub fn cancel(&self) -> RuntimeCancellationResult {
+        match self.state.compare_exchange(
+            REQUEST_QUEUED,
+            REQUEST_CANCELLED,
+            AtomicOrdering::AcqRel,
+            AtomicOrdering::Acquire,
+        ) {
+            Ok(_) => RuntimeCancellationResult::Cancelled,
+            Err(REQUEST_CANCELLED) => RuntimeCancellationResult::AlreadyCancelled,
+            Err(REQUEST_RUNNING) => RuntimeCancellationResult::AlreadyRunning,
+            Err(REQUEST_COMPLETED) => RuntimeCancellationResult::AlreadyCompleted,
+            Err(_) => RuntimeCancellationResult::AlreadyCompleted,
+        }
+    }
+
+    /// Return `true` if the request is currently marked cancelled.
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.state.load(AtomicOrdering::Acquire) == REQUEST_CANCELLED
+    }
+
+    fn try_mark_running(&self) -> std::result::Result<(), RuntimeCancellationResult> {
+        match self.state.compare_exchange(
+            REQUEST_QUEUED,
+            REQUEST_RUNNING,
+            AtomicOrdering::AcqRel,
+            AtomicOrdering::Acquire,
+        ) {
+            Ok(_) => Ok(()),
+            Err(REQUEST_CANCELLED) => Err(RuntimeCancellationResult::AlreadyCancelled),
+            Err(REQUEST_RUNNING) => Err(RuntimeCancellationResult::AlreadyRunning),
+            Err(REQUEST_COMPLETED) => Err(RuntimeCancellationResult::AlreadyCompleted),
+            Err(_) => Err(RuntimeCancellationResult::AlreadyCompleted),
+        }
+    }
+
+    fn mark_completed(&self) {
+        self.state.store(REQUEST_COMPLETED, AtomicOrdering::Release);
+    }
+}
+
+const REQUEST_QUEUED: u8 = 0;
+const REQUEST_CANCELLED: u8 = 1;
+const REQUEST_RUNNING: u8 = 2;
+const REQUEST_COMPLETED: u8 = 3;
+
 /// Completion handle returned by [`RuntimeExecutor::submit`].
 #[derive(Debug)]
 pub struct RuntimeRequestHandle {
     request_id: String,
+    cancellation: RuntimeCancellationToken,
     receiver: Receiver<Result<RuntimeResponse>>,
 }
 
@@ -422,6 +518,18 @@ impl RuntimeRequestHandle {
     #[must_use]
     pub fn request_id(&self) -> &str {
         &self.request_id
+    }
+
+    /// Shared cancellation token for this request.
+    #[must_use]
+    pub fn cancellation_token(&self) -> RuntimeCancellationToken {
+        self.cancellation.clone()
+    }
+
+    /// Attempt to cancel this request before runtime dispatch.
+    #[must_use]
+    pub fn cancel(&self) -> RuntimeCancellationResult {
+        self.cancellation.cancel()
     }
 
     /// Wait for request completion.
@@ -892,6 +1000,7 @@ impl RuntimeExecutor {
     pub fn submit(&self, request: RuntimeRequest) -> Result<RuntimeRequestHandle> {
         let (sender, receiver) = mpsc::channel();
         let request_id = request.request_id.clone();
+        let cancellation = RuntimeCancellationToken::new();
         let mut state = self.inner.lock_state()?;
         if state.closed {
             return Err(RuntimeError::ExecutorClosed);
@@ -913,6 +1022,7 @@ impl RuntimeExecutor {
             sequence,
             queued_at: Instant::now(),
             request,
+            cancellation: cancellation.clone(),
             sender,
         });
         state.metrics.submitted = state.metrics.submitted.saturating_add(1);
@@ -921,6 +1031,7 @@ impl RuntimeExecutor {
 
         Ok(RuntimeRequestHandle {
             request_id,
+            cancellation,
             receiver,
         })
     }
@@ -1018,6 +1129,14 @@ impl RuntimeExecutorInner {
             state.metrics.total_run_time += run_time;
         }
     }
+
+    fn record_cancelled(&self, queue_time: Duration) {
+        if let Ok(mut state) = self.state.lock() {
+            state.metrics.failed = state.metrics.failed.saturating_add(1);
+            state.metrics.cancelled = state.metrics.cancelled.saturating_add(1);
+            state.metrics.total_queue_time += queue_time;
+        }
+    }
 }
 
 struct RuntimeExecutorState {
@@ -1032,6 +1151,7 @@ struct QueuedRuntimeRequest {
     sequence: u64,
     queued_at: Instant,
     request: RuntimeRequest,
+    cancellation: RuntimeCancellationToken,
     sender: Sender<Result<RuntimeResponse>>,
 }
 
@@ -1066,11 +1186,21 @@ fn worker_loop(inner: Arc<RuntimeExecutorInner>) {
 fn execute_queued_request(inner: &RuntimeExecutorInner, queued: QueuedRuntimeRequest) {
     let started_at = Instant::now();
     let queue_time = started_at.saturating_duration_since(queued.queued_at);
+    if queued.cancellation.try_mark_running().is_err() {
+        queued.cancellation.mark_completed();
+        inner.record_cancelled(queue_time);
+        let _ = queued.sender.send(Err(RuntimeError::RequestCancelled {
+            request_id: queued.request.request_id,
+        }));
+        return;
+    }
+
     if queued
         .request
         .deadline
         .is_some_and(|deadline| deadline <= started_at)
     {
+        queued.cancellation.mark_completed();
         inner.record_failed(queue_time, Duration::ZERO, true);
         let _ = queued
             .sender
@@ -1088,6 +1218,7 @@ fn execute_queued_request(inner: &RuntimeExecutorInner, queued: QueuedRuntimeReq
     );
     let finished_at = Instant::now();
     let run_time = finished_at.saturating_duration_since(started_at);
+    queued.cancellation.mark_completed();
     match result {
         Ok(outputs) => {
             inner.record_completed(queue_time, run_time);
@@ -2221,6 +2352,96 @@ mod tests {
         assert_eq!(metrics.completed, 0);
         assert_eq!(metrics.failed, 1);
         assert_eq!(metrics.deadline_expired, 1);
+        assert_eq!(metrics.cancelled, 0);
+    }
+
+    #[test]
+    fn executor_rejects_zero_timeout_before_runtime_dispatch() {
+        let dir = tempdir().unwrap();
+        let engine = add_graph_engine(dir.path().join("executor-timeout.rsmf"));
+        let executor = RuntimeExecutor::new(
+            engine,
+            RuntimeExecutorConfig {
+                worker_threads: 0,
+                queue_capacity: 4,
+            },
+        );
+        let handle = executor
+            .submit(
+                RuntimeRequest::new("timeout", 99, RuntimeInputs::new())
+                    .with_timeout(Duration::ZERO),
+            )
+            .unwrap();
+
+        assert!(executor.execute_next().unwrap());
+        let err = handle.wait().unwrap_err();
+        assert!(matches!(
+            err,
+            RuntimeError::RequestDeadlineExceeded { request_id } if request_id == "timeout"
+        ));
+        let metrics = executor.metrics().unwrap();
+        assert_eq!(metrics.submitted, 1);
+        assert_eq!(metrics.completed, 0);
+        assert_eq!(metrics.failed, 1);
+        assert_eq!(metrics.deadline_expired, 1);
+        assert_eq!(metrics.cancelled, 0);
+    }
+
+    #[test]
+    fn executor_cancels_queued_request_before_runtime_dispatch() {
+        let dir = tempdir().unwrap();
+        let engine = add_graph_engine(dir.path().join("executor-cancel.rsmf"));
+        let executor = RuntimeExecutor::new(
+            engine,
+            RuntimeExecutorConfig {
+                worker_threads: 0,
+                queue_capacity: 4,
+            },
+        );
+        let handle = executor
+            .submit(RuntimeRequest::new("cancelled", 99, RuntimeInputs::new()))
+            .unwrap();
+
+        assert_eq!(handle.cancel(), RuntimeCancellationResult::Cancelled);
+        assert_eq!(handle.cancel(), RuntimeCancellationResult::AlreadyCancelled);
+        assert!(executor.execute_next().unwrap());
+        let err = handle.wait().unwrap_err();
+        assert!(matches!(
+            err,
+            RuntimeError::RequestCancelled { request_id } if request_id == "cancelled"
+        ));
+        let metrics = executor.metrics().unwrap();
+        assert_eq!(metrics.submitted, 1);
+        assert_eq!(metrics.completed, 0);
+        assert_eq!(metrics.failed, 1);
+        assert_eq!(metrics.deadline_expired, 0);
+        assert_eq!(metrics.cancelled, 1);
+    }
+
+    #[test]
+    fn cancellation_after_completion_reports_completed() {
+        let dir = tempdir().unwrap();
+        let engine = add_graph_engine(dir.path().join("executor-completed-cancel.rsmf"));
+        let executor = RuntimeExecutor::new(
+            engine,
+            RuntimeExecutorConfig {
+                worker_threads: 0,
+                queue_capacity: 4,
+            },
+        );
+        let handle = executor.submit(add_request("done", 1.0, 10.0)).unwrap();
+        let token = handle.cancellation_token();
+
+        assert!(executor.execute_next().unwrap());
+        let response = handle.wait().unwrap();
+        assert_eq!(response.request_id, "done");
+        assert_eq!(token.cancel(), RuntimeCancellationResult::AlreadyCompleted);
+
+        let metrics = executor.metrics().unwrap();
+        assert_eq!(metrics.submitted, 1);
+        assert_eq!(metrics.completed, 1);
+        assert_eq!(metrics.failed, 0);
+        assert_eq!(metrics.cancelled, 0);
     }
 
     #[test]
@@ -2255,6 +2476,8 @@ mod tests {
         assert_eq!(metrics.submitted, 1);
         assert_eq!(metrics.completed, 0);
         assert_eq!(metrics.failed, 1);
+        assert_eq!(metrics.deadline_expired, 0);
+        assert_eq!(metrics.cancelled, 0);
     }
 
     #[test]
