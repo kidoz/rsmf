@@ -1,4 +1,25 @@
 use super::*;
+use unicode_normalization::UnicodeNormalization;
+
+/// Role/content message consumed by native decoder chat templates.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeDecoderChatMessage {
+    /// Chat role, for example `system`, `user`, or `assistant`.
+    pub role: String,
+    /// Message content.
+    pub content: String,
+}
+
+impl NativeDecoderChatMessage {
+    /// Build a chat message from a role and content string.
+    #[must_use]
+    pub fn new(role: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            role: role.into(),
+            content: content.into(),
+        }
+    }
+}
 
 /// Minimal tokenizer contract supported by the native decoder text API.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -12,20 +33,32 @@ pub struct NativeDecoderTokenizer {
     mode: NativeDecoderTokenizerMode,
     normalizer: NativeDecoderNormalizer,
     pre_tokenizer: NativeDecoderPreTokenizer,
+    post_processor: NativeDecoderPostProcessor,
     bpe_ranks: HashMap<(String, String), usize>,
     byte_fallback: bool,
+    special_tokens: Vec<String>,
+    chat_template: Option<NativeDecoderChatTemplate>,
 }
 
 impl NativeDecoderTokenizer {
-    pub(crate) fn from_json(bytes: &[u8]) -> Result<Self> {
+    /// Parse a supported Hugging Face `tokenizer.json` payload.
+    pub fn from_json(bytes: &[u8]) -> Result<Self> {
+        Self::from_json_with_assets(bytes, None, None)
+    }
+
+    pub(crate) fn from_json_with_assets(
+        bytes: &[u8],
+        tokenizer_config: Option<&[u8]>,
+        chat_template_asset: Option<&[u8]>,
+    ) -> Result<Self> {
         let raw: NativeDecoderTokenizerJson = serde_json::from_slice(bytes).map_err(|error| {
             RuntimeError::NativeDecoderTokenizerInvalid {
                 reason: error.to_string(),
             }
         })?;
-        reject_supported_tokenizer_component("post_processor", raw.post_processor.as_ref())?;
         let normalizer = NativeDecoderNormalizer::from_json(raw.normalizer.as_ref())?;
         let pre_tokenizer = NativeDecoderPreTokenizer::from_json(raw.pre_tokenizer.as_ref())?;
+        let post_processor = NativeDecoderPostProcessor::from_json(raw.post_processor.as_ref())?;
         let mode = match raw.model.tokenizer_type.as_str() {
             "WordLevel" => NativeDecoderTokenizerMode::WordLevel,
             "BPE" => NativeDecoderTokenizerMode::Bpe,
@@ -44,9 +77,16 @@ impl NativeDecoderTokenizer {
         };
         let unk_token = raw.model.unk_token;
         let mut vocab = raw.model.vocab;
+        let mut special_tokens = Vec::new();
         for added in raw.added_tokens {
+            if added.special {
+                special_tokens.push(added.content.clone());
+            }
             vocab.entry(added.content).or_insert(added.id);
         }
+        special_tokens.extend(post_processor.special_token_strings());
+        special_tokens.sort_by_key(|token| std::cmp::Reverse(token.len()));
+        special_tokens.dedup();
         if vocab.is_empty() {
             return Err(RuntimeError::NativeDecoderTokenizerInvalid {
                 reason: "tokenizer vocab must not be empty".to_string(),
@@ -75,8 +115,14 @@ impl NativeDecoderTokenizer {
             mode,
             normalizer,
             pre_tokenizer,
+            post_processor,
             bpe_ranks,
             byte_fallback: raw.model.byte_fallback,
+            special_tokens,
+            chat_template: NativeDecoderChatTemplate::from_assets(
+                tokenizer_config,
+                chat_template_asset,
+            )?,
         })
     }
 
@@ -87,15 +133,61 @@ impl NativeDecoderTokenizer {
     /// exact special-token lookup. Unsupported tokenizer components fail at
     /// load time with typed errors.
     pub fn encode(&self, text: &str) -> Result<Vec<i64>> {
+        let model_token_ids = self.encode_without_post_processor(text)?;
+        self.post_processor.apply_single(model_token_ids)
+    }
+
+    /// Encode a pair of text sequences and apply a pair post-processor when
+    /// the tokenizer defines one.
+    pub fn encode_pair(&self, first: &str, second: &str) -> Result<Vec<i64>> {
+        let first_ids = self.encode_without_post_processor(first)?;
+        let second_ids = self.encode_without_post_processor(second)?;
+        self.post_processor.apply_pair(first_ids, second_ids)
+    }
+
+    /// Render the configured chat template to prompt text.
+    pub fn apply_chat_template(
+        &self,
+        messages: &[NativeDecoderChatMessage],
+        add_generation_prompt: bool,
+    ) -> Result<String> {
+        let Some(template) = &self.chat_template else {
+            return Err(RuntimeError::NativeDecoderTokenizerInvalid {
+                reason: "tokenizer has no supported chat template".to_string(),
+            });
+        };
+        template.render(messages, add_generation_prompt)
+    }
+
+    /// Render and encode chat messages with the configured chat template.
+    pub fn encode_chat(
+        &self,
+        messages: &[NativeDecoderChatMessage],
+        add_generation_prompt: bool,
+    ) -> Result<Vec<i64>> {
+        let prompt = self.apply_chat_template(messages, add_generation_prompt)?;
+        self.encode(&prompt)
+    }
+
+    fn encode_without_post_processor(&self, text: &str) -> Result<Vec<i64>> {
         let normalized = self.normalizer.normalize(text);
         let mut token_ids = Vec::new();
-        for token in self.pre_tokenizer.pieces(&normalized) {
-            match self.mode {
-                NativeDecoderTokenizerMode::WordLevel => {
+        for segment in isolate_special_token_segments(&normalized, &self.special_tokens) {
+            match segment {
+                NativeDecoderTokenSegment::Special(token) => {
                     token_ids.push(self.lookup_token_id(&token)?);
                 }
-                NativeDecoderTokenizerMode::Bpe => {
-                    token_ids.extend(self.encode_bpe_piece(&token)?);
+                NativeDecoderTokenSegment::Text(text) => {
+                    for token in self.pre_tokenizer.pieces(&text) {
+                        match self.mode {
+                            NativeDecoderTokenizerMode::WordLevel => {
+                                token_ids.push(self.lookup_token_id(&token)?);
+                            }
+                            NativeDecoderTokenizerMode::Bpe => {
+                                token_ids.extend(self.encode_bpe_piece(&token)?);
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -215,6 +307,10 @@ pub(crate) enum NativeDecoderTokenizerMode {
 pub(crate) enum NativeDecoderNormalizer {
     None,
     Lowercase,
+    Nfc,
+    Nfd,
+    Nfkc,
+    Nfkd,
     Sequence(Vec<NativeDecoderNormalizer>),
 }
 
@@ -233,6 +329,10 @@ impl NativeDecoderNormalizer {
         };
         match kind {
             "Lowercase" => Ok(Self::Lowercase),
+            "NFC" => Ok(Self::Nfc),
+            "NFD" => Ok(Self::Nfd),
+            "NFKC" => Ok(Self::Nfkc),
+            "NFKD" => Ok(Self::Nfkd),
             "Sequence" => {
                 let normalizers = value
                     .get("normalizers")
@@ -255,11 +355,102 @@ impl NativeDecoderNormalizer {
         match self {
             Self::None => text.to_string(),
             Self::Lowercase => text.to_lowercase(),
+            Self::Nfc => text.nfc().collect(),
+            Self::Nfd => text.nfd().collect(),
+            Self::Nfkc => text.nfkc().collect(),
+            Self::Nfkd => text.nfkd().collect(),
             Self::Sequence(normalizers) => normalizers
                 .iter()
                 .fold(text.to_string(), |text, next| next.normalize(&text)),
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum NativeDecoderPostProcessor {
+    None,
+    TemplateProcessing {
+        single: Vec<NativeDecoderTemplatePiece>,
+        pair: Vec<NativeDecoderTemplatePiece>,
+    },
+}
+
+impl NativeDecoderPostProcessor {
+    pub(crate) fn from_json(value: Option<&serde_json::Value>) -> Result<Self> {
+        let Some(value) = value else {
+            return Ok(Self::None);
+        };
+        if value.is_null() {
+            return Ok(Self::None);
+        }
+        let Some(kind) = value.get("type").and_then(serde_json::Value::as_str) else {
+            return Err(RuntimeError::NativeDecoderTokenizerInvalid {
+                reason: "post_processor.type is required when post_processor is present"
+                    .to_string(),
+            });
+        };
+        match kind {
+            "RobertaProcessing" => Err(RuntimeError::NativeDecoderTokenizerInvalid {
+                reason: "unsupported post_processor RobertaProcessing; use TemplateProcessing"
+                    .to_string(),
+            }),
+            "TemplateProcessing" => {
+                let special_tokens =
+                    template_special_tokens_from_json(value.get("special_tokens"))?;
+                Ok(Self::TemplateProcessing {
+                    single: template_pieces_from_json(
+                        value.get("single"),
+                        "single",
+                        &special_tokens,
+                    )?,
+                    pair: template_pieces_from_json(value.get("pair"), "pair", &special_tokens)?,
+                })
+            }
+            other => Err(RuntimeError::NativeDecoderTokenizerInvalid {
+                reason: format!("unsupported post_processor {other}"),
+            }),
+        }
+    }
+
+    pub(crate) fn apply_single(&self, ids: Vec<i64>) -> Result<Vec<i64>> {
+        match self {
+            Self::None => Ok(ids),
+            Self::TemplateProcessing { single, .. } => apply_template_pieces(single, &ids, &[]),
+        }
+    }
+
+    pub(crate) fn apply_pair(&self, first: Vec<i64>, second: Vec<i64>) -> Result<Vec<i64>> {
+        match self {
+            Self::None => {
+                let mut ids = first;
+                ids.extend(second);
+                Ok(ids)
+            }
+            Self::TemplateProcessing { pair, .. } => apply_template_pieces(pair, &first, &second),
+        }
+    }
+
+    pub(crate) fn special_token_strings(&self) -> Vec<String> {
+        match self {
+            Self::None => Vec::new(),
+            Self::TemplateProcessing { single, pair } => single
+                .iter()
+                .chain(pair.iter())
+                .filter_map(|piece| match piece {
+                    NativeDecoderTemplatePiece::SpecialToken { token, .. } => Some(token.clone()),
+                    NativeDecoderTemplatePiece::SequenceA
+                    | NativeDecoderTemplatePiece::SequenceB => None,
+                })
+                .collect(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum NativeDecoderTemplatePiece {
+    SequenceA,
+    SequenceB,
+    SpecialToken { token: String, ids: Vec<i64> },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -344,6 +535,8 @@ pub(crate) struct NativeDecoderTokenizerModelJson {
 pub(crate) struct NativeDecoderAddedTokenJson {
     id: i64,
     content: String,
+    #[serde(default)]
+    special: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -353,16 +546,488 @@ pub(crate) enum NativeDecoderBpeMergeJson {
     Pair([String; 2]),
 }
 
-pub(crate) fn reject_supported_tokenizer_component(
-    name: &str,
+pub(crate) fn template_pieces_from_json(
     value: Option<&serde_json::Value>,
-) -> Result<()> {
-    if value.is_some_and(|value| !value.is_null()) {
+    field_name: &str,
+    special_tokens: &HashMap<String, Vec<i64>>,
+) -> Result<Vec<NativeDecoderTemplatePiece>> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    let Some(items) = value.as_array() else {
         return Err(RuntimeError::NativeDecoderTokenizerInvalid {
-            reason: format!("{name} is not supported by the native tokenizer yet"),
+            reason: format!("TemplateProcessing.{field_name} must be an array"),
+        });
+    };
+    items
+        .iter()
+        .map(|item| template_piece_from_json(item, special_tokens))
+        .collect::<Result<Vec<_>>>()
+}
+
+pub(crate) fn template_special_tokens_from_json(
+    value: Option<&serde_json::Value>,
+) -> Result<HashMap<String, Vec<i64>>> {
+    let Some(value) = value else {
+        return Ok(HashMap::new());
+    };
+    let Some(entries) = value.as_object() else {
+        return Err(RuntimeError::NativeDecoderTokenizerInvalid {
+            reason: "TemplateProcessing.special_tokens must be an object".to_string(),
+        });
+    };
+    let mut special_tokens = HashMap::with_capacity(entries.len());
+    for (token, entry) in entries {
+        let ids = entry
+            .get("ids")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| RuntimeError::NativeDecoderTokenizerInvalid {
+                reason: format!("TemplateProcessing special token {token} requires ids"),
+            })?
+            .iter()
+            .map(|id| {
+                id.as_i64()
+                    .ok_or_else(|| RuntimeError::NativeDecoderTokenizerInvalid {
+                        reason: format!(
+                            "TemplateProcessing special token {token} ids must be integers"
+                        ),
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if ids.is_empty() {
+            return Err(RuntimeError::NativeDecoderTokenizerInvalid {
+                reason: format!("TemplateProcessing special token {token} ids must not be empty"),
+            });
+        }
+        special_tokens.insert(token.clone(), ids);
+    }
+    Ok(special_tokens)
+}
+
+pub(crate) fn template_piece_from_json(
+    value: &serde_json::Value,
+    special_tokens: &HashMap<String, Vec<i64>>,
+) -> Result<NativeDecoderTemplatePiece> {
+    if let Some(sequence) = value.get("Sequence") {
+        let id = sequence
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("A");
+        return match id {
+            "A" => Ok(NativeDecoderTemplatePiece::SequenceA),
+            "B" => Ok(NativeDecoderTemplatePiece::SequenceB),
+            other => Err(RuntimeError::NativeDecoderTokenizerInvalid {
+                reason: format!("unsupported TemplateProcessing sequence id {other}"),
+            }),
+        };
+    }
+    if let Some(special) = value.get("SpecialToken") {
+        let token = special
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| RuntimeError::NativeDecoderTokenizerInvalid {
+                reason: "TemplateProcessing SpecialToken requires string id".to_string(),
+            })?
+            .to_string();
+        let ids = special
+            .get("ids")
+            .and_then(serde_json::Value::as_array)
+            .map(|ids| {
+                ids.iter()
+                    .map(|id| {
+                        id.as_i64()
+                            .ok_or_else(|| RuntimeError::NativeDecoderTokenizerInvalid {
+                                reason: format!(
+                                    "TemplateProcessing SpecialToken {token} ids must be integers"
+                                ),
+                            })
+                    })
+                    .collect::<Result<Vec<_>>>()
+            })
+            .transpose()?
+            .or_else(|| special_tokens.get(&token).cloned())
+            .unwrap_or_default();
+        if ids.is_empty() {
+            return Err(RuntimeError::NativeDecoderTokenizerInvalid {
+                reason: format!("TemplateProcessing SpecialToken {token} requires ids"),
+            });
+        }
+        return Ok(NativeDecoderTemplatePiece::SpecialToken { token, ids });
+    }
+    Err(RuntimeError::NativeDecoderTokenizerInvalid {
+        reason: "unsupported TemplateProcessing piece".to_string(),
+    })
+}
+
+pub(crate) fn apply_template_pieces(
+    pieces: &[NativeDecoderTemplatePiece],
+    first: &[i64],
+    second: &[i64],
+) -> Result<Vec<i64>> {
+    if pieces.is_empty() {
+        let mut ids = first.to_vec();
+        ids.extend_from_slice(second);
+        return Ok(ids);
+    }
+    let mut output = Vec::new();
+    for piece in pieces {
+        match piece {
+            NativeDecoderTemplatePiece::SequenceA => output.extend_from_slice(first),
+            NativeDecoderTemplatePiece::SequenceB => output.extend_from_slice(second),
+            NativeDecoderTemplatePiece::SpecialToken { ids, .. } => output.extend_from_slice(ids),
+        }
+    }
+    Ok(output)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum NativeDecoderTokenSegment {
+    Text(String),
+    Special(String),
+}
+
+pub(crate) fn isolate_special_token_segments(
+    text: &str,
+    special_tokens: &[String],
+) -> Vec<NativeDecoderTokenSegment> {
+    if special_tokens.is_empty() {
+        return vec![NativeDecoderTokenSegment::Text(text.to_string())];
+    }
+    let mut segments = Vec::new();
+    let mut rest = text;
+    while !rest.is_empty() {
+        let next = special_tokens
+            .iter()
+            .filter_map(|token| rest.find(token).map(|index| (index, token)))
+            .min_by_key(|(index, token)| (*index, std::cmp::Reverse(token.len())));
+        let Some((index, token)) = next else {
+            segments.push(NativeDecoderTokenSegment::Text(rest.to_string()));
+            break;
+        };
+        if index > 0 {
+            segments.push(NativeDecoderTokenSegment::Text(rest[..index].to_string()));
+        }
+        segments.push(NativeDecoderTokenSegment::Special(token.clone()));
+        rest = &rest[index + token.len()..];
+    }
+    segments
+        .into_iter()
+        .filter(|segment| match segment {
+            NativeDecoderTokenSegment::Text(text) => !text.is_empty(),
+            NativeDecoderTokenSegment::Special(_) => true,
+        })
+        .collect()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NativeDecoderChatTemplate {
+    template: String,
+}
+
+impl NativeDecoderChatTemplate {
+    pub(crate) fn from_assets(
+        tokenizer_config: Option<&[u8]>,
+        chat_template_asset: Option<&[u8]>,
+    ) -> Result<Option<Self>> {
+        let template = if let Some(bytes) = chat_template_asset {
+            Some(chat_template_from_asset(bytes)?)
+        } else if let Some(bytes) = tokenizer_config {
+            chat_template_from_tokenizer_config(bytes)?
+        } else {
+            None
+        };
+        Ok(template.map(|template| Self { template }))
+    }
+
+    pub(crate) fn render(
+        &self,
+        messages: &[NativeDecoderChatMessage],
+        add_generation_prompt: bool,
+    ) -> Result<String> {
+        if messages.is_empty() {
+            return Err(RuntimeError::NativeDecoderTokenizerInvalid {
+                reason: "chat template requires at least one message".to_string(),
+            });
+        }
+        render_chat_template(&self.template, messages, add_generation_prompt)
+    }
+}
+
+pub(crate) fn chat_template_from_tokenizer_config(bytes: &[u8]) -> Result<Option<String>> {
+    let value: serde_json::Value = serde_json::from_slice(bytes).map_err(|error| {
+        RuntimeError::NativeDecoderTokenizerInvalid {
+            reason: format!("tokenizer_config.json is not valid JSON: {error}"),
+        }
+    })?;
+    let Some(template) = value.get("chat_template") else {
+        return Ok(None);
+    };
+    let Some(template) = template.as_str() else {
+        return Err(RuntimeError::NativeDecoderTokenizerInvalid {
+            reason: "tokenizer_config.json chat_template must be a string".to_string(),
+        });
+    };
+    Ok(Some(template.to_string()))
+}
+
+pub(crate) fn chat_template_from_asset(bytes: &[u8]) -> Result<String> {
+    let text = std::str::from_utf8(bytes).map_err(|error| {
+        RuntimeError::NativeDecoderTokenizerInvalid {
+            reason: format!("chat_template.json is not UTF-8: {error}"),
+        }
+    })?;
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(text) {
+        if let Some(template) = value.as_str() {
+            return Ok(template.to_string());
+        }
+        if let Some(template) = value
+            .get("chat_template")
+            .and_then(serde_json::Value::as_str)
+        {
+            return Ok(template.to_string());
+        }
+        return Err(RuntimeError::NativeDecoderTokenizerInvalid {
+            reason: "chat_template.json must be a JSON string or object with chat_template"
+                .to_string(),
         });
     }
-    Ok(())
+    Ok(text.to_string())
+}
+
+pub(crate) fn render_chat_template(
+    template: &str,
+    messages: &[NativeDecoderChatMessage],
+    add_generation_prompt: bool,
+) -> Result<String> {
+    let Some((before, for_body, after)) = split_jinja_for_messages(template)? else {
+        return render_chat_template_segment(template, None, add_generation_prompt);
+    };
+    let mut rendered = render_chat_template_segment(before, None, add_generation_prompt)?;
+    for message in messages {
+        rendered.push_str(&render_chat_template_segment(
+            for_body,
+            Some(message),
+            add_generation_prompt,
+        )?);
+    }
+    rendered.push_str(&render_chat_template_segment(
+        after,
+        None,
+        add_generation_prompt,
+    )?);
+    Ok(rendered)
+}
+
+pub(crate) fn split_jinja_for_messages(template: &str) -> Result<Option<(&str, &str, &str)>> {
+    let Some((for_start, for_end, for_tag)) = find_jinja_tag(template, 0, "for") else {
+        return Ok(None);
+    };
+    if for_tag != "for message in messages" {
+        return Err(RuntimeError::NativeDecoderTokenizerInvalid {
+            reason: format!("unsupported chat template for block {for_tag:?}"),
+        });
+    }
+    let Some((end_start, end_end, end_tag)) = find_jinja_tag(template, for_end, "endfor") else {
+        return Err(RuntimeError::NativeDecoderTokenizerInvalid {
+            reason: "chat template for block is missing endfor".to_string(),
+        });
+    };
+    if end_tag != "endfor" {
+        return Err(RuntimeError::NativeDecoderTokenizerInvalid {
+            reason: format!("unsupported chat template end block {end_tag:?}"),
+        });
+    }
+    Ok(Some((
+        &template[..for_start],
+        &template[for_end..end_start],
+        &template[end_end..],
+    )))
+}
+
+pub(crate) fn render_chat_template_segment(
+    segment: &str,
+    message: Option<&NativeDecoderChatMessage>,
+    add_generation_prompt: bool,
+) -> Result<String> {
+    let mut rendered = String::new();
+    let mut rest = segment;
+    while let Some(index) = rest.find('{') {
+        rendered.push_str(&rest[..index]);
+        rest = &rest[index..];
+        if rest.starts_with("{{") {
+            let end =
+                rest.find("}}")
+                    .ok_or_else(|| RuntimeError::NativeDecoderTokenizerInvalid {
+                        reason: "chat template expression is missing }}".to_string(),
+                    })?;
+            let expression = rest[2..end].trim().trim_matches('-').trim();
+            rendered.push_str(&eval_chat_expression(expression, message)?);
+            rest = &rest[end + 2..];
+        } else if rest.starts_with("{%") {
+            let end =
+                rest.find("%}")
+                    .ok_or_else(|| RuntimeError::NativeDecoderTokenizerInvalid {
+                        reason: "chat template block is missing %}".to_string(),
+                    })?;
+            let tag = rest[2..end].trim().trim_matches('-').trim();
+            if tag == "if add_generation_prompt" {
+                let body_start = end + 2;
+                let Some((endif_start, endif_end, endif_tag)) =
+                    find_jinja_tag(rest, body_start, "endif")
+                else {
+                    return Err(RuntimeError::NativeDecoderTokenizerInvalid {
+                        reason: "chat template if block is missing endif".to_string(),
+                    });
+                };
+                if endif_tag != "endif" {
+                    return Err(RuntimeError::NativeDecoderTokenizerInvalid {
+                        reason: format!("unsupported chat template if end block {endif_tag:?}"),
+                    });
+                }
+                if add_generation_prompt {
+                    rendered.push_str(&render_chat_template_segment(
+                        &rest[body_start..endif_start],
+                        message,
+                        add_generation_prompt,
+                    )?);
+                }
+                rest = &rest[endif_end..];
+            } else {
+                return Err(RuntimeError::NativeDecoderTokenizerInvalid {
+                    reason: format!("unsupported chat template block {tag:?}"),
+                });
+            }
+        } else {
+            rendered.push('{');
+            rest = &rest[1..];
+        }
+    }
+    rendered.push_str(rest);
+    Ok(rendered)
+}
+
+pub(crate) fn find_jinja_tag<'a>(
+    template: &'a str,
+    start: usize,
+    expected_prefix: &str,
+) -> Option<(usize, usize, &'a str)> {
+    let mut search_start = start;
+    while let Some(relative_start) = template[search_start..].find("{%") {
+        let tag_start = search_start + relative_start;
+        let tag_body_start = tag_start + 2;
+        let relative_end = template[tag_body_start..].find("%}")?;
+        let tag_end = tag_body_start + relative_end + 2;
+        let tag = template[tag_body_start..tag_body_start + relative_end]
+            .trim()
+            .trim_matches('-')
+            .trim();
+        if tag.starts_with(expected_prefix) {
+            return Some((tag_start, tag_end, tag));
+        }
+        search_start = tag_end;
+    }
+    None
+}
+
+pub(crate) fn eval_chat_expression(
+    expression: &str,
+    message: Option<&NativeDecoderChatMessage>,
+) -> Result<String> {
+    let mut output = String::new();
+    for part in split_chat_concat(expression) {
+        output.push_str(&eval_chat_expression_part(part.trim(), message)?);
+    }
+    Ok(output)
+}
+
+pub(crate) fn split_chat_concat(expression: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut start = 0usize;
+    let mut quote = None;
+    let mut escape = false;
+    for (index, ch) in expression.char_indices() {
+        if escape {
+            escape = false;
+            continue;
+        }
+        if ch == '\\' {
+            escape = true;
+            continue;
+        }
+        if let Some(active_quote) = quote {
+            if ch == active_quote {
+                quote = None;
+            }
+            continue;
+        }
+        if ch == '\'' || ch == '"' {
+            quote = Some(ch);
+        } else if ch == '+' {
+            parts.push(&expression[start..index]);
+            start = index + ch.len_utf8();
+        }
+    }
+    parts.push(&expression[start..]);
+    parts
+}
+
+pub(crate) fn eval_chat_expression_part(
+    part: &str,
+    message: Option<&NativeDecoderChatMessage>,
+) -> Result<String> {
+    if (part.starts_with('\'') && part.ends_with('\''))
+        || (part.starts_with('"') && part.ends_with('"'))
+    {
+        return Ok(unescape_chat_literal(&part[1..part.len() - 1]));
+    }
+    if matches!(
+        part,
+        "message['role']" | "message[\"role\"]" | "message.role"
+    ) {
+        return message.map(|message| message.role.clone()).ok_or_else(|| {
+            RuntimeError::NativeDecoderTokenizerInvalid {
+                reason: "chat template message role used outside message loop".to_string(),
+            }
+        });
+    }
+    if matches!(
+        part,
+        "message['content']" | "message[\"content\"]" | "message.content"
+    ) {
+        return message
+            .map(|message| message.content.clone())
+            .ok_or_else(|| RuntimeError::NativeDecoderTokenizerInvalid {
+                reason: "chat template message content used outside message loop".to_string(),
+            });
+    }
+    Err(RuntimeError::NativeDecoderTokenizerInvalid {
+        reason: format!("unsupported chat template expression part {part:?}"),
+    })
+}
+
+pub(crate) fn unescape_chat_literal(literal: &str) -> String {
+    let mut output = String::new();
+    let mut chars = literal.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            output.push(ch);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => output.push('\n'),
+            Some('r') => output.push('\r'),
+            Some('t') => output.push('\t'),
+            Some('\\') => output.push('\\'),
+            Some('\'') => output.push('\''),
+            Some('"') => output.push('"'),
+            Some(other) => {
+                output.push('\\');
+                output.push(other);
+            }
+            None => output.push('\\'),
+        }
+    }
+    output
 }
 
 pub(crate) fn bpe_ranks_from_merges(

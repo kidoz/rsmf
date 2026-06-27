@@ -14,12 +14,13 @@ use rsmf_core::{LogicalDtype, RsmfError, RsmfFile, StorageDtype, TensorView};
 use crate::allocator_stats::provider_allocator_stats;
 use crate::executor::RuntimeCancellationToken;
 use crate::native_decoder::{
-    NATIVE_DECODER_TOKENIZER_ASSET, NativeDecoderContract, NativeDecoderGenerateOutput,
-    NativeDecoderReferenceLogitCheck, NativeDecoderReferenceLogitReport, NativeDecoderRunOptions,
-    NativeDecoderSession, NativeDecoderTextGenerateOutput, NativeDecoderTokenizer,
-    NativeDecoderWeightOptions, NativeDecoderWeights, load_native_decoder_weights,
-    native_decoder_check_reference_logits, native_decoder_generate_with_backend,
-    resolve_native_decoder_backend,
+    NATIVE_DECODER_CHAT_TEMPLATE_ASSET, NATIVE_DECODER_TOKENIZER_ASSET,
+    NATIVE_DECODER_TOKENIZER_CONFIG_ASSET, NativeDecoderChatMessage, NativeDecoderContract,
+    NativeDecoderGenerateOutput, NativeDecoderReferenceLogitCheck,
+    NativeDecoderReferenceLogitReport, NativeDecoderRunOptions, NativeDecoderSession,
+    NativeDecoderTextGenerateOutput, NativeDecoderTokenizer, NativeDecoderWeightOptions,
+    NativeDecoderWeights, load_native_decoder_weights, native_decoder_check_reference_logits,
+    native_decoder_generate_with_backend, resolve_native_decoder_backend,
 };
 use crate::onnx::{OnnxTensorDataType, onnx_initializers};
 use crate::session::{
@@ -234,8 +235,8 @@ impl Engine {
 
     /// Load the native decoder tokenizer from `tokenizer.json`.
     ///
-    /// R4.7 supports simple `WordLevel` tokenizer JSON assets with a `vocab`
-    /// map and optional `unk_token`.
+    /// Optional `tokenizer_config.json` and `chat_template.json` assets attach a
+    /// supported chat template when present.
     pub fn native_decoder_tokenizer(&self) -> Result<NativeDecoderTokenizer> {
         let tokenizer_asset = self
             .file
@@ -243,7 +244,19 @@ impl Engine {
             .ok_or_else(|| RuntimeError::NativeDecoderAssetMissing {
                 asset_name: NATIVE_DECODER_TOKENIZER_ASSET.to_string(),
             })?;
-        NativeDecoderTokenizer::from_json(tokenizer_asset.bytes)
+        let tokenizer_config = self
+            .file
+            .asset(NATIVE_DECODER_TOKENIZER_CONFIG_ASSET)
+            .map(|asset| asset.bytes);
+        let chat_template = self
+            .file
+            .asset(NATIVE_DECODER_CHAT_TEMPLATE_ASSET)
+            .map(|asset| asset.bytes);
+        NativeDecoderTokenizer::from_json_with_assets(
+            tokenizer_asset.bytes,
+            tokenizer_config,
+            chat_template,
+        )
     }
 
     /// Run native decoder token-id generation.
@@ -275,6 +288,18 @@ impl Engine {
         let weight_options = options.weight_options.clone();
         self.native_decoder_session_with_options(&weight_options)?
             .generate_text(prompt, options)
+    }
+
+    /// Generate text from role/content chat messages using the tokenizer's
+    /// supported chat template.
+    pub fn native_decoder_generate_chat(
+        &self,
+        messages: &[NativeDecoderChatMessage],
+        options: NativeDecoderRunOptions,
+    ) -> Result<NativeDecoderTextGenerateOutput> {
+        let weight_options = options.weight_options.clone();
+        self.native_decoder_session_with_options(&weight_options)?
+            .generate_chat(messages, options)
     }
 
     /// Compare native decoder logits against a caller-supplied reference.

@@ -298,6 +298,7 @@ fn native_decoder_tokenizer_applies_sequence_normalizer() {
             "normalizer": {
                 "type": "Sequence",
                 "normalizers": [
+                    { "type": "NFKC" },
                     { "type": "Lowercase" }
                 ]
             },
@@ -311,14 +312,32 @@ fn native_decoder_tokenizer_applies_sequence_normalizer() {
     )
     .unwrap();
 
-    assert_eq!(tokenizer.encode("HELLO").unwrap(), vec![0]);
+    assert_eq!(tokenizer.encode("ＨＥＬＬＯ").unwrap(), vec![0]);
+}
+
+#[test]
+fn native_decoder_tokenizer_applies_nfc_normalizer() {
+    let tokenizer = NativeDecoderTokenizer::from_json(
+        serde_json::json!({
+            "normalizer": { "type": "NFC" },
+            "model": {
+                "type": "WordLevel",
+                "vocab": { "é": 0 }
+            }
+        })
+        .to_string()
+        .as_bytes(),
+    )
+    .unwrap();
+
+    assert_eq!(tokenizer.encode("e\u{301}").unwrap(), vec![0]);
 }
 
 #[test]
 fn native_decoder_tokenizer_rejects_unsupported_normalizer() {
     let err = NativeDecoderTokenizer::from_json(
         serde_json::json!({
-            "normalizer": { "type": "NFC" },
+            "normalizer": { "type": "StripAccents" },
             "model": {
                 "type": "BPE",
                 "vocab": { "hello": 0 },
@@ -332,6 +351,120 @@ fn native_decoder_tokenizer_rejects_unsupported_normalizer() {
 
     assert!(
         matches!(err, RuntimeError::NativeDecoderTokenizerInvalid { reason } if reason.contains("unsupported normalizer"))
+    );
+}
+
+#[test]
+fn native_decoder_tokenizer_applies_template_processing() {
+    let tokenizer = NativeDecoderTokenizer::from_json(
+        serde_json::json!({
+            "model": {
+                "type": "WordLevel",
+                "vocab": {
+                    "<s>": 1,
+                    "</s>": 2,
+                    "hello": 3,
+                    "world": 4,
+                    "<sep>": 5
+                }
+            },
+            "post_processor": {
+                "type": "TemplateProcessing",
+                "single": [
+                    { "SpecialToken": { "id": "<s>", "type_id": 0 } },
+                    { "Sequence": { "id": "A", "type_id": 0 } },
+                    { "SpecialToken": { "id": "</s>", "type_id": 0 } }
+                ],
+                "pair": [
+                    { "Sequence": { "id": "A", "type_id": 0 } },
+                    { "SpecialToken": { "id": "<sep>", "type_id": 0 } },
+                    { "Sequence": { "id": "B", "type_id": 1 } },
+                    { "SpecialToken": { "id": "</s>", "type_id": 1 } }
+                ],
+                "special_tokens": {
+                    "<s>": { "id": "<s>", "ids": [1], "tokens": ["<s>"] },
+                    "</s>": { "id": "</s>", "ids": [2], "tokens": ["</s>"] },
+                    "<sep>": { "id": "<sep>", "ids": [5], "tokens": ["<sep>"] }
+                }
+            }
+        })
+        .to_string()
+        .as_bytes(),
+    )
+    .unwrap();
+
+    assert_eq!(tokenizer.encode("hello").unwrap(), vec![1, 3, 2]);
+    assert_eq!(
+        tokenizer.encode_pair("hello", "world").unwrap(),
+        vec![3, 5, 4, 2]
+    );
+}
+
+#[test]
+fn native_decoder_tokenizer_isolates_adjacent_special_tokens() {
+    let tokenizer = NativeDecoderTokenizer::from_json(
+        serde_json::json!({
+            "model": {
+                "type": "BPE",
+                "vocab": {
+                    "<s>": 0,
+                    "hello": 1
+                },
+                "merges": []
+            },
+            "added_tokens": [
+                { "id": 0, "content": "<s>", "special": true }
+            ]
+        })
+        .to_string()
+        .as_bytes(),
+    )
+    .unwrap();
+
+    assert_eq!(tokenizer.encode("<s>hello").unwrap(), vec![0, 1]);
+}
+
+#[test]
+fn native_decoder_tokenizer_renders_chat_template_from_tokenizer_config() {
+    let template = concat!(
+        "{% for message in messages %}",
+        "{{ '<|' + message['role'] + '|> ' + message['content'] + '\\n' }}",
+        "{% endfor %}",
+        "{% if add_generation_prompt %}",
+        "{{ '<|assistant|> ' }}",
+        "{% endif %}"
+    );
+    let tokenizer_config = serde_json::json!({ "chat_template": template }).to_string();
+    let tokenizer = NativeDecoderTokenizer::from_json_with_assets(
+        serde_json::json!({
+            "model": {
+                "type": "WordLevel",
+                "vocab": {
+                    "<|user|>": 0,
+                    "hello": 1,
+                    "<|assistant|>": 2
+                }
+            },
+            "added_tokens": [
+                { "id": 0, "content": "<|user|>", "special": true },
+                { "id": 2, "content": "<|assistant|>", "special": true }
+            ]
+        })
+        .to_string()
+        .as_bytes(),
+        Some(tokenizer_config.as_bytes()),
+        None,
+    )
+    .unwrap();
+
+    let messages = vec![NativeDecoderChatMessage::new("user", "hello")];
+    assert_eq!(
+        tokenizer.apply_chat_template(&messages, true).unwrap(),
+        "<|user|> hello\n<|assistant|> "
+    );
+    assert_eq!(
+        tokenizer.encode_chat(&messages, true).unwrap(),
+        vec![0, 1, 2]
     );
 }
 

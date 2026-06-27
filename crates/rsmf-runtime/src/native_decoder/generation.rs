@@ -86,6 +86,17 @@ impl NativeDecoderSession {
         })
     }
 
+    /// Generate text from role/content chat messages without reloading weights
+    /// or tokenizer from the RSMF file.
+    pub fn generate_chat(
+        &self,
+        messages: &[NativeDecoderChatMessage],
+        options: NativeDecoderRunOptions,
+    ) -> Result<NativeDecoderTextGenerateOutput> {
+        let prompt = self.tokenizer.apply_chat_template(messages, true)?;
+        self.generate_text(&prompt, options)
+    }
+
     /// Compare logits against a supplied reference without reloading weights.
     pub fn check_reference_logits(
         &self,

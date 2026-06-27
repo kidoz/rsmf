@@ -5,6 +5,12 @@ pub const NATIVE_DECODER_CONFIG_ASSET: &str = "config.json";
 /// Canonical RSMF asset name for the tokenizer payload used by native decoders.
 pub const NATIVE_DECODER_TOKENIZER_ASSET: &str = "tokenizer.json";
 
+/// Optional RSMF asset name for Hugging Face tokenizer configuration.
+pub const NATIVE_DECODER_TOKENIZER_CONFIG_ASSET: &str = "tokenizer_config.json";
+
+/// Optional RSMF asset name for a standalone chat template payload.
+pub const NATIVE_DECODER_CHAT_TEMPLATE_ASSET: &str = "chat_template.json";
+
 /// Optional RSMF asset name for generation defaults.
 pub const NATIVE_DECODER_GENERATION_CONFIG_ASSET: &str = "generation_config.json";
 

@@ -17,8 +17,9 @@ mod tokenizer;
 mod weights;
 
 pub use contract::{
-    NATIVE_DECODER_CONFIG_ASSET, NATIVE_DECODER_GENERATION_CONFIG_ASSET,
-    NATIVE_DECODER_TOKENIZER_ASSET, NativeDecoderAssets, NativeDecoderConfig,
+    NATIVE_DECODER_CHAT_TEMPLATE_ASSET, NATIVE_DECODER_CONFIG_ASSET,
+    NATIVE_DECODER_GENERATION_CONFIG_ASSET, NATIVE_DECODER_TOKENIZER_ASSET,
+    NATIVE_DECODER_TOKENIZER_CONFIG_ASSET, NativeDecoderAssets, NativeDecoderConfig,
     NativeDecoderContract, NativeDecoderFamily, NativeDecoderTensorBinding,
 };
 pub use generation::{
@@ -37,7 +38,7 @@ pub use options::{
     NativeDecoderReferenceLogitReport, NativeDecoderRunOptions, NativeDecoderSamplingOptions,
     NativeDecoderWeightOptions,
 };
-pub use tokenizer::NativeDecoderTokenizer;
+pub use tokenizer::{NativeDecoderChatMessage, NativeDecoderTokenizer};
 pub use weights::{NativeDecoderLayerWeights, NativeDecoderWeights};
 
 pub(crate) use backends::*;
