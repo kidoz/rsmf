@@ -573,22 +573,7 @@ impl Engine {
                 reason: error,
             }
         })?;
-        let data = view
-            .to_vec::<f32>()
-            .map_err(|error| RuntimeError::UnsupportedInitializer {
-                initializer_name: binding.initializer_name.clone(),
-                tensor_name: binding.tensor_name.clone(),
-                reason: error.to_string(),
-            })?;
-        let materialized_bytes = data
-            .len()
-            .checked_mul(std::mem::size_of::<f32>())
-            .ok_or_else(|| RuntimeError::UnsupportedInitializer {
-                initializer_name: binding.initializer_name.clone(),
-                tensor_name: binding.tensor_name.clone(),
-                reason: "initializer materialized byte count overflow".to_string(),
-            })?;
-        let value = tensor_from_vec(shape, data).map(Arc::new)?;
+        let (value, materialized_bytes) = initializer_tensor_from_view(binding, &view, shape)?;
         Ok(InitializerValue {
             value,
             memory_report: InitializerMemoryReport {
@@ -624,20 +609,6 @@ impl Engine {
                     reason: "initializer is not declared by the ONNX graph".to_string(),
                 });
             };
-            if info.data_type != Some(OnnxTensorDataType::Float) {
-                return Err(RuntimeError::UnsupportedInitializer {
-                    initializer_name: binding.initializer_name.clone(),
-                    tensor_name: binding.tensor_name.clone(),
-                    reason: format!(
-                        "ONNX initializer dtype is {}, but only Float/F32 is supported",
-                        info.data_type.map_or_else(
-                            || "missing".to_string(),
-                            |data_type| data_type.name().to_string()
-                        )
-                    ),
-                });
-            }
-
             let view =
                 self.file
                     .tensor_view(&binding.tensor_name)
@@ -649,6 +620,27 @@ impl Engine {
                         other => RuntimeError::Core(other),
                     })?;
             validate_initializer_view(binding, &view)?;
+            let expected_data_type = OnnxTensorDataType::from_logical_dtype(view.dtype())
+                .ok_or_else(|| RuntimeError::UnsupportedInitializer {
+                    initializer_name: binding.initializer_name.clone(),
+                    tensor_name: binding.tensor_name.clone(),
+                    reason: format!("unsupported RSMF initializer dtype {:?}", view.dtype()),
+                })?;
+            if info.data_type != Some(expected_data_type) {
+                return Err(RuntimeError::UnsupportedInitializer {
+                    initializer_name: binding.initializer_name.clone(),
+                    tensor_name: binding.tensor_name.clone(),
+                    reason: format!(
+                        "ONNX initializer dtype is {}, but RSMF tensor dtype is {}",
+                        info.data_type.map_or_else(
+                            || "missing".to_string(),
+                            |data_type| data_type.name().to_string()
+                        ),
+                        expected_data_type.name()
+                    ),
+                });
+            }
+
             let actual_shape = shape_u64_to_i64(view.shape()).map_err(|reason| {
                 RuntimeError::UnsupportedInitializer {
                     initializer_name: binding.initializer_name.clone(),
@@ -770,11 +762,8 @@ fn shape_u64_to_i64(shape: &[u64]) -> std::result::Result<Vec<i64>, String> {
 }
 
 fn validate_initializer_view(binding: &InitializerBinding, view: &TensorView<'_>) -> Result<()> {
-    let reason = if view.dtype() != LogicalDtype::F32 {
-        Some(format!(
-            "only F32 initializers are supported, got {:?}",
-            view.dtype()
-        ))
+    let reason = if !is_supported_initializer_dtype(view.dtype()) {
+        Some(format!("unsupported initializer dtype {:?}", view.dtype()))
     } else if view.encoding != EncodingKind::Raw {
         Some(format!(
             "only raw canonical initializers are supported, got {:?}",
@@ -785,10 +774,11 @@ fn validate_initializer_view(binding: &InitializerBinding, view: &TensorView<'_>
             "only row-major initializers are supported, got {:?}",
             view.layout
         ))
-    } else if view.storage_dtype != StorageDtype::Logical(LogicalDtype::F32) {
+    } else if view.storage_dtype != StorageDtype::Logical(view.dtype()) {
         Some(format!(
-            "only logical F32 storage is supported, got {:?}",
-            view.storage_dtype
+            "initializer storage {:?} does not match logical dtype {:?}",
+            view.storage_dtype,
+            view.dtype()
         ))
     } else {
         None
@@ -805,6 +795,105 @@ fn validate_initializer_view(binding: &InitializerBinding, view: &TensorView<'_>
     }
 }
 
+fn is_supported_initializer_dtype(dtype: LogicalDtype) -> bool {
+    matches!(
+        dtype,
+        LogicalDtype::F32
+            | LogicalDtype::F64
+            | LogicalDtype::I64
+            | LogicalDtype::I32
+            | LogicalDtype::U8
+            | LogicalDtype::I8
+            | LogicalDtype::Bool
+    )
+}
+
+fn initializer_tensor_from_view(
+    binding: &InitializerBinding,
+    view: &TensorView<'_>,
+    shape: Vec<usize>,
+) -> Result<(Arc<DynValue>, usize)> {
+    match view.dtype() {
+        LogicalDtype::F32 => initializer_tensor_from_vec(
+            binding,
+            &shape,
+            view.to_vec::<f32>()
+                .map_err(|source| unsupported_initializer(binding, source.to_string()))?,
+        ),
+        LogicalDtype::F64 => initializer_tensor_from_vec(
+            binding,
+            &shape,
+            view.to_vec::<f64>()
+                .map_err(|source| unsupported_initializer(binding, source.to_string()))?,
+        ),
+        LogicalDtype::I64 => initializer_tensor_from_vec(
+            binding,
+            &shape,
+            view.to_vec::<i64>()
+                .map_err(|source| unsupported_initializer(binding, source.to_string()))?,
+        ),
+        LogicalDtype::I32 => initializer_tensor_from_vec(
+            binding,
+            &shape,
+            view.to_vec::<i32>()
+                .map_err(|source| unsupported_initializer(binding, source.to_string()))?,
+        ),
+        LogicalDtype::U8 => initializer_tensor_from_vec(
+            binding,
+            &shape,
+            view.to_vec::<u8>()
+                .map_err(|source| unsupported_initializer(binding, source.to_string()))?,
+        ),
+        LogicalDtype::I8 => initializer_tensor_from_vec(
+            binding,
+            &shape,
+            view.to_vec::<i8>()
+                .map_err(|source| unsupported_initializer(binding, source.to_string()))?,
+        ),
+        LogicalDtype::Bool => {
+            let data = view
+                .bytes()
+                .iter()
+                .map(|&byte| byte != 0)
+                .collect::<Vec<_>>();
+            initializer_tensor_from_vec(binding, &shape, data)
+        }
+        other => Err(RuntimeError::UnsupportedInitializer {
+            initializer_name: binding.initializer_name.clone(),
+            tensor_name: binding.tensor_name.clone(),
+            reason: format!("unsupported initializer dtype {other:?}"),
+        }),
+    }
+}
+
+fn unsupported_initializer(binding: &InitializerBinding, reason: String) -> RuntimeError {
+    RuntimeError::UnsupportedInitializer {
+        initializer_name: binding.initializer_name.clone(),
+        tensor_name: binding.tensor_name.clone(),
+        reason,
+    }
+}
+
+fn initializer_tensor_from_vec<T>(
+    binding: &InitializerBinding,
+    shape: &[usize],
+    data: Vec<T>,
+) -> Result<(Arc<DynValue>, usize)>
+where
+    T: ort::value::PrimitiveTensorElementType + Clone + Debug + 'static,
+{
+    let materialized_bytes = data
+        .len()
+        .checked_mul(std::mem::size_of::<T>())
+        .ok_or_else(|| RuntimeError::UnsupportedInitializer {
+            initializer_name: binding.initializer_name.clone(),
+            tensor_name: binding.tensor_name.clone(),
+            reason: "initializer materialized byte count overflow".to_string(),
+        })?;
+    let value = tensor_from_vec(shape.to_vec(), data).map(Arc::new)?;
+    Ok((value, materialized_bytes))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct OnnxInitializerInfo {
     data_type: Option<OnnxTensorDataType>,
@@ -814,6 +903,12 @@ struct OnnxInitializerInfo {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OnnxTensorDataType {
     Float,
+    Uint8,
+    Int8,
+    Int32,
+    Int64,
+    Bool,
+    Double,
     Other(i32),
 }
 
@@ -821,22 +916,41 @@ impl OnnxTensorDataType {
     fn from_raw(raw: i32) -> Self {
         match raw {
             1 => Self::Float,
+            2 => Self::Uint8,
+            3 => Self::Int8,
+            6 => Self::Int32,
+            7 => Self::Int64,
+            9 => Self::Bool,
+            11 => Self::Double,
             other => Self::Other(other),
+        }
+    }
+
+    fn from_logical_dtype(dtype: LogicalDtype) -> Option<Self> {
+        match dtype {
+            LogicalDtype::F32 => Some(Self::Float),
+            LogicalDtype::F64 => Some(Self::Double),
+            LogicalDtype::I64 => Some(Self::Int64),
+            LogicalDtype::I32 => Some(Self::Int32),
+            LogicalDtype::U8 => Some(Self::Uint8),
+            LogicalDtype::I8 => Some(Self::Int8),
+            LogicalDtype::Bool => Some(Self::Bool),
+            _ => None,
         }
     }
 
     fn name(self) -> &'static str {
         match self {
             Self::Float => "Float/F32",
-            Self::Other(2) => "Uint8",
-            Self::Other(3) => "Int8",
+            Self::Uint8 => "Uint8",
+            Self::Int8 => "Int8",
+            Self::Int32 => "Int32",
+            Self::Int64 => "Int64",
+            Self::Bool => "Bool",
+            Self::Double => "Double/F64",
             Self::Other(4) => "Uint16",
             Self::Other(5) => "Int16",
-            Self::Other(6) => "Int32",
-            Self::Other(7) => "Int64",
-            Self::Other(9) => "Bool",
             Self::Other(10) => "Float16",
-            Self::Other(11) => "Double/F64",
             Self::Other(16) => "BFloat16",
             Self::Other(_) => "unknown",
         }
@@ -1313,6 +1427,58 @@ mod tests {
     }
 
     #[test]
+    fn runs_onnx_graph_with_i64_rsmf_external_initializer() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("add-i64-initializer.onnx.rsmf");
+        let graph = tiny_add_external_initializer_onnx_model_with_dtype_shape(7, &[2]);
+        RsmfWriter::new()
+            .with_tensor(TensorInput {
+                name: "bias.tensor".to_string(),
+                dtype: LogicalDtype::I64,
+                shape: vec![2],
+                shard_id: 0,
+                metadata: Vec::new(),
+                canonical: VariantInput::canonical_raw(i64_bytes(&[10, -4])),
+                packed: Vec::new(),
+            })
+            .with_graph(GraphInput::onnx(graph.clone()))
+            .write_to_path(&path)
+            .unwrap();
+
+        let engine = Engine::new(RsmfFile::open(path).unwrap()).unwrap();
+        let options = SessionOptions {
+            initializers: vec![InitializerBinding::new("bias", "bias.tensor")],
+            ..SessionOptions::default()
+        };
+        let handle = engine.session_handle(0, options.clone()).unwrap();
+        assert_eq!(handle.memory_report().graph_payload_bytes, graph.len());
+        assert_eq!(handle.memory_report().initializer_count(), 1);
+        assert_eq!(handle.memory_report().initializer_materialized_bytes, 16);
+
+        let outputs = engine
+            .run(
+                0,
+                options,
+                HashMap::from([(
+                    "x".to_string(),
+                    RuntimeTensor::I64 {
+                        shape: vec![2],
+                        data: vec![2, 9],
+                    },
+                )]),
+            )
+            .unwrap();
+
+        assert_eq!(
+            outputs.get("z"),
+            Some(&RuntimeTensor::I64 {
+                shape: vec![2],
+                data: vec![12, 5],
+            })
+        );
+    }
+
+    #[test]
     fn missing_initializer_tensor_is_typed_error() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("missing-initializer.rsmf");
@@ -1466,8 +1632,8 @@ mod tests {
         push_message(&mut graph, 1, add_initializer_node());
         push_string(&mut graph, 2, "rsmf_add_initializer_graph");
         push_message(&mut graph, 5, external_tensor("bias", data_type, shape));
-        push_message(&mut graph, 11, value_info("x", &[2]));
-        push_message(&mut graph, 12, value_info("z", &[2]));
+        push_message(&mut graph, 11, value_info_typed("x", &[2], data_type));
+        push_message(&mut graph, 12, value_info_typed("z", &[2], data_type));
         graph
     }
 
@@ -1517,16 +1683,27 @@ mod tests {
             .collect()
     }
 
+    fn i64_bytes(values: &[i64]) -> Vec<u8> {
+        values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect()
+    }
+
     fn value_info(name: &str, shape: &[i64]) -> Vec<u8> {
+        value_info_typed(name, shape, 1)
+    }
+
+    fn value_info_typed(name: &str, shape: &[i64], data_type: i32) -> Vec<u8> {
         let mut value = Vec::new();
         push_string(&mut value, 1, name);
-        push_message(&mut value, 2, type_proto_f32(shape));
+        push_message(&mut value, 2, type_proto(data_type, shape));
         value
     }
 
-    fn type_proto_f32(shape: &[i64]) -> Vec<u8> {
+    fn type_proto(data_type: i32, shape: &[i64]) -> Vec<u8> {
         let mut tensor = Vec::new();
-        push_i32(&mut tensor, 1, 1);
+        push_i32(&mut tensor, 1, data_type);
         push_message(&mut tensor, 2, tensor_shape(shape));
 
         let mut type_proto = Vec::new();
