@@ -2,11 +2,94 @@ use ort::session::builder::GraphOptimizationLevel as OrtGraphOptimizationLevel;
 use ort::value::Outlet;
 use serde::{Deserialize, Serialize};
 
+/// One raw ORT allocator statistic key/value entry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeAllocatorStat {
+    /// ORT statistic key.
+    pub key: String,
+    /// ORT statistic value as returned by the provider.
+    pub value: String,
+}
+
+/// ORT allocator statistics with parsed common counters.
+///
+/// ORT providers may return an empty key/value map for allocators that do not
+/// expose internal statistics. Raw entries are preserved so callers can inspect
+/// provider-specific counters without the runtime guessing their semantics.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum RuntimeAllocatorStats {
+    /// ORT returned allocator statistics.
+    Available {
+        /// Total bytes allocated over the allocator lifetime, when ORT reports
+        /// `TotalAllocated`.
+        total_allocated_bytes: Option<usize>,
+        /// Maximum bytes in use at one time, when ORT reports `MaxInUse`.
+        max_in_use_bytes: Option<usize>,
+        /// Largest single allocation size, when ORT reports `MaxAllocSize`.
+        max_alloc_size_bytes: Option<usize>,
+        /// Number of allocation calls, when ORT reports `NumAllocs`.
+        allocation_count: Option<usize>,
+        /// Number of reserve calls, when ORT reports `NumReserves`.
+        reserve_count: Option<usize>,
+        /// Raw provider key/value entries copied from ORT.
+        raw_entries: Vec<RuntimeAllocatorStat>,
+    },
+    /// The runtime could not obtain allocator statistics for this session.
+    Unavailable {
+        /// Human-readable reason.
+        reason: String,
+    },
+}
+
+impl RuntimeAllocatorStats {
+    /// Build an explicit unavailable allocator-stat report.
+    #[must_use]
+    pub fn unavailable(reason: impl Into<String>) -> Self {
+        Self::Unavailable {
+            reason: reason.into(),
+        }
+    }
+
+    /// Build allocator stats from raw ORT key/value entries.
+    #[must_use]
+    pub fn from_entries(raw_entries: Vec<RuntimeAllocatorStat>) -> Self {
+        if raw_entries.is_empty() {
+            return Self::unavailable("ORT allocator returned no stats entries");
+        }
+        let parsed = |name: &str| -> Option<usize> {
+            raw_entries
+                .iter()
+                .find(|entry| entry.key == name)
+                .and_then(|entry| entry.value.parse::<usize>().ok())
+        };
+        Self::Available {
+            total_allocated_bytes: parsed("TotalAllocated"),
+            max_in_use_bytes: parsed("MaxInUse"),
+            max_alloc_size_bytes: parsed("MaxAllocSize"),
+            allocation_count: parsed("NumAllocs"),
+            reserve_count: parsed("NumReserves"),
+            raw_entries,
+        }
+    }
+
+    /// Return ORT's `MaxInUse` byte counter when present.
+    #[must_use]
+    pub fn max_in_use_bytes(&self) -> Option<usize> {
+        match self {
+            Self::Available {
+                max_in_use_bytes, ..
+            } => *max_in_use_bytes,
+            Self::Unavailable { .. } => None,
+        }
+    }
+}
+
 /// Byte-valued runtime memory measurement.
 ///
 /// Some memory sources, such as ORT provider allocator statistics, depend on
-/// upstream runtime APIs that may not be exposed safely by the pinned backend.
-/// Those fields are reported as explicitly unavailable instead of inferred.
+/// backend-specific runtime counters. Those fields are reported as explicitly
+/// unavailable instead of inferred when the active backend returns no counter.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum RuntimeMemoryMeasurement {
@@ -287,8 +370,12 @@ pub struct SessionMemoryReport {
     pub initializer_source_bytes: usize,
     /// Total initializer bytes kept in borrowed zero-copy residency.
     pub initializer_zero_copy_bytes: usize,
-    /// ORT provider allocator memory accounting, if exposed safely.
+    /// ORT provider allocator memory accounting, if the active allocator
+    /// reports ORT's `MaxInUse` byte counter.
     pub provider_allocator_bytes: RuntimeMemoryMeasurement,
+    /// Raw and parsed ORT provider allocator statistics, if the active
+    /// allocator reports them.
+    pub provider_allocator_stats: RuntimeAllocatorStats,
     /// Process resident set size observed after session construction, if
     /// supported on this target.
     pub process_resident_set_bytes: RuntimeMemoryMeasurement,
@@ -307,13 +394,23 @@ impl SessionMemoryReport {
 pub(crate) fn runtime_capability_report() -> RuntimeCapabilityReport {
     RuntimeCapabilityReport {
         ort_cpu_io_binding: RuntimeCapability::Available,
-        ort_provider_allocator_stats: RuntimeCapability::unavailable(
-            "the pinned safe ort crate does not expose provider allocator byte counters",
-        ),
+        ort_provider_allocator_stats: provider_allocator_stats_capability(),
         mmap_initializer_zero_copy: RuntimeCapability::unavailable(
             "ONNX external initializer binding currently requires an ORT-owned value; borrowed RSMF mmap initializer lifetimes are not exposed safely",
         ),
     }
+}
+
+#[cfg(feature = "ort-api-23-allocator-stats")]
+fn provider_allocator_stats_capability() -> RuntimeCapability {
+    RuntimeCapability::Available
+}
+
+#[cfg(not(feature = "ort-api-23-allocator-stats"))]
+fn provider_allocator_stats_capability() -> RuntimeCapability {
+    RuntimeCapability::unavailable(
+        "rsmf-runtime was built without the ort-api-23-allocator-stats feature",
+    )
 }
 
 pub(crate) fn current_process_resident_set_bytes() -> RuntimeMemoryMeasurement {

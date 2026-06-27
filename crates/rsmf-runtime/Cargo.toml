@@ -19,8 +19,12 @@ ndarray = "0.17"
 tracing = { workspace = true, optional = true }
 
 [features]
-default = ["tracing"]
+default = ["tracing", "ort-api-23-allocator-stats"]
 tracing = ["rsmf-core/tracing", "dep:tracing"]
+# Enables the ORT C API allocator statistics probe used by session memory
+# reports. The workspace's pinned `ort` default features already expose API 24;
+# this feature keeps the runtime contract explicit if ORT defaults are changed.
+ort-api-23-allocator-stats = ["ort/api-23"]
 # macOS-only native decoder backend using Accelerate / vecLib BLAS for f32
 # linear projections. Non-macOS builds compile the feature but fall back to the
 # CPU reference backend.

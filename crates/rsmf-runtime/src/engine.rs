@@ -11,6 +11,7 @@ use rsmf_core::manifest::GraphKind;
 use rsmf_core::tensor::variant::{EncodingKind, LayoutTag};
 use rsmf_core::{LogicalDtype, RsmfError, RsmfFile, StorageDtype, TensorView};
 
+use crate::allocator_stats::provider_allocator_stats;
 use crate::executor::RuntimeCancellationToken;
 use crate::native_decoder::{
     NATIVE_DECODER_TOKENIZER_ASSET, NativeDecoderContract, NativeDecoderGenerateOutput,
@@ -484,21 +485,29 @@ impl Engine {
                     RuntimeError::Shape("initializer zero-copy byte count overflow".to_string())
                 })
             })?;
+        let session = builder
+            .commit_from_memory(payload.bytes)
+            .map_err(|e| ort_error("session creation", e))?;
+        let provider_allocator_stats = provider_allocator_stats(session.allocator());
+        let provider_allocator_bytes = provider_allocator_stats.max_in_use_bytes().map_or_else(
+            || {
+                RuntimeMemoryMeasurement::unavailable(
+                    "ORT allocator did not report a MaxInUse byte counter",
+                )
+            },
+            RuntimeMemoryMeasurement::available,
+        );
         let memory_report = SessionMemoryReport {
             graph_payload_bytes: payload.bytes.len(),
             initializer_materialized_bytes,
             initializer_source_bytes,
             initializer_zero_copy_bytes,
             initializers: initializer_reports,
-            provider_allocator_bytes: RuntimeMemoryMeasurement::unavailable(
-                "the pinned safe ort crate does not expose provider allocator byte counters",
-            ),
+            provider_allocator_bytes,
+            provider_allocator_stats,
             process_resident_set_bytes: current_process_resident_set_bytes(),
             io_binding: options.io_binding,
         };
-        let session = builder
-            .commit_from_memory(payload.bytes)
-            .map_err(|e| ort_error("session creation", e))?;
         Ok(BuiltSession {
             session,
             memory_report,

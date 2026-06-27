@@ -104,12 +104,16 @@ fn runs_embedded_onnx_add_graph_from_rsmf() {
         RuntimeMemoryMeasurement::Unavailable { .. }
     ));
     assert!(matches!(
+        &handle.memory_report().provider_allocator_stats,
+        RuntimeAllocatorStats::Available { .. } | RuntimeAllocatorStats::Unavailable { .. }
+    ));
+    assert!(matches!(
         handle.capability_report().ort_cpu_io_binding,
         RuntimeCapability::Available
     ));
     assert!(matches!(
         handle.capability_report().ort_provider_allocator_stats,
-        RuntimeCapability::Unavailable { .. }
+        RuntimeCapability::Available
     ));
     assert!(matches!(
         handle.capability_report().mmap_initializer_zero_copy,
@@ -147,6 +151,45 @@ fn runs_embedded_onnx_add_graph_from_rsmf() {
     let z = outputs.get("z").unwrap();
     assert_eq!(z.shape(), &[2]);
     assert_eq!(z.iter().copied().collect::<Vec<_>>(), vec![4.0, 1.0]);
+}
+
+#[test]
+fn runtime_allocator_stats_parse_common_ort_counters() {
+    let stats = RuntimeAllocatorStats::from_entries(vec![
+        RuntimeAllocatorStat {
+            key: "TotalAllocated".to_string(),
+            value: "4096".to_string(),
+        },
+        RuntimeAllocatorStat {
+            key: "MaxInUse".to_string(),
+            value: "2048".to_string(),
+        },
+        RuntimeAllocatorStat {
+            key: "MaxAllocSize".to_string(),
+            value: "1024".to_string(),
+        },
+        RuntimeAllocatorStat {
+            key: "NumAllocs".to_string(),
+            value: "7".to_string(),
+        },
+        RuntimeAllocatorStat {
+            key: "NumReserves".to_string(),
+            value: "2".to_string(),
+        },
+    ]);
+
+    assert_eq!(stats.max_in_use_bytes(), Some(2048));
+    assert!(matches!(
+        stats,
+        RuntimeAllocatorStats::Available {
+            total_allocated_bytes: Some(4096),
+            max_in_use_bytes: Some(2048),
+            max_alloc_size_bytes: Some(1024),
+            allocation_count: Some(7),
+            reserve_count: Some(2),
+            ..
+        }
+    ));
 }
 
 #[test]
