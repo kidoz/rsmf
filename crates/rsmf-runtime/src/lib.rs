@@ -499,6 +499,17 @@ pub struct RuntimeExecutorMetrics {
     pub batched_requests: u64,
     /// Attempted batches that fell back to individual request execution.
     pub batch_fallbacks: u64,
+    /// Dynamic scheduler flushes because a batch reached configured capacity.
+    pub batch_flushes_full: u64,
+    /// Dynamic scheduler flushes because the max queue delay elapsed.
+    pub batch_flushes_delay: u64,
+    /// Dynamic scheduler flushes because queued input bytes reached the
+    /// configured admission pressure point.
+    pub batch_flushes_memory_pressure: u64,
+    /// Dynamic scheduler flushes triggered by manual [`RuntimeExecutor::execute_next`].
+    pub batch_flushes_manual: u64,
+    /// Dynamic scheduler flushes triggered while closing the executor.
+    pub batch_flushes_shutdown: u64,
     /// Cumulative queue time for completed and failed dispatched requests.
     pub total_queue_time: Duration,
     /// Cumulative run time for completed and failed dispatched requests.
@@ -1315,9 +1326,10 @@ impl RuntimeExecutorInner {
 
     fn pop_ready_batch(&self) -> Result<Option<Vec<QueuedRuntimeRequest>>> {
         let mut state = self.lock_state()?;
-        Ok(pop_batch_from_state(
+        Ok(pop_ready_batch_from_state(
             &mut state,
             self.dynamic_batching.as_ref(),
+            &self.admission,
         ))
     }
 
@@ -1325,12 +1337,10 @@ impl RuntimeExecutorInner {
         let mut state = self.state.lock().ok()?;
         loop {
             if let Some(queued) = state.pop_queued() {
-                if self.dynamic_batching.is_some() {
-                    state = wait_for_batch_window(self, state);
-                }
-                let mut batch = vec![queued];
-                extend_batch_from_state(&mut state, self.dynamic_batching.as_ref(), &mut batch);
-                return Some(batch);
+                let Some(config) = &self.dynamic_batching else {
+                    return Some(vec![queued]);
+                };
+                return collect_blocking_dynamic_batch(self, state, config, vec![queued]);
             }
             if state.closed {
                 return None;
@@ -1469,6 +1479,39 @@ impl RuntimeExecutorState {
             .saturating_sub(queued.input_bytes);
         Some(queued)
     }
+
+    fn record_batch_flush(&mut self, reason: BatchFlushReason) {
+        match reason {
+            BatchFlushReason::Full => {
+                self.metrics.batch_flushes_full = self.metrics.batch_flushes_full.saturating_add(1);
+            }
+            BatchFlushReason::Delay => {
+                self.metrics.batch_flushes_delay =
+                    self.metrics.batch_flushes_delay.saturating_add(1);
+            }
+            BatchFlushReason::MemoryPressure => {
+                self.metrics.batch_flushes_memory_pressure =
+                    self.metrics.batch_flushes_memory_pressure.saturating_add(1);
+            }
+            BatchFlushReason::Manual => {
+                self.metrics.batch_flushes_manual =
+                    self.metrics.batch_flushes_manual.saturating_add(1);
+            }
+            BatchFlushReason::Shutdown => {
+                self.metrics.batch_flushes_shutdown =
+                    self.metrics.batch_flushes_shutdown.saturating_add(1);
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BatchFlushReason {
+    Full,
+    Delay,
+    MemoryPressure,
+    Manual,
+    Shutdown,
 }
 
 struct QueuedRuntimeRequest {
@@ -1509,14 +1552,108 @@ fn worker_loop(inner: Arc<RuntimeExecutorInner>) {
     }
 }
 
-fn pop_batch_from_state(
+fn pop_ready_batch_from_state(
     state: &mut RuntimeExecutorState,
     config: Option<&DynamicBatchingConfig>,
+    admission: &RuntimeAdmissionConfig,
 ) -> Option<Vec<QueuedRuntimeRequest>> {
     let queued = state.pop_queued()?;
     let mut batch = vec![queued];
-    extend_batch_from_state(state, config, &mut batch);
+    if let Some(config) = config {
+        extend_batch_from_state(state, Some(config), &mut batch);
+        let reason =
+            dynamic_batch_flush_reason(state, &batch, config, admission, BatchFlushReason::Manual);
+        state.record_batch_flush(reason);
+    }
     Some(batch)
+}
+
+fn collect_blocking_dynamic_batch(
+    inner: &RuntimeExecutorInner,
+    mut state: MutexGuard<'_, RuntimeExecutorState>,
+    config: &DynamicBatchingConfig,
+    mut batch: Vec<QueuedRuntimeRequest>,
+) -> Option<Vec<QueuedRuntimeRequest>> {
+    let opened_at = Instant::now();
+    loop {
+        extend_batch_from_state(&mut state, Some(config), &mut batch);
+        if batch.len() >= config.max_batch_size {
+            state.record_batch_flush(BatchFlushReason::Full);
+            return Some(batch);
+        }
+        if dynamic_batch_memory_pressure(&state, &batch, &inner.admission) {
+            state.record_batch_flush(BatchFlushReason::MemoryPressure);
+            return Some(batch);
+        }
+        if state.closed {
+            state.record_batch_flush(BatchFlushReason::Shutdown);
+            return Some(batch);
+        }
+        if config.max_queue_delay.is_zero() {
+            state.record_batch_flush(BatchFlushReason::Delay);
+            return Some(batch);
+        }
+        let elapsed = opened_at.elapsed();
+        if elapsed >= config.max_queue_delay {
+            state.record_batch_flush(BatchFlushReason::Delay);
+            return Some(batch);
+        }
+        let wait_for = config.max_queue_delay - elapsed;
+        let (next_state, timed_out) = match inner.available.wait_timeout(state, wait_for) {
+            Ok((state, timeout)) => (state, timeout.timed_out()),
+            Err(poisoned) => {
+                let (state, timeout) = poisoned.into_inner();
+                (state, timeout.timed_out())
+            }
+        };
+        state = next_state;
+        if timed_out {
+            extend_batch_from_state(&mut state, Some(config), &mut batch);
+            let reason = dynamic_batch_flush_reason(
+                &state,
+                &batch,
+                config,
+                &inner.admission,
+                BatchFlushReason::Delay,
+            );
+            state.record_batch_flush(reason);
+            return Some(batch);
+        }
+    }
+}
+
+fn dynamic_batch_flush_reason(
+    state: &RuntimeExecutorState,
+    batch: &[QueuedRuntimeRequest],
+    config: &DynamicBatchingConfig,
+    admission: &RuntimeAdmissionConfig,
+    default_reason: BatchFlushReason,
+) -> BatchFlushReason {
+    if batch.len() >= config.max_batch_size {
+        BatchFlushReason::Full
+    } else if dynamic_batch_memory_pressure(state, batch, admission) {
+        BatchFlushReason::MemoryPressure
+    } else {
+        default_reason
+    }
+}
+
+fn dynamic_batch_memory_pressure(
+    state: &RuntimeExecutorState,
+    batch: &[QueuedRuntimeRequest],
+    admission: &RuntimeAdmissionConfig,
+) -> bool {
+    let Some(capacity_bytes) = admission.max_queued_tensor_bytes else {
+        return false;
+    };
+    let batch_bytes = batch.iter().fold(0usize, |total, queued| {
+        total.saturating_add(queued.input_bytes)
+    });
+    state
+        .metrics
+        .current_queued_tensor_bytes
+        .saturating_add(batch_bytes)
+        >= capacity_bytes
 }
 
 fn extend_batch_from_state(
@@ -1545,22 +1682,6 @@ fn extend_batch_from_state(
     for skipped in skipped {
         state.push_queued(skipped);
     }
-}
-
-fn wait_for_batch_window<'a>(
-    inner: &RuntimeExecutorInner,
-    state: MutexGuard<'a, RuntimeExecutorState>,
-) -> MutexGuard<'a, RuntimeExecutorState> {
-    let Some(config) = &inner.dynamic_batching else {
-        return state;
-    };
-    if config.max_batch_size <= 1 || config.max_queue_delay.is_zero() {
-        return state;
-    }
-    inner
-        .available
-        .wait_timeout(state, config.max_queue_delay)
-        .map_or_else(|poisoned| poisoned.into_inner().0, |(state, _)| state)
 }
 
 fn execute_queued_batch(inner: &RuntimeExecutorInner, batch: Vec<QueuedRuntimeRequest>) {
@@ -3490,6 +3611,11 @@ mod tests {
         assert_eq!(metrics.batches_executed, 1);
         assert_eq!(metrics.batched_requests, 2);
         assert_eq!(metrics.batch_fallbacks, 0);
+        assert_eq!(metrics.batch_flushes_full, 0);
+        assert_eq!(metrics.batch_flushes_delay, 0);
+        assert_eq!(metrics.batch_flushes_memory_pressure, 0);
+        assert_eq!(metrics.batch_flushes_manual, 1);
+        assert_eq!(metrics.batch_flushes_shutdown, 0);
         assert_eq!(metrics.active_requests, 0);
         assert_eq!(metrics.active_runtime_invocations, 0);
         assert_eq!(metrics.active_batch_size, 0);
@@ -3543,6 +3669,170 @@ mod tests {
         assert_eq!(metrics.batches_executed, 0);
         assert_eq!(metrics.batched_requests, 0);
         assert_eq!(metrics.batch_fallbacks, 0);
+    }
+
+    #[test]
+    fn executor_reports_full_batch_flush_reason() {
+        let dir = tempdir().unwrap();
+        let engine = dynamic_add_graph_engine(dir.path().join("executor-full-batch.rsmf"));
+        let executor = RuntimeExecutor::new(
+            engine,
+            RuntimeExecutorConfig {
+                worker_threads: 0,
+                queue_capacity: 8,
+                dynamic_batching: Some(DynamicBatchingConfig {
+                    max_batch_size: 2,
+                    max_queue_delay: Duration::from_secs(1),
+                }),
+                admission: RuntimeAdmissionConfig::default(),
+            },
+        );
+
+        let first = executor
+            .submit(dynamic_add_request("first", &[1.0, 2.0], &[10.0, 20.0]))
+            .unwrap();
+        let second = executor
+            .submit(dynamic_add_request("second", &[3.0, 4.0], &[30.0, 40.0]))
+            .unwrap();
+
+        assert!(executor.execute_next().unwrap());
+        assert_eq!(f32_output(&first.wait().unwrap(), "z"), vec![11.0, 22.0]);
+        assert_eq!(f32_output(&second.wait().unwrap(), "z"), vec![33.0, 44.0]);
+
+        let metrics = executor.metrics().unwrap();
+        assert_eq!(metrics.runtime_invocations, 1);
+        assert_eq!(metrics.batches_executed, 1);
+        assert_eq!(metrics.batch_flushes_full, 1);
+        assert_eq!(metrics.batch_flushes_delay, 0);
+        assert_eq!(metrics.batch_flushes_memory_pressure, 0);
+        assert_eq!(metrics.batch_flushes_manual, 0);
+        assert_eq!(metrics.batch_flushes_shutdown, 0);
+    }
+
+    #[test]
+    fn background_scheduler_collects_compatible_arrivals_until_delay() {
+        let dir = tempdir().unwrap();
+        let engine = dynamic_add_graph_engine(dir.path().join("executor-delay-batch.rsmf"));
+        let executor = RuntimeExecutor::new(
+            engine,
+            RuntimeExecutorConfig {
+                worker_threads: 1,
+                queue_capacity: 8,
+                dynamic_batching: Some(DynamicBatchingConfig {
+                    max_batch_size: 4,
+                    max_queue_delay: Duration::from_millis(100),
+                }),
+                admission: RuntimeAdmissionConfig::default(),
+            },
+        );
+
+        let first = executor
+            .submit(dynamic_add_request("first", &[1.0, 2.0], &[10.0, 20.0]))
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(matches!(
+            first.receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        let second = executor
+            .submit(dynamic_add_request("second", &[3.0, 4.0], &[30.0, 40.0]))
+            .unwrap();
+
+        let first_response = first.wait().unwrap();
+        let second_response = second.wait().unwrap();
+        assert_eq!(f32_output(&first_response, "z"), vec![11.0, 22.0]);
+        assert_eq!(f32_output(&second_response, "z"), vec![33.0, 44.0]);
+
+        let metrics = executor.metrics().unwrap();
+        assert_eq!(metrics.completed, 2);
+        assert_eq!(metrics.runtime_invocations, 1);
+        assert_eq!(metrics.batches_executed, 1);
+        assert_eq!(metrics.batched_requests, 2);
+        assert_eq!(metrics.batch_flushes_full, 0);
+        assert_eq!(metrics.batch_flushes_delay, 1);
+        assert_eq!(metrics.batch_flushes_memory_pressure, 0);
+        assert_eq!(metrics.batch_flushes_manual, 0);
+        assert_eq!(metrics.batch_flushes_shutdown, 0);
+    }
+
+    #[test]
+    fn background_scheduler_flushes_open_batch_on_shutdown() {
+        let dir = tempdir().unwrap();
+        let engine = dynamic_add_graph_engine(dir.path().join("executor-shutdown-batch.rsmf"));
+        let executor = RuntimeExecutor::new(
+            engine,
+            RuntimeExecutorConfig {
+                worker_threads: 1,
+                queue_capacity: 8,
+                dynamic_batching: Some(DynamicBatchingConfig {
+                    max_batch_size: 4,
+                    max_queue_delay: Duration::from_secs(60),
+                }),
+                admission: RuntimeAdmissionConfig::default(),
+            },
+        );
+
+        let handle = executor
+            .submit(dynamic_add_request("first", &[1.0, 2.0], &[10.0, 20.0]))
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(matches!(
+            handle.receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+
+        executor.close().unwrap();
+        let response = handle.wait().unwrap();
+        assert_eq!(f32_output(&response, "z"), vec![11.0, 22.0]);
+
+        let metrics = executor.metrics().unwrap();
+        assert_eq!(metrics.completed, 1);
+        assert_eq!(metrics.runtime_invocations, 1);
+        assert_eq!(metrics.batch_flushes_full, 0);
+        assert_eq!(metrics.batch_flushes_delay, 0);
+        assert_eq!(metrics.batch_flushes_memory_pressure, 0);
+        assert_eq!(metrics.batch_flushes_manual, 0);
+        assert_eq!(metrics.batch_flushes_shutdown, 1);
+    }
+
+    #[test]
+    fn executor_reports_memory_pressure_batch_flush_reason() {
+        let dir = tempdir().unwrap();
+        let engine = dynamic_add_graph_engine(dir.path().join("executor-pressure-batch.rsmf"));
+        let executor = RuntimeExecutor::new(
+            engine,
+            RuntimeExecutorConfig {
+                worker_threads: 0,
+                queue_capacity: 8,
+                dynamic_batching: Some(DynamicBatchingConfig {
+                    max_batch_size: 4,
+                    max_queue_delay: Duration::from_secs(1),
+                }),
+                admission: RuntimeAdmissionConfig {
+                    max_queued_tensor_bytes: Some(32),
+                },
+            },
+        );
+
+        let first = executor
+            .submit(dynamic_add_request("first", &[1.0, 2.0], &[10.0, 20.0]))
+            .unwrap();
+        let second = executor
+            .submit(dynamic_add_request("second", &[3.0, 4.0], &[30.0, 40.0]))
+            .unwrap();
+
+        assert!(executor.execute_next().unwrap());
+        assert_eq!(f32_output(&first.wait().unwrap(), "z"), vec![11.0, 22.0]);
+        assert_eq!(f32_output(&second.wait().unwrap(), "z"), vec![33.0, 44.0]);
+
+        let metrics = executor.metrics().unwrap();
+        assert_eq!(metrics.runtime_invocations, 1);
+        assert_eq!(metrics.batches_executed, 1);
+        assert_eq!(metrics.batch_flushes_full, 0);
+        assert_eq!(metrics.batch_flushes_delay, 0);
+        assert_eq!(metrics.batch_flushes_memory_pressure, 1);
+        assert_eq!(metrics.batch_flushes_manual, 0);
+        assert_eq!(metrics.batch_flushes_shutdown, 0);
     }
 
     fn tiny_add_onnx_model() -> Vec<u8> {
