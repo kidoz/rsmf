@@ -49,9 +49,11 @@ rsmf-core  (library)           ← format, reader, writer, validator, selection
   cancellation tokens.
   `RuntimeNetworkServer` exposes a std-library HTTP/1.1 JSON wrapper for
   `/health`, `/metrics`, `POST /v1/run`, `GET /v1/requests/{id}`, and
-  `DELETE /v1/requests/{id}` without adding a web framework dependency. JSON
-  run requests can carry `tenant_id` for executor quota accounting. It stays
-  graph-runtime agnostic for later native decoder paths.
+  `DELETE /v1/requests/{id}` without adding a web framework dependency. It
+  supports protocol version fields, configurable header/body/response size
+  limits, connection timeouts, sanitized error responses, and JSON `tenant_id`
+  propagation for executor quota accounting. It stays graph-runtime agnostic for
+  later native decoder paths.
 - `rsmf-moe-runtime` is a proof-of-concept runtime for one MoE layer: host-side
   top-1 gating, token batching by destination expert, placement-aware expert
   shard lookup, WGPU expert matmuls when available, and a CPU reference path.
