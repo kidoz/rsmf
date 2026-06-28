@@ -99,6 +99,9 @@ tiny LLaMA-style fixture:
 - threaded CPU final-logits projection,
 - paged KV-cache attention reads with page size 1,
 - prompt length 3 with chunked prefill scheduling.
+- resident prefix-cache hit cost,
+- CPU tiled cached-attention mode,
+- two-request token-level continuous batch scheduling.
 
 ```sh
 cargo bench -p rsmf-bench --bench native_decoder
