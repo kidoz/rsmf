@@ -56,6 +56,109 @@ impl NativeDecoderTokenizer {
         Self::from_json_with_assets(bytes, None, None)
     }
 
+    /// Parse a supported SentencePiece `tokenizer.model` protobuf payload.
+    ///
+    /// This accepts the subset the native tokenizer can execute exactly today:
+    /// Unigram models with whitespace escaping through the standard `▁`
+    /// metaspace convention and no embedded precompiled normalizer map.
+    pub fn from_sentencepiece_model(bytes: &[u8]) -> Result<Self> {
+        Self::from_sentencepiece_model_with_assets(bytes, None, None)
+    }
+
+    pub(crate) fn from_sentencepiece_model_with_assets(
+        bytes: &[u8],
+        tokenizer_config: Option<&[u8]>,
+        chat_template_asset: Option<&[u8]>,
+    ) -> Result<Self> {
+        if bytes.len() > MAX_TOKENIZER_JSON_BYTES {
+            return Err(RuntimeError::NativeDecoderTokenizerInvalid {
+                reason: format!(
+                    "tokenizer.model is too large: {} bytes exceeds {}",
+                    bytes.len(),
+                    MAX_TOKENIZER_JSON_BYTES
+                ),
+            });
+        }
+        let model = NativeDecoderSentencePieceModel::from_bytes(bytes)?;
+        if model.has_precompiled_normalizer {
+            return Err(RuntimeError::NativeDecoderTokenizerInvalid {
+                reason: "SentencePiece precompiled normalizer maps are not supported".to_string(),
+            });
+        }
+        if model.model_type != NativeDecoderSentencePieceModelType::Unigram {
+            return Err(RuntimeError::NativeDecoderTokenizerInvalid {
+                reason: format!(
+                    "SentencePiece model type {} is not supported by the direct protobuf path",
+                    model.model_type.name()
+                ),
+            });
+        }
+        let mut vocab = HashMap::with_capacity(model.pieces.len());
+        let mut unigram_scores = HashMap::with_capacity(model.pieces.len());
+        let mut special_tokens = Vec::new();
+        let mut unk_token = None;
+        for (idx, piece) in model.pieces.iter().enumerate() {
+            validate_tokenizer_token(&piece.piece)?;
+            let token_id =
+                i64::try_from(idx).map_err(|_| RuntimeError::NativeDecoderTokenizerInvalid {
+                    reason: format!("SentencePiece token index {idx} cannot convert to i64"),
+                })?;
+            if piece.kind == NativeDecoderSentencePiecePieceType::Unknown {
+                unk_token = Some(piece.piece.clone());
+            }
+            if piece.kind.is_special() {
+                special_tokens.push(piece.piece.clone());
+            }
+            vocab.insert(piece.piece.clone(), token_id);
+            unigram_scores.insert(
+                piece.piece.clone(),
+                (piece.score * 1_000_000.0).round() as i64,
+            );
+        }
+        if vocab.is_empty() {
+            return Err(RuntimeError::NativeDecoderTokenizerInvalid {
+                reason: "SentencePiece model has no pieces".to_string(),
+            });
+        }
+        let mut id_to_token = HashMap::with_capacity(vocab.len());
+        for (token, token_id) in &vocab {
+            if id_to_token.insert(*token_id, token.clone()).is_some() {
+                return Err(RuntimeError::NativeDecoderTokenizerInvalid {
+                    reason: format!("duplicate tokenizer id {token_id}"),
+                });
+            }
+        }
+        special_tokens.sort_by_key(|token| std::cmp::Reverse(token.len()));
+        special_tokens.dedup();
+        Ok(Self {
+            model_type: "SentencePieceUnigram".to_string(),
+            vocab,
+            id_to_token,
+            unk_token,
+            mode: NativeDecoderTokenizerMode::Unigram,
+            normalizer: NativeDecoderNormalizer::None,
+            pre_tokenizer: NativeDecoderPreTokenizer::Metaspace {
+                replacement: '▁',
+                add_prefix_space: model.add_dummy_prefix,
+            },
+            post_processor: NativeDecoderPostProcessor::None,
+            bpe_ranks: HashMap::new(),
+            unigram_scores,
+            wordpiece_prefix: "##".to_string(),
+            max_input_chars_per_word: 100,
+            byte_fallback: false,
+            decoder: NativeDecoderDecoder::Metaspace {
+                replacement: '▁',
+                add_prefix_space: model.add_dummy_prefix,
+            },
+            special_tokens,
+            chat_template: NativeDecoderChatTemplate::from_assets(
+                tokenizer_config,
+                chat_template_asset,
+            )?,
+        })
+    }
+
     pub(crate) fn from_json_with_assets(
         bytes: &[u8],
         tokenizer_config: Option<&[u8]>,
@@ -592,6 +695,13 @@ pub(crate) use decoder::NativeDecoderDecoder;
 mod pre_tokenizer;
 
 pub(crate) use pre_tokenizer::NativeDecoderPreTokenizer;
+
+mod sentencepiece_model;
+
+pub(crate) use sentencepiece_model::{
+    NativeDecoderSentencePieceModel, NativeDecoderSentencePieceModelType,
+    NativeDecoderSentencePiecePieceType,
+};
 
 mod json;
 

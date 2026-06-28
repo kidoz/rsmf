@@ -18,18 +18,32 @@ pub struct NativeDecoderCpuLayerWeights<'a> {
     pub post_attention_layernorm: &'a [f32],
     /// Query projection weight, row-major shape `[hidden_size, hidden_size]`.
     pub q_proj: &'a [f32],
+    /// Optional direct quantized query projection.
+    pub q_proj_quantized: Option<&'a NativeDecoderQuantizedMatrix>,
     /// Key projection weight, row-major shape `[kv_width, hidden_size]`.
     pub k_proj: &'a [f32],
+    /// Optional direct quantized key projection.
+    pub k_proj_quantized: Option<&'a NativeDecoderQuantizedMatrix>,
     /// Value projection weight, row-major shape `[kv_width, hidden_size]`.
     pub v_proj: &'a [f32],
+    /// Optional direct quantized value projection.
+    pub v_proj_quantized: Option<&'a NativeDecoderQuantizedMatrix>,
     /// Attention output projection weight, row-major shape `[hidden_size, hidden_size]`.
     pub o_proj: &'a [f32],
+    /// Optional direct quantized attention output projection.
+    pub o_proj_quantized: Option<&'a NativeDecoderQuantizedMatrix>,
     /// SwiGLU gate projection weight, row-major shape `[intermediate_size, hidden_size]`.
     pub gate_proj: &'a [f32],
+    /// Optional direct quantized gate projection.
+    pub gate_proj_quantized: Option<&'a NativeDecoderQuantizedMatrix>,
     /// SwiGLU up projection weight, row-major shape `[intermediate_size, hidden_size]`.
     pub up_proj: &'a [f32],
+    /// Optional direct quantized up projection.
+    pub up_proj_quantized: Option<&'a NativeDecoderQuantizedMatrix>,
     /// SwiGLU down projection weight, row-major shape `[hidden_size, intermediate_size]`.
     pub down_proj: &'a [f32],
+    /// Optional direct quantized down projection.
+    pub down_proj_quantized: Option<&'a NativeDecoderQuantizedMatrix>,
 }
 
 /// Output from one CPU reference native decoder block.

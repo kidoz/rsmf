@@ -595,29 +595,29 @@ pub(crate) fn native_decoder_cpu_llama_cached_step(
         weights.input_layernorm,
         config.rms_norm_eps,
     )?;
-    let mut query = native_decoder_backend_linear(
+    let mut query = native_decoder_projection(
         &normalized,
-        1,
         hidden_size,
         weights.q_proj,
+        weights.q_proj_quantized,
         hidden_size,
         linear_backend.backend,
         linear_backend.performance,
     )?;
-    let mut key = native_decoder_backend_linear(
+    let mut key = native_decoder_projection(
         &normalized,
-        1,
         hidden_size,
         weights.k_proj,
+        weights.k_proj_quantized,
         kv_width,
         linear_backend.backend,
         linear_backend.performance,
     )?;
-    let value = native_decoder_backend_linear(
+    let value = native_decoder_projection(
         &normalized,
-        1,
         hidden_size,
         weights.v_proj,
+        weights.v_proj_quantized,
         kv_width,
         linear_backend.backend,
         linear_backend.performance,
@@ -651,11 +651,11 @@ pub(crate) fn native_decoder_cpu_llama_cached_step(
         head_dim,
         implementation: linear_backend.performance.attention,
     })?;
-    let attention_projected = native_decoder_backend_linear(
+    let attention_projected = native_decoder_projection(
         &attention,
-        1,
         hidden_size,
         weights.o_proj,
+        weights.o_proj_quantized,
         hidden_size,
         linear_backend.backend,
         linear_backend.performance,
@@ -673,20 +673,20 @@ pub(crate) fn native_decoder_cpu_llama_cached_step(
         weights.post_attention_layernorm,
         config.rms_norm_eps,
     )?;
-    let gate = native_decoder_backend_linear(
+    let gate = native_decoder_projection(
         &mlp_normalized,
-        1,
         hidden_size,
         weights.gate_proj,
+        weights.gate_proj_quantized,
         intermediate_size,
         linear_backend.backend,
         linear_backend.performance,
     )?;
-    let up = native_decoder_backend_linear(
+    let up = native_decoder_projection(
         &mlp_normalized,
-        1,
         hidden_size,
         weights.up_proj,
+        weights.up_proj_quantized,
         intermediate_size,
         linear_backend.backend,
         linear_backend.performance,
@@ -696,11 +696,11 @@ pub(crate) fn native_decoder_cpu_llama_cached_step(
         .zip(up.iter())
         .map(|(gate, up)| native_decoder_cpu_silu(*gate) * up)
         .collect::<Vec<_>>();
-    let mlp_projected = native_decoder_backend_linear(
+    let mlp_projected = native_decoder_projection(
         &activated,
-        1,
         intermediate_size,
         weights.down_proj,
+        weights.down_proj_quantized,
         hidden_size,
         linear_backend.backend,
         linear_backend.performance,
@@ -717,6 +717,32 @@ pub(crate) fn native_decoder_cpu_llama_cached_step(
         key,
         value,
     })
+}
+
+fn native_decoder_projection(
+    input: &[f32],
+    in_features: usize,
+    weight: &[f32],
+    weight_quantized: Option<&NativeDecoderQuantizedMatrix>,
+    out_features: usize,
+    backend: NativeDecoderBackend,
+    performance: &NativeDecoderPerformanceOptions,
+) -> Result<Vec<f32>> {
+    if let Some(quantized) = weight_quantized {
+        validate_cpu_vector_len("projection_quantized", "input", input.len(), in_features)?;
+        let output = quantized.matvec(input)?;
+        validate_cpu_vector_len("projection_quantized", "output", output.len(), out_features)?;
+        return Ok(output);
+    }
+    native_decoder_backend_linear(
+        input,
+        1,
+        in_features,
+        weight,
+        out_features,
+        backend,
+        performance,
+    )
 }
 
 pub(crate) fn native_decoder_cpu_logits(

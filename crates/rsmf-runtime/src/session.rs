@@ -169,6 +169,34 @@ pub struct RuntimeCapabilityReport {
     pub ort_provider_allocator_stats: RuntimeCapability,
     /// True borrowed mmap-backed ONNX initializer binding.
     pub mmap_initializer_zero_copy: RuntimeCapability,
+    /// Direct native decoder quantized matrix-vector kernels for RawI8, Q8_0,
+    /// and Q4_0 projection weights.
+    pub native_decoder_i8_q8_q4_direct_kernels: RuntimeCapability,
+    /// Direct native decoder QK-family kernels such as Q3_K, Q4_K, Q5_K, and
+    /// Q6_K.
+    pub native_decoder_qk_family_direct_kernels: RuntimeCapability,
+    /// Native continuous batching can fuse compatible LM-head projection rows.
+    pub native_decoder_fused_lm_head_continuous_batching: RuntimeCapability,
+    /// Native continuous batching fused Q/K/V, attention, and MLP kernels.
+    pub native_decoder_fused_qkv_attention_mlp: RuntimeCapability,
+    /// Native decoder Metal/WGPU execution path.
+    pub native_decoder_metal_wgpu: RuntimeCapability,
+    /// ORT CoreML execution provider path for embedded graph payloads.
+    pub ort_coreml_execution_provider: RuntimeCapability,
+    /// Direct SentencePiece `.model` protobuf tokenizer loading.
+    pub sentencepiece_model_protobuf: RuntimeCapability,
+    /// Std HTTP bearer-token authentication.
+    pub serving_bearer_auth: RuntimeCapability,
+    /// Std HTTP local overload/load-shedding policy.
+    pub serving_load_shedding: RuntimeCapability,
+    /// Native TLS transport in this crate.
+    pub serving_tls: RuntimeCapability,
+    /// Response streaming transport in this crate.
+    pub serving_streaming: RuntimeCapability,
+    /// Distributed tenant quota coordination.
+    pub distributed_quotas: RuntimeCapability,
+    /// Production multi-device/expert runtime in `rsmf-runtime`.
+    pub r6_multi_device_expert_runtime: RuntimeCapability,
 }
 
 /// Runtime I/O binding policy for ORT graph execution.
@@ -397,6 +425,35 @@ pub(crate) fn runtime_capability_report() -> RuntimeCapabilityReport {
         ort_provider_allocator_stats: provider_allocator_stats_capability(),
         mmap_initializer_zero_copy: RuntimeCapability::unavailable(
             "ONNX external initializer binding currently requires an ORT-owned value; borrowed RSMF mmap initializer lifetimes are not exposed safely",
+        ),
+        native_decoder_i8_q8_q4_direct_kernels: RuntimeCapability::Available,
+        native_decoder_qk_family_direct_kernels: RuntimeCapability::unavailable(
+            "QK-family direct kernels are not implemented; Q3_K/Q4_K/Q5_K/Q6_K variants still use the f32 decode path",
+        ),
+        native_decoder_fused_lm_head_continuous_batching: RuntimeCapability::Available,
+        native_decoder_fused_qkv_attention_mlp: RuntimeCapability::unavailable(
+            "continuous batching interleaves decode steps and fuses LM-head projection only; Q/K/V, attention, and MLP are not fused across requests",
+        ),
+        native_decoder_metal_wgpu: RuntimeCapability::unavailable(
+            "Metal/WGPU native decoder kernels are not implemented in this build",
+        ),
+        ort_coreml_execution_provider: RuntimeCapability::unavailable(
+            "CoreML execution provider registration is not implemented in the default ORT graph runtime",
+        ),
+        sentencepiece_model_protobuf: RuntimeCapability::Available,
+        serving_bearer_auth: RuntimeCapability::Available,
+        serving_load_shedding: RuntimeCapability::Available,
+        serving_tls: RuntimeCapability::unavailable(
+            "the dependency-light std HTTP server does not terminate TLS; deploy behind a TLS proxy or add an optional serving crate",
+        ),
+        serving_streaming: RuntimeCapability::unavailable(
+            "the dependency-light std HTTP server returns complete JSON responses and does not implement streaming",
+        ),
+        distributed_quotas: RuntimeCapability::unavailable(
+            "tenant quotas are local to one RuntimeExecutor; no distributed quota store is implemented",
+        ),
+        r6_multi_device_expert_runtime: RuntimeCapability::unavailable(
+            "production multi-device/expert execution is not implemented in rsmf-runtime; rsmf-moe-runtime remains a separate proof-of-concept crate",
         ),
     }
 }

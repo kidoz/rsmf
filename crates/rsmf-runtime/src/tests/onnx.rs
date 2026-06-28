@@ -119,6 +119,30 @@ fn runs_embedded_onnx_add_graph_from_rsmf() {
         handle.capability_report().mmap_initializer_zero_copy,
         RuntimeCapability::Unavailable { .. }
     ));
+    assert!(matches!(
+        handle
+            .capability_report()
+            .native_decoder_i8_q8_q4_direct_kernels,
+        RuntimeCapability::Available
+    ));
+    assert!(matches!(
+        handle
+            .capability_report()
+            .native_decoder_qk_family_direct_kernels,
+        RuntimeCapability::Unavailable { .. }
+    ));
+    assert!(matches!(
+        handle.capability_report().serving_bearer_auth,
+        RuntimeCapability::Available
+    ));
+    assert!(matches!(
+        handle.capability_report().serving_load_shedding,
+        RuntimeCapability::Available
+    ));
+    assert!(matches!(
+        handle.capability_report().serving_tls,
+        RuntimeCapability::Unavailable { .. }
+    ));
     let input_names = handle
         .inputs()
         .iter()

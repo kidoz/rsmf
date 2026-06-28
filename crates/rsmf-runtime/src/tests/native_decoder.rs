@@ -4,7 +4,8 @@ use super::assert_close_slice;
 
 use rsmf_core::RsmfFile;
 use rsmf_core::writer::{
-    AssetInput, RsmfWriter, TensorInput, VariantInput, convert_f32_to_q8_0_bytes,
+    AssetInput, RsmfWriter, TensorInput, VariantInput, convert_f32_to_q4_0_bytes,
+    convert_f32_to_q8_0_bytes,
 };
 use rsmf_core::{LogicalDtype, TargetTag};
 use serde::Deserialize;
@@ -178,6 +179,27 @@ fn engine_native_decoder_tokenizer_encodes_and_decodes_wordlevel_text() {
 }
 
 #[test]
+fn engine_native_decoder_tokenizer_loads_sentencepiece_model_asset() {
+    let dir = tempdir().unwrap();
+    let engine = tiny_native_decoder_engine(
+        dir.path().join("native-decoder-tokenizer-model.rsmf"),
+        NativeDecoderFixtureOptions {
+            include_tokenizer: false,
+            include_sentencepiece_model: true,
+            ..NativeDecoderFixtureOptions::default()
+        },
+    );
+
+    let contract = engine.native_decoder_contract().unwrap();
+    assert_eq!(
+        contract.assets.tokenizer_asset,
+        NATIVE_DECODER_SENTENCEPIECE_MODEL_ASSET
+    );
+    let tokenizer = engine.native_decoder_tokenizer().unwrap();
+    assert_eq!(tokenizer.encode("hello world").unwrap(), vec![1, 2]);
+}
+
+#[test]
 fn engine_native_decoder_tokenizer_rejects_unsupported_model_type() {
     let err =
         NativeDecoderTokenizer::from_json(br#"{"model": {"type": "SentencePiece"}}"#).unwrap_err();
@@ -325,6 +347,30 @@ fn native_decoder_unigram_tokenizer_uses_unk_for_unmatched_chars() {
     .unwrap();
 
     assert_eq!(tokenizer.encode("hello!").unwrap(), vec![1, 0]);
+}
+
+#[test]
+fn native_decoder_sentencepiece_model_protobuf_encodes_unigram() {
+    let tokenizer =
+        NativeDecoderTokenizer::from_sentencepiece_model(&tiny_sentencepiece_unigram_model())
+            .unwrap();
+
+    assert_eq!(tokenizer.model_type, "SentencePieceUnigram");
+    assert_eq!(tokenizer.encode("hello world").unwrap(), vec![1, 2]);
+    assert_eq!(tokenizer.encode("hello!").unwrap(), vec![1, 0]);
+    assert_eq!(tokenizer.decode(&[1, 2]).unwrap(), "hello world");
+}
+
+#[test]
+fn native_decoder_sentencepiece_model_rejects_precompiled_normalizer() {
+    let err = NativeDecoderTokenizer::from_sentencepiece_model(
+        &tiny_sentencepiece_unigram_model_with_precompiled_normalizer(),
+    )
+    .unwrap_err();
+
+    assert!(
+        matches!(err, RuntimeError::NativeDecoderTokenizerInvalid { reason } if reason.contains("precompiled normalizer"))
+    );
 }
 
 #[test]
@@ -1435,6 +1481,14 @@ fn engine_native_decoder_raw_i8_weights_require_lossy_quantized_opt_in() {
         weights.lm_head_quantized,
         Some(NativeDecoderQuantizedMatrix::RawI8 { .. })
     ));
+    assert!(matches!(
+        weights.layers[0].q_proj_quantized,
+        Some(NativeDecoderQuantizedMatrix::RawI8 { .. })
+    ));
+    assert!(matches!(
+        weights.layers[0].down_proj_quantized,
+        Some(NativeDecoderQuantizedMatrix::RawI8 { .. })
+    ));
 
     let output = native_decoder_generate_with_backend(
         &weights,
@@ -1497,6 +1551,51 @@ fn engine_native_decoder_q8_lm_head_variant_uses_direct_quantized_kernel() {
 
     assert_eq!(quantized.generated_token_ids, reference.generated_token_ids);
     assert_close_slice(&quantized.logits[0], &reference.logits[0], 1e-2);
+}
+
+#[test]
+fn engine_native_decoder_q4_projection_variants_use_direct_quantized_kernels() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("native-decode-q4-projections.rsmf");
+    let engine = tiny_native_decoder_generation_engine_with_q4_projection_variants(path.clone());
+    let file = RsmfFile::open(path).unwrap();
+    let mut variants = std::collections::HashMap::new();
+    for tensor in &file.manifest().tensors {
+        if let Some(variant) = tensor.packed_variants.first().copied() {
+            variants.insert(tensor.name.clone(), variant);
+        }
+    }
+    let weights = engine
+        .native_decoder_weights_with_options(&NativeDecoderWeightOptions {
+            tensor_variants: variants,
+            allow_lossy_quantized: true,
+        })
+        .unwrap();
+
+    assert!(matches!(
+        weights.layers[0].q_proj_quantized,
+        Some(NativeDecoderQuantizedMatrix::Q4_0 { .. })
+    ));
+    assert!(matches!(
+        weights.layers[0].gate_proj_quantized,
+        Some(NativeDecoderQuantizedMatrix::Q4_0 { .. })
+    ));
+    assert!(matches!(
+        weights.lm_head_quantized,
+        Some(NativeDecoderQuantizedMatrix::Q4_0 { .. })
+    ));
+
+    let output = native_decoder_generate_with_backend(
+        &weights,
+        &[0],
+        NativeDecoderRunOptions {
+            max_new_tokens: 2,
+            ..NativeDecoderRunOptions::default()
+        },
+        NativeDecoderBackend::CpuReference,
+    )
+    .unwrap();
+    assert_eq!(output.generated_token_ids, vec![1, 2]);
 }
 
 #[test]
@@ -1570,12 +1669,19 @@ fn native_decoder_cpu_llama_block_zero_projections_preserve_hidden_states() {
             input_layernorm: &[1.0, 1.0],
             post_attention_layernorm: &[1.0, 1.0],
             q_proj: &zeros,
+            q_proj_quantized: None,
             k_proj: &zeros,
+            k_proj_quantized: None,
             v_proj: &zeros,
+            v_proj_quantized: None,
             o_proj: &zeros,
+            o_proj_quantized: None,
             gate_proj: &zeros,
+            gate_proj_quantized: None,
             up_proj: &zeros,
+            up_proj_quantized: None,
             down_proj: &zeros,
+            down_proj_quantized: None,
         },
     )
     .unwrap();
@@ -1599,12 +1705,19 @@ fn native_decoder_cpu_llama_block_validates_weight_shape() {
             input_layernorm: &[1.0, 1.0],
             post_attention_layernorm: &[1.0, 1.0],
             q_proj: &[0.0, 0.0, 0.0],
+            q_proj_quantized: None,
             k_proj: &zeros,
+            k_proj_quantized: None,
             v_proj: &zeros,
+            v_proj_quantized: None,
             o_proj: &zeros,
+            o_proj_quantized: None,
             gate_proj: &zeros,
+            gate_proj_quantized: None,
             up_proj: &zeros,
+            up_proj_quantized: None,
             down_proj: &zeros,
+            down_proj_quantized: None,
         },
     )
     .unwrap_err();
@@ -1616,6 +1729,7 @@ fn native_decoder_cpu_llama_block_validates_weight_shape() {
 
 struct NativeDecoderFixtureOptions {
     include_tokenizer: bool,
+    include_sentencepiece_model: bool,
     omit_tensor: Option<String>,
     bad_shape: Option<(String, Vec<u64>)>,
 }
@@ -1624,6 +1738,7 @@ impl NativeDecoderFixtureOptions {
     fn default() -> Self {
         Self {
             include_tokenizer: true,
+            include_sentencepiece_model: false,
             omit_tensor: None,
             bad_shape: None,
         }
@@ -1648,6 +1763,12 @@ fn tiny_native_decoder_engine(
         writer = writer.with_asset(AssetInput::new(
             NATIVE_DECODER_TOKENIZER_ASSET,
             br#"{"model": {"type": "BPE"}}"#.to_vec(),
+        ));
+    }
+    if options.include_sentencepiece_model {
+        writer = writer.with_asset(AssetInput::new(
+            NATIVE_DECODER_SENTENCEPIECE_MODEL_ASSET,
+            tiny_sentencepiece_unigram_model(),
         ));
     }
     for (name, shape) in tiny_native_decoder_tensor_specs() {
@@ -1733,6 +1854,44 @@ fn tiny_native_decoder_generation_engine_with_q8_lm_head_variant(
     Engine::new(RsmfFile::open(path).unwrap()).unwrap()
 }
 
+fn tiny_native_decoder_generation_engine_with_q4_projection_variants(
+    path: std::path::PathBuf,
+) -> Engine {
+    let config = tiny_native_decoder_cpu_config();
+    let mut writer = RsmfWriter::new()
+        .with_metadata("model.arch", "llama")
+        .with_asset(AssetInput::new(
+            NATIVE_DECODER_CONFIG_ASSET,
+            tiny_native_decoder_generation_config_json().into_bytes(),
+        ))
+        .with_asset(AssetInput::new(
+            NATIVE_DECODER_TOKENIZER_ASSET,
+            tiny_native_decoder_tokenizer_json().into_bytes(),
+        ));
+    for expected in expected_native_decoder_tensors(&config).unwrap() {
+        let values =
+            tiny_native_decoder_generation_tensor_values(&expected.tensor_name, &expected.shape);
+        let mut tensor = native_decoder_tensor_with_dtype_values(
+            &expected.tensor_name,
+            expected.shape,
+            LogicalDtype::F32,
+            values,
+        );
+        if expected.tensor_name == "lm_head.weight"
+            || expected.tensor_name.contains(".self_attn.")
+            || expected.tensor_name.contains(".mlp.")
+        {
+            tensor.packed.push(VariantInput::packed_q4_0(
+                TargetTag::CpuGeneric,
+                convert_f32_to_q4_0_bytes(&tensor.canonical.bytes),
+            ));
+        }
+        writer = writer.with_tensor(tensor);
+    }
+    writer.write_to_path(&path).unwrap();
+    Engine::new(RsmfFile::open(path).unwrap()).unwrap()
+}
+
 fn tiny_native_decoder_config_json() -> String {
     serde_json::json!({
         "model_type": "llama",
@@ -1784,6 +1943,69 @@ fn tiny_native_decoder_tokenizer_json() -> String {
         }
     })
     .to_string()
+}
+
+fn tiny_sentencepiece_unigram_model() -> Vec<u8> {
+    tiny_sentencepiece_unigram_model_with_normalizer(None)
+}
+
+fn tiny_sentencepiece_unigram_model_with_precompiled_normalizer() -> Vec<u8> {
+    tiny_sentencepiece_unigram_model_with_normalizer(Some(vec![1, 2, 3]))
+}
+
+fn tiny_sentencepiece_unigram_model_with_normalizer(
+    precompiled_normalizer: Option<Vec<u8>>,
+) -> Vec<u8> {
+    let mut model = Vec::new();
+    sp_push_message(&mut model, 1, sp_piece("<unk>", 0.0, 2));
+    sp_push_message(&mut model, 1, sp_piece("▁hello", -0.1, 1));
+    sp_push_message(&mut model, 1, sp_piece("▁world", -0.2, 1));
+    let mut trainer = Vec::new();
+    sp_push_varint(&mut trainer, 3, 1);
+    sp_push_message(&mut model, 2, trainer);
+    let mut normalizer = Vec::new();
+    if let Some(precompiled_normalizer) = precompiled_normalizer {
+        sp_push_bytes(&mut normalizer, 2, &precompiled_normalizer);
+    }
+    sp_push_varint(&mut normalizer, 3, 1);
+    sp_push_message(&mut model, 3, normalizer);
+    model
+}
+
+fn sp_piece(piece: &str, score: f32, kind: u64) -> Vec<u8> {
+    let mut out = Vec::new();
+    sp_push_bytes(&mut out, 1, piece.as_bytes());
+    sp_push_fixed32(&mut out, 2, score.to_bits());
+    sp_push_varint(&mut out, 3, kind);
+    out
+}
+
+fn sp_push_message(out: &mut Vec<u8>, field: u64, bytes: Vec<u8>) {
+    sp_push_bytes(out, field, &bytes);
+}
+
+fn sp_push_bytes(out: &mut Vec<u8>, field: u64, bytes: &[u8]) {
+    sp_push_raw_varint(out, (field << 3) | 2);
+    sp_push_raw_varint(out, bytes.len() as u64);
+    out.extend_from_slice(bytes);
+}
+
+fn sp_push_varint(out: &mut Vec<u8>, field: u64, value: u64) {
+    sp_push_raw_varint(out, field << 3);
+    sp_push_raw_varint(out, value);
+}
+
+fn sp_push_fixed32(out: &mut Vec<u8>, field: u64, value: u32) {
+    sp_push_raw_varint(out, (field << 3) | 5);
+    out.extend_from_slice(&value.to_le_bytes());
+}
+
+fn sp_push_raw_varint(out: &mut Vec<u8>, mut value: u64) {
+    while value >= 0x80 {
+        out.push((value as u8 & 0x7f) | 0x80);
+        value >>= 7;
+    }
+    out.push(value as u8);
 }
 
 fn tiny_native_decoder_cpu_config() -> NativeDecoderConfig {

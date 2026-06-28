@@ -5,6 +5,9 @@ pub const NATIVE_DECODER_CONFIG_ASSET: &str = "config.json";
 /// Canonical RSMF asset name for the tokenizer payload used by native decoders.
 pub const NATIVE_DECODER_TOKENIZER_ASSET: &str = "tokenizer.json";
 
+/// Optional RSMF asset name for a direct SentencePiece protobuf tokenizer.
+pub const NATIVE_DECODER_SENTENCEPIECE_MODEL_ASSET: &str = "tokenizer.model";
+
 /// Optional RSMF asset name for Hugging Face tokenizer configuration.
 pub const NATIVE_DECODER_TOKENIZER_CONFIG_ASSET: &str = "tokenizer_config.json";
 
@@ -203,14 +206,21 @@ impl NativeDecoderContract {
             }
         })?;
         let config = NativeDecoderConfig::from_hf_config_json(config_asset.bytes)?;
-        if file.asset(NATIVE_DECODER_TOKENIZER_ASSET).is_none() {
+        let tokenizer_asset_name = if file.asset(NATIVE_DECODER_TOKENIZER_ASSET).is_some() {
+            NATIVE_DECODER_TOKENIZER_ASSET
+        } else if file
+            .asset(NATIVE_DECODER_SENTENCEPIECE_MODEL_ASSET)
+            .is_some()
+        {
+            NATIVE_DECODER_SENTENCEPIECE_MODEL_ASSET
+        } else {
             return Err(RuntimeError::NativeDecoderAssetMissing {
                 asset_name: NATIVE_DECODER_TOKENIZER_ASSET.to_string(),
             });
-        }
+        };
         let assets = NativeDecoderAssets {
             config_asset: NATIVE_DECODER_CONFIG_ASSET.to_string(),
-            tokenizer_asset: NATIVE_DECODER_TOKENIZER_ASSET.to_string(),
+            tokenizer_asset: tokenizer_asset_name.to_string(),
             generation_config_asset: file
                 .asset(NATIVE_DECODER_GENERATION_CONFIG_ASSET)
                 .map(|asset| asset.name.to_string()),

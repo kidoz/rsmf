@@ -14,13 +14,14 @@ use rsmf_core::{LogicalDtype, RsmfError, RsmfFile, StorageDtype, TensorView};
 use crate::allocator_stats::provider_allocator_stats;
 use crate::executor::RuntimeCancellationToken;
 use crate::native_decoder::{
-    NATIVE_DECODER_CHAT_TEMPLATE_ASSET, NATIVE_DECODER_TOKENIZER_ASSET,
-    NATIVE_DECODER_TOKENIZER_CONFIG_ASSET, NativeDecoderChatMessage, NativeDecoderContract,
-    NativeDecoderGenerateOutput, NativeDecoderReferenceLogitCheck,
-    NativeDecoderReferenceLogitReport, NativeDecoderRunOptions, NativeDecoderSession,
-    NativeDecoderTextGenerateOutput, NativeDecoderTokenizer, NativeDecoderWeightOptions,
-    NativeDecoderWeights, load_native_decoder_weights, native_decoder_check_reference_logits,
-    native_decoder_generate_with_backend, resolve_native_decoder_backend,
+    NATIVE_DECODER_CHAT_TEMPLATE_ASSET, NATIVE_DECODER_SENTENCEPIECE_MODEL_ASSET,
+    NATIVE_DECODER_TOKENIZER_ASSET, NATIVE_DECODER_TOKENIZER_CONFIG_ASSET,
+    NativeDecoderChatMessage, NativeDecoderContract, NativeDecoderGenerateOutput,
+    NativeDecoderReferenceLogitCheck, NativeDecoderReferenceLogitReport, NativeDecoderRunOptions,
+    NativeDecoderSession, NativeDecoderTextGenerateOutput, NativeDecoderTokenizer,
+    NativeDecoderWeightOptions, NativeDecoderWeights, load_native_decoder_weights,
+    native_decoder_check_reference_logits, native_decoder_generate_with_backend,
+    resolve_native_decoder_backend,
 };
 use crate::onnx::{OnnxTensorDataType, onnx_initializers};
 use crate::session::{
@@ -236,15 +237,12 @@ impl Engine {
 
     /// Load the native decoder tokenizer from `tokenizer.json`.
     ///
+    /// If `tokenizer.json` is absent, a supported SentencePiece
+    /// `tokenizer.model` protobuf asset is accepted as a bounded fallback.
+    ///
     /// Optional `tokenizer_config.json` and `chat_template.json` assets attach a
     /// supported chat template when present.
     pub fn native_decoder_tokenizer(&self) -> Result<NativeDecoderTokenizer> {
-        let tokenizer_asset = self
-            .file
-            .asset(NATIVE_DECODER_TOKENIZER_ASSET)
-            .ok_or_else(|| RuntimeError::NativeDecoderAssetMissing {
-                asset_name: NATIVE_DECODER_TOKENIZER_ASSET.to_string(),
-            })?;
         let tokenizer_config = self
             .file
             .asset(NATIVE_DECODER_TOKENIZER_CONFIG_ASSET)
@@ -253,11 +251,25 @@ impl Engine {
             .file
             .asset(NATIVE_DECODER_CHAT_TEMPLATE_ASSET)
             .map(|asset| asset.bytes);
-        NativeDecoderTokenizer::from_json_with_assets(
-            tokenizer_asset.bytes,
-            tokenizer_config,
-            chat_template,
-        )
+        if let Some(tokenizer_asset) = self.file.asset(NATIVE_DECODER_TOKENIZER_ASSET) {
+            NativeDecoderTokenizer::from_json_with_assets(
+                tokenizer_asset.bytes,
+                tokenizer_config,
+                chat_template,
+            )
+        } else if let Some(tokenizer_asset) =
+            self.file.asset(NATIVE_DECODER_SENTENCEPIECE_MODEL_ASSET)
+        {
+            NativeDecoderTokenizer::from_sentencepiece_model_with_assets(
+                tokenizer_asset.bytes,
+                tokenizer_config,
+                chat_template,
+            )
+        } else {
+            Err(RuntimeError::NativeDecoderAssetMissing {
+                asset_name: NATIVE_DECODER_TOKENIZER_ASSET.to_string(),
+            })
+        }
     }
 
     /// Run native decoder token-id generation.

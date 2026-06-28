@@ -25,6 +25,15 @@ pub enum NativeDecoderQuantizedMatrix {
         /// Owned block bytes.
         bytes: Vec<u8>,
     },
+    /// RSMF/GGUF-style Q4_0 blocks stored as `[f16 scale][u4; 32]`.
+    Q4_0 {
+        /// Row count.
+        rows: usize,
+        /// Column count.
+        cols: usize,
+        /// Owned block bytes.
+        bytes: Vec<u8>,
+    },
 }
 
 impl NativeDecoderQuantizedMatrix {
@@ -33,7 +42,7 @@ impl NativeDecoderQuantizedMatrix {
     pub fn resident_bytes(&self) -> usize {
         match self {
             Self::RawI8 { values, .. } => values.len(),
-            Self::Q8_0 { bytes, .. } => bytes.len(),
+            Self::Q8_0 { bytes, .. } | Self::Q4_0 { bytes, .. } => bytes.len(),
         }
     }
 
@@ -107,6 +116,52 @@ impl NativeDecoderQuantizedMatrix {
                 }
                 Ok(output)
             }
+            Self::Q4_0 { rows, cols, bytes } => {
+                validate_cpu_vector_len("quantized_matvec_q4_0", "input", input.len(), *cols)?;
+                let element_count =
+                    cpu_element_count("quantized_matvec_q4_0", "weight", *rows, *cols)?;
+                let block_size = 32usize;
+                let block_bytes = 18usize;
+                let expected_blocks = element_count.div_ceil(block_size);
+                validate_cpu_vector_len(
+                    "quantized_matvec_q4_0",
+                    "bytes",
+                    bytes.len(),
+                    expected_blocks.checked_mul(block_bytes).ok_or_else(|| {
+                        native_decoder_cpu_shape_error(
+                            "quantized_matvec_q4_0",
+                            "byte count overflow",
+                        )
+                    })?,
+                )?;
+                let mut output = vec![0.0f32; *rows];
+                for (row, output_value) in output.iter_mut().enumerate().take(*rows) {
+                    let mut sum = 0.0f32;
+                    for (col, input_value) in input.iter().enumerate().take(*cols) {
+                        let index = row * *cols + col;
+                        let block_index = index / block_size;
+                        let block_offset = index % block_size;
+                        let byte_offset = block_index * block_bytes;
+                        let scale =
+                            f16::from_le_bytes([bytes[byte_offset], bytes[byte_offset + 1]])
+                                .to_f32();
+                        let packed = if block_offset < 16 {
+                            bytes[byte_offset + 2 + block_offset]
+                        } else {
+                            bytes[byte_offset + 2 + block_offset - 16] >> 4
+                        };
+                        let quantized = if block_offset < 16 {
+                            packed & 0x0f
+                        } else {
+                            packed
+                        };
+                        let value = (quantized as i8 - 8) as f32 * scale;
+                        sum += *input_value * value;
+                    }
+                    *output_value = sum;
+                }
+                Ok(output)
+            }
         }
     }
 }
@@ -120,18 +175,32 @@ pub struct NativeDecoderLayerWeights {
     pub post_attention_layernorm: Vec<f32>,
     /// Query projection weight, row-major shape `[hidden_size, hidden_size]`.
     pub q_proj: Vec<f32>,
+    /// Optional selected quantized query projection matrix.
+    pub q_proj_quantized: Option<NativeDecoderQuantizedMatrix>,
     /// Key projection weight, row-major shape `[kv_width, hidden_size]`.
     pub k_proj: Vec<f32>,
+    /// Optional selected quantized key projection matrix.
+    pub k_proj_quantized: Option<NativeDecoderQuantizedMatrix>,
     /// Value projection weight, row-major shape `[kv_width, hidden_size]`.
     pub v_proj: Vec<f32>,
+    /// Optional selected quantized value projection matrix.
+    pub v_proj_quantized: Option<NativeDecoderQuantizedMatrix>,
     /// Attention output projection weight, row-major shape `[hidden_size, hidden_size]`.
     pub o_proj: Vec<f32>,
+    /// Optional selected quantized attention output projection matrix.
+    pub o_proj_quantized: Option<NativeDecoderQuantizedMatrix>,
     /// SwiGLU gate projection weight, row-major shape `[intermediate_size, hidden_size]`.
     pub gate_proj: Vec<f32>,
+    /// Optional selected quantized gate projection matrix.
+    pub gate_proj_quantized: Option<NativeDecoderQuantizedMatrix>,
     /// SwiGLU up projection weight, row-major shape `[intermediate_size, hidden_size]`.
     pub up_proj: Vec<f32>,
+    /// Optional selected quantized up projection matrix.
+    pub up_proj_quantized: Option<NativeDecoderQuantizedMatrix>,
     /// SwiGLU down projection weight, row-major shape `[hidden_size, intermediate_size]`.
     pub down_proj: Vec<f32>,
+    /// Optional selected quantized down projection matrix.
+    pub down_proj_quantized: Option<NativeDecoderQuantizedMatrix>,
 }
 
 impl NativeDecoderLayerWeights {
@@ -140,12 +209,19 @@ impl NativeDecoderLayerWeights {
             input_layernorm: &self.input_layernorm,
             post_attention_layernorm: &self.post_attention_layernorm,
             q_proj: &self.q_proj,
+            q_proj_quantized: self.q_proj_quantized.as_ref(),
             k_proj: &self.k_proj,
+            k_proj_quantized: self.k_proj_quantized.as_ref(),
             v_proj: &self.v_proj,
+            v_proj_quantized: self.v_proj_quantized.as_ref(),
             o_proj: &self.o_proj,
+            o_proj_quantized: self.o_proj_quantized.as_ref(),
             gate_proj: &self.gate_proj,
+            gate_proj_quantized: self.gate_proj_quantized.as_ref(),
             up_proj: &self.up_proj,
+            up_proj_quantized: self.up_proj_quantized.as_ref(),
             down_proj: &self.down_proj,
+            down_proj_quantized: self.down_proj_quantized.as_ref(),
         }
     }
 
@@ -161,6 +237,13 @@ impl NativeDecoderLayerWeights {
             .saturating_add(f32_slice_bytes(&self.gate_proj))
             .saturating_add(f32_slice_bytes(&self.up_proj))
             .saturating_add(f32_slice_bytes(&self.down_proj))
+            .saturating_add(quantized_matrix_bytes(&self.q_proj_quantized))
+            .saturating_add(quantized_matrix_bytes(&self.k_proj_quantized))
+            .saturating_add(quantized_matrix_bytes(&self.v_proj_quantized))
+            .saturating_add(quantized_matrix_bytes(&self.o_proj_quantized))
+            .saturating_add(quantized_matrix_bytes(&self.gate_proj_quantized))
+            .saturating_add(quantized_matrix_bytes(&self.up_proj_quantized))
+            .saturating_add(quantized_matrix_bytes(&self.down_proj_quantized))
     }
 }
 
@@ -209,6 +292,12 @@ pub(crate) fn f32_slice_bytes(values: &[f32]) -> usize {
     values.len().saturating_mul(std::mem::size_of::<f32>())
 }
 
+fn quantized_matrix_bytes(value: &Option<NativeDecoderQuantizedMatrix>) -> usize {
+    value
+        .as_ref()
+        .map_or(0, NativeDecoderQuantizedMatrix::resident_bytes)
+}
+
 pub(crate) fn load_native_decoder_weights(
     file: &RsmfFile,
     config: NativeDecoderConfig,
@@ -243,6 +332,48 @@ pub(crate) fn load_native_decoder_weights(
     };
     let mut layers = Vec::with_capacity(config.num_hidden_layers);
     for layer in 0..config.num_hidden_layers {
+        let q_proj = load_native_decoder_tensor_f32_with_quantized(
+            file,
+            options,
+            &format!("model.layers.{layer}.self_attn.q_proj.weight"),
+            &[hidden, hidden],
+        )?;
+        let k_proj = load_native_decoder_tensor_f32_with_quantized(
+            file,
+            options,
+            &format!("model.layers.{layer}.self_attn.k_proj.weight"),
+            &[kv_width, hidden],
+        )?;
+        let v_proj = load_native_decoder_tensor_f32_with_quantized(
+            file,
+            options,
+            &format!("model.layers.{layer}.self_attn.v_proj.weight"),
+            &[kv_width, hidden],
+        )?;
+        let o_proj = load_native_decoder_tensor_f32_with_quantized(
+            file,
+            options,
+            &format!("model.layers.{layer}.self_attn.o_proj.weight"),
+            &[hidden, hidden],
+        )?;
+        let gate_proj = load_native_decoder_tensor_f32_with_quantized(
+            file,
+            options,
+            &format!("model.layers.{layer}.mlp.gate_proj.weight"),
+            &[intermediate, hidden],
+        )?;
+        let up_proj = load_native_decoder_tensor_f32_with_quantized(
+            file,
+            options,
+            &format!("model.layers.{layer}.mlp.up_proj.weight"),
+            &[intermediate, hidden],
+        )?;
+        let down_proj = load_native_decoder_tensor_f32_with_quantized(
+            file,
+            options,
+            &format!("model.layers.{layer}.mlp.down_proj.weight"),
+            &[hidden, intermediate],
+        )?;
         layers.push(NativeDecoderLayerWeights {
             input_layernorm: load_native_decoder_tensor_f32(
                 file,
@@ -256,48 +387,20 @@ pub(crate) fn load_native_decoder_weights(
                 &format!("model.layers.{layer}.post_attention_layernorm.weight"),
                 &[hidden],
             )?,
-            q_proj: load_native_decoder_tensor_f32(
-                file,
-                options,
-                &format!("model.layers.{layer}.self_attn.q_proj.weight"),
-                &[hidden, hidden],
-            )?,
-            k_proj: load_native_decoder_tensor_f32(
-                file,
-                options,
-                &format!("model.layers.{layer}.self_attn.k_proj.weight"),
-                &[kv_width, hidden],
-            )?,
-            v_proj: load_native_decoder_tensor_f32(
-                file,
-                options,
-                &format!("model.layers.{layer}.self_attn.v_proj.weight"),
-                &[kv_width, hidden],
-            )?,
-            o_proj: load_native_decoder_tensor_f32(
-                file,
-                options,
-                &format!("model.layers.{layer}.self_attn.o_proj.weight"),
-                &[hidden, hidden],
-            )?,
-            gate_proj: load_native_decoder_tensor_f32(
-                file,
-                options,
-                &format!("model.layers.{layer}.mlp.gate_proj.weight"),
-                &[intermediate, hidden],
-            )?,
-            up_proj: load_native_decoder_tensor_f32(
-                file,
-                options,
-                &format!("model.layers.{layer}.mlp.up_proj.weight"),
-                &[intermediate, hidden],
-            )?,
-            down_proj: load_native_decoder_tensor_f32(
-                file,
-                options,
-                &format!("model.layers.{layer}.mlp.down_proj.weight"),
-                &[hidden, intermediate],
-            )?,
+            q_proj: q_proj.values,
+            q_proj_quantized: q_proj.quantized,
+            k_proj: k_proj.values,
+            k_proj_quantized: k_proj.quantized,
+            v_proj: v_proj.values,
+            v_proj_quantized: v_proj.quantized,
+            o_proj: o_proj.values,
+            o_proj_quantized: o_proj.quantized,
+            gate_proj: gate_proj.values,
+            gate_proj_quantized: gate_proj.quantized,
+            up_proj: up_proj.values,
+            up_proj_quantized: up_proj.quantized,
+            down_proj: down_proj.values,
+            down_proj_quantized: down_proj.quantized,
         });
     }
     Ok(NativeDecoderWeights {
@@ -451,6 +554,14 @@ impl NativeDecoderQuantizedMatrix {
                 rows,
                 cols,
                 block_size,
+                bytes: view.bytes.to_vec(),
+            }));
+        }
+        if view.encoding == EncodingKind::BlockQuantized && view.storage_dtype == StorageDtype::Q4_0
+        {
+            return Ok(Some(Self::Q4_0 {
+                rows,
+                cols,
                 bytes: view.bytes.to_vec(),
             }));
         }

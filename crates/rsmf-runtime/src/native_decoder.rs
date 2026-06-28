@@ -20,9 +20,9 @@ mod weights;
 
 pub use contract::{
     NATIVE_DECODER_CHAT_TEMPLATE_ASSET, NATIVE_DECODER_CONFIG_ASSET,
-    NATIVE_DECODER_GENERATION_CONFIG_ASSET, NATIVE_DECODER_TOKENIZER_ASSET,
-    NATIVE_DECODER_TOKENIZER_CONFIG_ASSET, NativeDecoderAssets, NativeDecoderConfig,
-    NativeDecoderContract, NativeDecoderFamily, NativeDecoderTensorBinding,
+    NATIVE_DECODER_GENERATION_CONFIG_ASSET, NATIVE_DECODER_SENTENCEPIECE_MODEL_ASSET,
+    NATIVE_DECODER_TOKENIZER_ASSET, NATIVE_DECODER_TOKENIZER_CONFIG_ASSET, NativeDecoderAssets,
+    NativeDecoderConfig, NativeDecoderContract, NativeDecoderFamily, NativeDecoderTensorBinding,
 };
 pub use generation::{
     NativeDecoderGenerateOutput, NativeDecoderResidencyReport, NativeDecoderSession,
