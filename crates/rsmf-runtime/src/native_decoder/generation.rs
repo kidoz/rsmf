@@ -130,6 +130,10 @@ pub struct NativeDecoderStepOutput {
     pub next_token_id: i64,
 }
 
+pub(crate) struct NativeDecoderHiddenStepOutput {
+    pub(crate) normalized: Vec<f32>,
+}
+
 /// Output from native decoder greedy generation.
 #[derive(Debug, Clone, PartialEq)]
 pub struct NativeDecoderGenerateOutput {
@@ -417,6 +421,31 @@ pub(crate) fn native_decoder_cpu_step(
     backend: NativeDecoderBackend,
     performance: &NativeDecoderPerformanceOptions,
 ) -> Result<NativeDecoderStepOutput> {
+    let hidden = native_decoder_cpu_step_hidden(weights, cache, token_id, backend, performance)?;
+    let lm_head = weights.lm_head.as_ref().unwrap_or(&weights.token_embedding);
+    let lm_head_quantized = if weights.lm_head.is_some() {
+        weights.lm_head_quantized.as_ref()
+    } else {
+        None
+    };
+    native_decoder_cpu_step_from_normalized(
+        &hidden.normalized,
+        weights.config.hidden_size,
+        lm_head,
+        lm_head_quantized,
+        weights.config.vocab_size,
+        backend,
+        performance,
+    )
+}
+
+pub(crate) fn native_decoder_cpu_step_hidden(
+    weights: &NativeDecoderWeights,
+    cache: &mut NativeDecoderKvCache,
+    token_id: i64,
+    backend: NativeDecoderBackend,
+    performance: &NativeDecoderPerformanceOptions,
+) -> Result<NativeDecoderHiddenStepOutput> {
     let token_index = validate_native_decoder_token_id(token_id, weights.config.vocab_size)?;
     if cache.layers.len() != weights.config.num_hidden_layers {
         return Err(native_decoder_cpu_shape_error(
@@ -492,12 +521,24 @@ pub(crate) fn native_decoder_cpu_step(
         &weights.final_norm,
         weights.config.rms_norm_eps,
     )?;
-    let lm_head = weights.lm_head.as_ref().unwrap_or(&weights.token_embedding);
+    Ok(NativeDecoderHiddenStepOutput { normalized })
+}
+
+pub(crate) fn native_decoder_cpu_step_from_normalized(
+    normalized: &[f32],
+    hidden_size: usize,
+    lm_head: &[f32],
+    lm_head_quantized: Option<&NativeDecoderQuantizedMatrix>,
+    vocab_size: usize,
+    backend: NativeDecoderBackend,
+    performance: &NativeDecoderPerformanceOptions,
+) -> Result<NativeDecoderStepOutput> {
     let logits = native_decoder_cpu_logits(
-        &normalized,
+        normalized,
         hidden_size,
         lm_head,
-        weights.config.vocab_size,
+        lm_head_quantized,
+        vocab_size,
         backend,
         performance,
     )?;
@@ -682,10 +723,21 @@ pub(crate) fn native_decoder_cpu_logits(
     normalized: &[f32],
     hidden_size: usize,
     lm_head: &[f32],
+    lm_head_quantized: Option<&NativeDecoderQuantizedMatrix>,
     vocab_size: usize,
     backend: NativeDecoderBackend,
     performance: &NativeDecoderPerformanceOptions,
 ) -> Result<Vec<f32>> {
+    if let Some(quantized) = lm_head_quantized {
+        validate_cpu_matrix_len(
+            "logits_quantized",
+            "normalized",
+            normalized.len(),
+            1,
+            hidden_size,
+        )?;
+        return quantized.matvec(normalized);
+    }
     match backend {
         NativeDecoderBackend::AppleCpuAccelerate => native_decoder_backend_linear(
             normalized,
@@ -717,4 +769,64 @@ pub(crate) fn native_decoder_cpu_logits(
             native_decoder_cpu_linear(normalized, 1, hidden_size, lm_head, vocab_size)
         }
     }
+}
+
+pub(crate) fn native_decoder_cpu_logits_batch(
+    input: NativeDecoderCpuLogitsBatchInput<'_>,
+) -> Result<Vec<Vec<f32>>> {
+    validate_cpu_matrix_len(
+        "logits_batch",
+        "normalized",
+        input.normalized.len(),
+        input.rows,
+        input.hidden_size,
+    )?;
+    if let Some(quantized) = input.lm_head_quantized {
+        let mut outputs = Vec::with_capacity(input.rows);
+        for row in 0..input.rows {
+            let start = row * input.hidden_size;
+            outputs.push(quantized.matvec(&input.normalized[start..start + input.hidden_size])?);
+        }
+        return Ok(outputs);
+    }
+    let flat = match input.backend {
+        NativeDecoderBackend::AppleCpuAccelerate | NativeDecoderBackend::CpuThreaded => {
+            native_decoder_backend_linear(
+                input.normalized,
+                input.rows,
+                input.hidden_size,
+                input.lm_head,
+                input.vocab_size,
+                input.backend,
+                input.performance,
+            )?
+        }
+        NativeDecoderBackend::CpuReference
+        | NativeDecoderBackend::Auto
+        | NativeDecoderBackend::Accelerated
+        | NativeDecoderBackend::MetalWgpuLmHead
+        | NativeDecoderBackend::MetalWgpuFullDecoder
+        | NativeDecoderBackend::OrtCoreMl => native_decoder_cpu_linear(
+            input.normalized,
+            input.rows,
+            input.hidden_size,
+            input.lm_head,
+            input.vocab_size,
+        )?,
+    };
+    Ok(flat
+        .chunks(input.vocab_size)
+        .map(<[f32]>::to_vec)
+        .collect::<Vec<_>>())
+}
+
+pub(crate) struct NativeDecoderCpuLogitsBatchInput<'a> {
+    pub(crate) normalized: &'a [f32],
+    pub(crate) rows: usize,
+    pub(crate) hidden_size: usize,
+    pub(crate) lm_head: &'a [f32],
+    pub(crate) lm_head_quantized: Option<&'a NativeDecoderQuantizedMatrix>,
+    pub(crate) vocab_size: usize,
+    pub(crate) backend: NativeDecoderBackend,
+    pub(crate) performance: &'a NativeDecoderPerformanceOptions,
 }

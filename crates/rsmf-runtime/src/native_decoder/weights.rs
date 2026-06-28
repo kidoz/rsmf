@@ -1,4 +1,115 @@
 use super::*;
+use half::f16;
+use rsmf_core::{EncodingKind, StorageDtype};
+
+/// Owned quantized native decoder matrix used by direct CPU kernels.
+#[derive(Debug, Clone, PartialEq)]
+pub enum NativeDecoderQuantizedMatrix {
+    /// Raw row-major I8 matrix with implicit scale 1.0.
+    RawI8 {
+        /// Row count.
+        rows: usize,
+        /// Column count.
+        cols: usize,
+        /// Row-major signed values.
+        values: Vec<i8>,
+    },
+    /// RSMF/GGUF-style Q8_0 blocks stored as `[f16 scale][i8; block_size]`.
+    Q8_0 {
+        /// Row count.
+        rows: usize,
+        /// Column count.
+        cols: usize,
+        /// Quantization block size, usually 32.
+        block_size: usize,
+        /// Owned block bytes.
+        bytes: Vec<u8>,
+    },
+}
+
+impl NativeDecoderQuantizedMatrix {
+    /// Resident bytes held by this quantized matrix.
+    #[must_use]
+    pub fn resident_bytes(&self) -> usize {
+        match self {
+            Self::RawI8 { values, .. } => values.len(),
+            Self::Q8_0 { bytes, .. } => bytes.len(),
+        }
+    }
+
+    /// Direct matrix-vector multiply into f32 without materializing the whole
+    /// matrix as f32 first.
+    pub fn matvec(&self, input: &[f32]) -> Result<Vec<f32>> {
+        match self {
+            Self::RawI8 { rows, cols, values } => {
+                validate_cpu_vector_len("quantized_matvec_i8", "input", input.len(), *cols)?;
+                validate_cpu_matrix_len(
+                    "quantized_matvec_i8",
+                    "weight",
+                    values.len(),
+                    *rows,
+                    *cols,
+                )?;
+                let mut output = vec![0.0f32; *rows];
+                for (row, output_value) in output.iter_mut().enumerate().take(*rows) {
+                    let mut sum = 0.0f32;
+                    let row_start = row * *cols;
+                    for (col, input_value) in input.iter().enumerate().take(*cols) {
+                        sum += *input_value * values[row_start + col] as f32;
+                    }
+                    *output_value = sum;
+                }
+                Ok(output)
+            }
+            Self::Q8_0 {
+                rows,
+                cols,
+                block_size,
+                bytes,
+            } => {
+                validate_cpu_vector_len("quantized_matvec_q8_0", "input", input.len(), *cols)?;
+                validate_cpu_positive("quantized_matvec_q8_0", "block_size", *block_size)?;
+                let element_count =
+                    cpu_element_count("quantized_matvec_q8_0", "weight", *rows, *cols)?;
+                let block_bytes = block_size.checked_add(2).ok_or_else(|| {
+                    native_decoder_cpu_shape_error(
+                        "quantized_matvec_q8_0",
+                        "block byte count overflow",
+                    )
+                })?;
+                let expected_blocks = element_count.div_ceil(*block_size);
+                validate_cpu_vector_len(
+                    "quantized_matvec_q8_0",
+                    "bytes",
+                    bytes.len(),
+                    expected_blocks.checked_mul(block_bytes).ok_or_else(|| {
+                        native_decoder_cpu_shape_error(
+                            "quantized_matvec_q8_0",
+                            "byte count overflow",
+                        )
+                    })?,
+                )?;
+                let mut output = vec![0.0f32; *rows];
+                for (row, output_value) in output.iter_mut().enumerate().take(*rows) {
+                    let mut sum = 0.0f32;
+                    for (col, input_value) in input.iter().enumerate().take(*cols) {
+                        let index = row * *cols + col;
+                        let block_index = index / *block_size;
+                        let block_offset = index % *block_size;
+                        let byte_offset = block_index * block_bytes;
+                        let scale =
+                            f16::from_le_bytes([bytes[byte_offset], bytes[byte_offset + 1]])
+                                .to_f32();
+                        let value = bytes[byte_offset + 2 + block_offset] as i8 as f32 * scale;
+                        sum += *input_value * value;
+                    }
+                    *output_value = sum;
+                }
+                Ok(output)
+            }
+        }
+    }
+}
 
 /// Owned LLaMA-style layer weights decoded for native decoder execution.
 #[derive(Debug, Clone, PartialEq)]
@@ -65,6 +176,9 @@ pub struct NativeDecoderWeights {
     /// Optional LM head matrix, row-major shape `[vocab_size, hidden_size]`.
     /// When absent, token embeddings are used as tied output embeddings.
     pub lm_head: Option<Vec<f32>>,
+    /// Optional selected quantized LM-head matrix used by direct quantized
+    /// kernels when the selected RSMF variant supports it.
+    pub lm_head_quantized: Option<NativeDecoderQuantizedMatrix>,
     /// Per-layer decoded weights.
     pub layers: Vec<NativeDecoderLayerWeights>,
 }
@@ -79,6 +193,11 @@ impl NativeDecoderWeights {
                 self.lm_head
                     .as_ref()
                     .map_or(0, |weights| f32_slice_bytes(weights)),
+            )
+            .saturating_add(
+                self.lm_head_quantized
+                    .as_ref()
+                    .map_or(0, NativeDecoderQuantizedMatrix::resident_bytes),
             );
         self.layers.iter().fold(base, |total, layer| {
             total.saturating_add(layer.resident_bytes())
@@ -111,15 +230,16 @@ pub(crate) fn load_native_decoder_weights(
         &[vocab, hidden],
     )?;
     let final_norm = load_native_decoder_tensor_f32(file, options, "model.norm.weight", &[hidden])?;
-    let lm_head = if config.tie_word_embeddings {
-        None
+    let (lm_head, lm_head_quantized) = if config.tie_word_embeddings {
+        (None, None)
     } else {
-        Some(load_native_decoder_tensor_f32(
+        let loaded = load_native_decoder_tensor_f32_with_quantized(
             file,
             options,
             "lm_head.weight",
             &[vocab, hidden],
-        )?)
+        )?;
+        (Some(loaded.values), loaded.quantized)
     };
     let mut layers = Vec::with_capacity(config.num_hidden_layers);
     for layer in 0..config.num_hidden_layers {
@@ -185,8 +305,27 @@ pub(crate) fn load_native_decoder_weights(
         token_embedding,
         final_norm,
         lm_head,
+        lm_head_quantized,
         layers,
     })
+}
+
+struct NativeDecoderLoadedTensor {
+    values: Vec<f32>,
+    quantized: Option<NativeDecoderQuantizedMatrix>,
+}
+
+fn load_native_decoder_tensor_f32_with_quantized(
+    file: &RsmfFile,
+    options: &NativeDecoderWeightOptions,
+    tensor_name: &str,
+    expected_shape: &[u64],
+) -> Result<NativeDecoderLoadedTensor> {
+    let view = native_decoder_weight_view(file, options, tensor_name)?;
+    let values =
+        decode_native_decoder_weight_view_f32(&view, options, tensor_name, expected_shape)?;
+    let quantized = NativeDecoderQuantizedMatrix::from_weight_view(view, options, expected_shape)?;
+    Ok(NativeDecoderLoadedTensor { values, quantized })
 }
 
 pub(crate) fn load_native_decoder_tensor_f32(
@@ -196,6 +335,15 @@ pub(crate) fn load_native_decoder_tensor_f32(
     expected_shape: &[u64],
 ) -> Result<Vec<f32>> {
     let view = native_decoder_weight_view(file, options, tensor_name)?;
+    decode_native_decoder_weight_view_f32(&view, options, tensor_name, expected_shape)
+}
+
+fn decode_native_decoder_weight_view_f32(
+    view: &TensorView<'_>,
+    options: &NativeDecoderWeightOptions,
+    tensor_name: &str,
+    expected_shape: &[u64],
+) -> Result<Vec<f32>> {
     if view.shape() != expected_shape {
         return Err(RuntimeError::NativeDecoderTensorShapeMismatch {
             tensor_name: tensor_name.to_string(),
@@ -231,13 +379,16 @@ pub(crate) fn load_native_decoder_tensor_f32(
             ),
         });
     }
-    let values =
+    let mut values =
         view.decode_f32()
             .map_err(|error| RuntimeError::NativeDecoderTensorUnsupported {
                 tensor_name: tensor_name.to_string(),
                 reason: error.to_string(),
             })?;
     let expected_len = shape_element_count(expected_shape)?;
+    if view.encoding == EncodingKind::BlockQuantized && values.len() > expected_len {
+        values.truncate(expected_len);
+    }
     if values.len() != expected_len {
         return Err(RuntimeError::NativeDecoderTensorUnsupported {
             tensor_name: tensor_name.to_string(),
@@ -245,6 +396,66 @@ pub(crate) fn load_native_decoder_tensor_f32(
         });
     }
     Ok(values)
+}
+
+impl NativeDecoderQuantizedMatrix {
+    fn from_weight_view(
+        view: TensorView<'_>,
+        options: &NativeDecoderWeightOptions,
+        expected_shape: &[u64],
+    ) -> Result<Option<Self>> {
+        if !options.allow_lossy_quantized {
+            return Ok(None);
+        }
+        let [rows_u64, cols_u64] = expected_shape else {
+            return Ok(None);
+        };
+        let rows = usize::try_from(*rows_u64)
+            .map_err(|_| RuntimeError::Shape("quantized matrix rows exceed usize".to_string()))?;
+        let cols = usize::try_from(*cols_u64)
+            .map_err(|_| RuntimeError::Shape("quantized matrix cols exceed usize".to_string()))?;
+        if view.encoding == EncodingKind::Raw && view.descriptor.dtype == LogicalDtype::I8 {
+            if view.layout != LayoutTag::RowMajor {
+                return Err(RuntimeError::NativeDecoderTensorUnsupported {
+                    tensor_name: view.descriptor.name.clone(),
+                    reason: format!(
+                        "raw I8 quantized matrix requires row-major layout, got {:?}",
+                        view.layout
+                    ),
+                });
+            }
+            let expected_len = rows.checked_mul(cols).ok_or_else(|| {
+                RuntimeError::Shape("quantized matrix element count overflow".to_string())
+            })?;
+            validate_cpu_vector_len(
+                "quantized_matrix_i8",
+                "bytes",
+                view.bytes.len(),
+                expected_len,
+            )?;
+            return Ok(Some(Self::RawI8 {
+                rows,
+                cols,
+                values: view.bytes.iter().map(|value| *value as i8).collect(),
+            }));
+        }
+        if view.encoding == EncodingKind::BlockQuantized
+            && matches!(
+                view.storage_dtype,
+                StorageDtype::Q8_0 | StorageDtype::Logical(LogicalDtype::I8)
+            )
+        {
+            let block_size = view.meta.block_shape.first().copied().unwrap_or(32) as usize;
+            validate_cpu_positive("quantized_matrix_q8_0", "block_size", block_size)?;
+            return Ok(Some(Self::Q8_0 {
+                rows,
+                cols,
+                block_size,
+                bytes: view.bytes.to_vec(),
+            }));
+        }
+        Ok(None)
+    }
 }
 
 pub(crate) fn native_decoder_weight_view<'a>(

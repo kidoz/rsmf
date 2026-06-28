@@ -1,10 +1,13 @@
 use criterion::{Criterion, criterion_group, criterion_main};
-use rsmf_core::writer::{AssetInput, RsmfWriter, TensorInput, VariantInput};
-use rsmf_core::{LogicalDtype, RsmfFile};
+use rsmf_core::writer::{
+    AssetInput, RsmfWriter, TensorInput, VariantInput, convert_f32_to_q8_0_bytes,
+};
+use rsmf_core::{LogicalDtype, RsmfFile, TargetTag};
 use rsmf_runtime::{
     Engine, NATIVE_DECODER_CONFIG_ASSET, NATIVE_DECODER_TOKENIZER_ASSET,
     NativeDecoderAttentionImplementation, NativeDecoderBackend,
     NativeDecoderContinuousBatchRequest, NativeDecoderPerformanceOptions, NativeDecoderRunOptions,
+    NativeDecoderWeightOptions,
 };
 use tempfile::tempdir;
 
@@ -171,6 +174,28 @@ fn bench_native_decoder(c: &mut Criterion) {
         },
     );
 
+    let prompt_seven = vec![0i64, 1, 0, 1, 0, 1, 0];
+    c.bench_function(
+        "native_decoder/resident_prompt_len_7_chunked_prefill",
+        |b| {
+            b.iter(|| {
+                resident_session
+                    .generate_token_ids(
+                        std::hint::black_box(&prompt_seven),
+                        NativeDecoderRunOptions {
+                            max_new_tokens: 1,
+                            performance: NativeDecoderPerformanceOptions {
+                                prefill_chunk_size: Some(2),
+                                ..NativeDecoderPerformanceOptions::default()
+                            },
+                            ..NativeDecoderRunOptions::default()
+                        },
+                    )
+                    .expect("generate resident native decoder tokens with longer prompt")
+            });
+        },
+    );
+
     let prefix_options = NativeDecoderRunOptions {
         max_new_tokens: 1,
         performance: NativeDecoderPerformanceOptions {
@@ -245,9 +270,75 @@ fn bench_native_decoder(c: &mut Criterion) {
                 .expect("generate continuous native decoder batch")
         });
     });
+
+    c.bench_function("native_decoder/continuous_batch_four_requests", |b| {
+        b.iter(|| {
+            resident_session
+                .generate_token_ids_continuous_batch(
+                    (0..4)
+                        .map(|request| NativeDecoderContinuousBatchRequest {
+                            request_id: request.to_string(),
+                            input_token_ids: std::hint::black_box(prompt_one.clone()),
+                            options: NativeDecoderRunOptions {
+                                max_new_tokens: 2,
+                                performance: NativeDecoderPerformanceOptions {
+                                    continuous_batch_max_requests: Some(4),
+                                    ..NativeDecoderPerformanceOptions::default()
+                                },
+                                ..NativeDecoderRunOptions::default()
+                            },
+                            deadline: None,
+                            cancelled: false,
+                        })
+                        .collect(),
+                )
+                .expect("generate continuous native decoder batch")
+        });
+    });
+
+    let q8_path = dir.path().join("native-decoder-q8-head-bench.rsmf");
+    build_tiny_native_decoder_with_q8_lm_head(&q8_path);
+    let q8_file = RsmfFile::open(&q8_path).expect("open q8 native decoder fixture");
+    let q8_variant = q8_file
+        .manifest()
+        .tensors
+        .iter()
+        .find(|tensor| tensor.name == "lm_head.weight")
+        .and_then(|tensor| tensor.packed_variants.first().copied())
+        .expect("q8 lm_head variant");
+    let q8_engine = Engine::new(q8_file).expect("create q8 runtime engine");
+    let mut variants = std::collections::HashMap::new();
+    variants.insert("lm_head.weight".to_string(), q8_variant);
+    let q8_session = q8_engine
+        .native_decoder_session_with_options(&NativeDecoderWeightOptions {
+            tensor_variants: variants,
+            allow_lossy_quantized: true,
+        })
+        .expect("create q8 resident native decoder session");
+    c.bench_function("native_decoder/resident_q8_lm_head", |b| {
+        b.iter(|| {
+            q8_session
+                .generate_token_ids(
+                    std::hint::black_box(&prompt_one),
+                    NativeDecoderRunOptions {
+                        max_new_tokens: 2,
+                        ..NativeDecoderRunOptions::default()
+                    },
+                )
+                .expect("generate resident native decoder tokens with q8 lm head")
+        });
+    });
 }
 
 fn build_tiny_native_decoder(path: &std::path::Path) {
+    build_tiny_native_decoder_inner(path, false);
+}
+
+fn build_tiny_native_decoder_with_q8_lm_head(path: &std::path::Path) {
+    build_tiny_native_decoder_inner(path, true);
+}
+
+fn build_tiny_native_decoder_inner(path: &std::path::Path, q8_lm_head: bool) {
     let mut writer = RsmfWriter::new()
         .with_metadata("model.arch", "llama")
         .with_asset(AssetInput::new(
@@ -259,11 +350,18 @@ fn build_tiny_native_decoder(path: &std::path::Path) {
             tiny_native_decoder_tokenizer_json().into_bytes(),
         ));
     for (name, shape) in tiny_native_decoder_tensor_specs() {
-        writer = writer.with_tensor(native_decoder_tensor_with_values(
+        let mut tensor = native_decoder_tensor_with_values(
             name,
             shape,
             tiny_native_decoder_tensor_values(name, shape),
-        ));
+        );
+        if q8_lm_head && name == "lm_head.weight" {
+            tensor.packed.push(VariantInput::packed_q8_0(
+                TargetTag::CpuGeneric,
+                convert_f32_to_q8_0_bytes(&tensor.canonical.bytes),
+            ));
+        }
+        writer = writer.with_tensor(tensor);
     }
     writer
         .write_to_path(path)

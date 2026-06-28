@@ -2,9 +2,11 @@ use super::super::native_decoder::*;
 use super::super::*;
 use super::assert_close_slice;
 
-use rsmf_core::LogicalDtype;
 use rsmf_core::RsmfFile;
-use rsmf_core::writer::{AssetInput, RsmfWriter, TensorInput, VariantInput};
+use rsmf_core::writer::{
+    AssetInput, RsmfWriter, TensorInput, VariantInput, convert_f32_to_q8_0_bytes,
+};
+use rsmf_core::{LogicalDtype, TargetTag};
 use serde::Deserialize;
 use tempfile::tempdir;
 
@@ -1429,6 +1431,72 @@ fn engine_native_decoder_raw_i8_weights_require_lossy_quantized_opt_in() {
         .unwrap();
     assert_eq!(weights.token_embedding[0], 1.0);
     assert_eq!(weights.lm_head.as_ref().unwrap()[6], -1.0);
+    assert!(matches!(
+        weights.lm_head_quantized,
+        Some(NativeDecoderQuantizedMatrix::RawI8 { .. })
+    ));
+
+    let output = native_decoder_generate_with_backend(
+        &weights,
+        &[0],
+        NativeDecoderRunOptions {
+            max_new_tokens: 2,
+            ..NativeDecoderRunOptions::default()
+        },
+        NativeDecoderBackend::CpuReference,
+    )
+    .unwrap();
+    assert_eq!(output.generated_token_ids, vec![1, 2]);
+}
+
+#[test]
+fn engine_native_decoder_q8_lm_head_variant_uses_direct_quantized_kernel() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("native-decode-q8-head.rsmf");
+    let engine = tiny_native_decoder_generation_engine_with_q8_lm_head_variant(path.clone());
+    let file = RsmfFile::open(path).unwrap();
+    let lm_head_variant = file
+        .manifest()
+        .tensors
+        .iter()
+        .find(|tensor| tensor.name == "lm_head.weight")
+        .and_then(|tensor| tensor.packed_variants.first().copied())
+        .unwrap();
+    let mut variants = std::collections::HashMap::new();
+    variants.insert("lm_head.weight".to_string(), lm_head_variant);
+    let weights = engine
+        .native_decoder_weights_with_options(&NativeDecoderWeightOptions {
+            tensor_variants: variants,
+            allow_lossy_quantized: true,
+        })
+        .unwrap();
+    assert!(matches!(
+        weights.lm_head_quantized,
+        Some(NativeDecoderQuantizedMatrix::Q8_0 { .. })
+    ));
+
+    let reference = engine
+        .native_decoder_greedy_decode(
+            &[0],
+            NativeDecoderRunOptions {
+                max_new_tokens: 1,
+                ..NativeDecoderRunOptions::default()
+            },
+        )
+        .unwrap();
+    let quantized = native_decoder_generate_with_backend(
+        &weights,
+        &[0],
+        NativeDecoderRunOptions {
+            max_new_tokens: 1,
+            ..NativeDecoderRunOptions::default()
+        },
+        NativeDecoderBackend::CpuReference,
+    )
+    .unwrap();
+
+    assert_eq!(quantized.generated_token_ids, reference.generated_token_ids);
+    assert_close_slice(&quantized.logits[0], &reference.logits[0], 1e-2);
 }
 
 #[test]
@@ -1472,6 +1540,8 @@ fn engine_native_decoder_continuous_batch_interleaves_decode_steps() {
     assert_eq!(report.admitted_requests, 2);
     assert_eq!(report.decode_rounds, 2);
     assert_eq!(report.scheduled_decode_steps, 4);
+    assert_eq!(report.fused_lm_head_batches, 1);
+    assert_eq!(report.fused_lm_head_rows, 2);
 }
 
 #[test]
@@ -1623,6 +1693,41 @@ fn tiny_native_decoder_generation_engine_with_dtype(
             dtype,
             values,
         ));
+    }
+    writer.write_to_path(&path).unwrap();
+    Engine::new(RsmfFile::open(path).unwrap()).unwrap()
+}
+
+fn tiny_native_decoder_generation_engine_with_q8_lm_head_variant(
+    path: std::path::PathBuf,
+) -> Engine {
+    let config = tiny_native_decoder_cpu_config();
+    let mut writer = RsmfWriter::new()
+        .with_metadata("model.arch", "llama")
+        .with_asset(AssetInput::new(
+            NATIVE_DECODER_CONFIG_ASSET,
+            tiny_native_decoder_generation_config_json().into_bytes(),
+        ))
+        .with_asset(AssetInput::new(
+            NATIVE_DECODER_TOKENIZER_ASSET,
+            tiny_native_decoder_tokenizer_json().into_bytes(),
+        ));
+    for expected in expected_native_decoder_tensors(&config).unwrap() {
+        let values =
+            tiny_native_decoder_generation_tensor_values(&expected.tensor_name, &expected.shape);
+        let mut tensor = native_decoder_tensor_with_dtype_values(
+            &expected.tensor_name,
+            expected.shape,
+            LogicalDtype::F32,
+            values,
+        );
+        if expected.tensor_name == "lm_head.weight" {
+            tensor.packed.push(VariantInput::packed_q8_0(
+                TargetTag::CpuGeneric,
+                convert_f32_to_q8_0_bytes(&tensor.canonical.bytes),
+            ));
+        }
+        writer = writer.with_tensor(tensor);
     }
     writer.write_to_path(&path).unwrap();
     Engine::new(RsmfFile::open(path).unwrap()).unwrap()

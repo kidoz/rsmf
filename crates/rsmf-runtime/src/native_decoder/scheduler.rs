@@ -34,6 +34,10 @@ pub struct NativeDecoderContinuousBatchReport {
     pub decode_rounds: usize,
     /// Total decode steps scheduled across all requests.
     pub scheduled_decode_steps: usize,
+    /// Number of fused LM-head projection calls issued for continued requests.
+    pub fused_lm_head_batches: usize,
+    /// Total rows projected by fused LM-head calls.
+    pub fused_lm_head_rows: usize,
 }
 
 impl NativeDecoderSession {
@@ -207,6 +211,7 @@ fn native_decoder_generate_continuous_batch(
     while !active.is_empty() {
         report.decode_rounds = report.decode_rounds.saturating_add(1);
         let mut next_active = Vec::with_capacity(active.len());
+        let mut continuations = Vec::new();
         for mut request in active {
             check_deadline(&request.request_id, request.deadline)?;
             let adjusted_logits = apply_native_decoder_repetition_penalty(
@@ -230,15 +235,23 @@ fn native_decoder_generate_continuous_batch(
             if stop || generated >= request.options.max_new_tokens {
                 completed.push((request.index, complete_active_request(request)));
             } else {
-                request.last_step = native_decoder_cpu_step(
+                let hidden = native_decoder_cpu_step_hidden(
                     weights,
                     &mut request.cache,
                     next_token_id,
                     request.backend,
                     &request.options.performance,
                 )?;
-                next_active.push(request);
+                continuations.push((request, hidden.normalized));
             }
+        }
+        if !continuations.is_empty() {
+            let fused_rows = assign_continuation_logits(weights, &mut continuations)?;
+            if fused_rows > 1 {
+                report.fused_lm_head_batches = report.fused_lm_head_batches.saturating_add(1);
+                report.fused_lm_head_rows = report.fused_lm_head_rows.saturating_add(fused_rows);
+            }
+            next_active.extend(continuations.into_iter().map(|(request, _)| request));
         }
         active = next_active;
     }
@@ -247,6 +260,73 @@ fn native_decoder_generate_continuous_batch(
         completed.into_iter().map(|(_, output)| output).collect(),
         report,
     ))
+}
+
+fn assign_continuation_logits(
+    weights: &NativeDecoderWeights,
+    continuations: &mut [(ActiveRequest, Vec<f32>)],
+) -> Result<usize> {
+    if continuations.is_empty() {
+        return Ok(0);
+    }
+    let first_backend = continuations[0].0.backend;
+    let first_performance = continuations[0].0.options.performance.clone();
+    let compatible = continuations.iter().all(|(request, hidden)| {
+        request.backend == first_backend
+            && request.options.performance == first_performance
+            && hidden.len() == weights.config.hidden_size
+    });
+    if !compatible || continuations.len() == 1 {
+        for (request, hidden) in continuations.iter_mut() {
+            let lm_head = weights.lm_head.as_ref().unwrap_or(&weights.token_embedding);
+            let lm_head_quantized = if weights.lm_head.is_some() {
+                weights.lm_head_quantized.as_ref()
+            } else {
+                None
+            };
+            request.last_step = native_decoder_cpu_step_from_normalized(
+                hidden,
+                weights.config.hidden_size,
+                lm_head,
+                lm_head_quantized,
+                weights.config.vocab_size,
+                request.backend,
+                &request.options.performance,
+            )?;
+        }
+        return Ok(0);
+    }
+
+    let rows = continuations.len();
+    let hidden_size = weights.config.hidden_size;
+    let mut normalized = Vec::with_capacity(rows * hidden_size);
+    for (_, hidden) in continuations.iter() {
+        normalized.extend_from_slice(hidden);
+    }
+    let lm_head = weights.lm_head.as_ref().unwrap_or(&weights.token_embedding);
+    let lm_head_quantized = if weights.lm_head.is_some() {
+        weights.lm_head_quantized.as_ref()
+    } else {
+        None
+    };
+    let logits = native_decoder_cpu_logits_batch(NativeDecoderCpuLogitsBatchInput {
+        normalized: &normalized,
+        rows,
+        hidden_size,
+        lm_head,
+        lm_head_quantized,
+        vocab_size: weights.config.vocab_size,
+        backend: first_backend,
+        performance: &first_performance,
+    })?;
+    for ((request, _), logits) in continuations.iter_mut().zip(logits) {
+        let next_token_id = greedy_argmax_token(&logits)?;
+        request.last_step = NativeDecoderStepOutput {
+            logits,
+            next_token_id,
+        };
+    }
+    Ok(rows)
 }
 
 fn complete_active_request(request: ActiveRequest) -> NativeDecoderContinuousBatchOutput {

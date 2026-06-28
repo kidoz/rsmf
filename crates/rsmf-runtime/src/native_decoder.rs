@@ -46,7 +46,7 @@ pub use scheduler::{
     NativeDecoderContinuousBatchRequest,
 };
 pub use tokenizer::{NativeDecoderChatMessage, NativeDecoderTokenizer};
-pub use weights::{NativeDecoderLayerWeights, NativeDecoderWeights};
+pub use weights::{NativeDecoderLayerWeights, NativeDecoderQuantizedMatrix, NativeDecoderWeights};
 
 pub(crate) use backends::*;
 pub(crate) use contract::*;
