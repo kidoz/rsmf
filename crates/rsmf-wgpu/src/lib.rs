@@ -6,9 +6,11 @@
 #![warn(missing_docs)]
 #![warn(clippy::all)]
 
+pub mod compute;
 pub mod device;
 pub mod upload;
 
+pub use compute::{WgpuComputeError, WgpuLinearExecutor};
 pub use device::{DeviceHandle, WgpuCapabilities, detect_capabilities, request_device};
 pub use upload::{UploadError, UploadOptions, upload_canonical_tensor};
 
