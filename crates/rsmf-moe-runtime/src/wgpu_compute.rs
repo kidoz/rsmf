@@ -104,7 +104,7 @@ impl WgpuExecutor {
                 label: Some("rsmf-moe matmul pipeline"),
                 layout: Some(&pipeline_layout),
                 module: &shader,
-                entry_point: "main",
+                entry_point: Some("main"),
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
                 cache: None,
             });
@@ -223,7 +223,9 @@ impl WgpuExecutor {
         slice.map_async(wgpu::MapMode::Read, move |result| {
             let _ignored = sender.send(result);
         });
-        self.device.poll(wgpu::Maintain::Wait);
+        self.device
+            .poll(wgpu::PollType::Wait)
+            .map_err(|e| MoeRuntimeError::Unsupported(format!("WGPU device poll failed: {e}")))?;
         receiver
             .recv()
             .map_err(|e| MoeRuntimeError::Unsupported(format!("WGPU map callback failed: {e}")))?
