@@ -24,9 +24,10 @@ pub use executor::{
 };
 pub use native_decoder::*;
 pub use network::{
-    RUNTIME_NETWORK_PROTOCOL_VERSION, RuntimeNetworkMetrics, RuntimeNetworkRunRequest,
-    RuntimeNetworkRunResponse, RuntimeNetworkServer, RuntimeNetworkServerConfig,
-    RuntimeNetworkServerHandle, RuntimeNetworkTimings,
+    RUNTIME_NETWORK_PROTOCOL_VERSION, RuntimeNetworkAuthConfig, RuntimeNetworkLoadSheddingConfig,
+    RuntimeNetworkMetrics, RuntimeNetworkRunRequest, RuntimeNetworkRunResponse,
+    RuntimeNetworkServer, RuntimeNetworkServerConfig, RuntimeNetworkServerHandle,
+    RuntimeNetworkTimings,
 };
 pub use session::{
     ExecutionProvider, GraphOptimizationLevel, InitializerBinding, InitializerMemoryReport,

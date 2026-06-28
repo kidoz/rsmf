@@ -242,6 +242,15 @@ pub enum RuntimeError {
         /// Human-readable protocol error.
         reason: String,
     },
+    /// A network request did not satisfy the configured authentication policy.
+    #[error("runtime network request is unauthorized")]
+    NetworkUnauthorized,
+    /// A network request was rejected by transport-level overload policy.
+    #[error("runtime network request rejected by load shedding: {reason}")]
+    NetworkOverloaded {
+        /// Human-readable rejection reason.
+        reason: String,
+    },
     /// A network request used an unsupported protocol version.
     #[error("unsupported runtime network protocol version {version}; expected {supported_version}")]
     NetworkProtocolVersion {

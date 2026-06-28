@@ -154,6 +154,87 @@ fn network_server_rejects_unsupported_content_type() {
 }
 
 #[test]
+fn network_server_enforces_bearer_token_authentication() {
+    let dir = tempdir().unwrap();
+    let engine = add_graph_engine(dir.path().join("network-auth.rsmf"));
+    let server = start_test_network_server_with_network_config(
+        engine,
+        RuntimeExecutorConfig::default(),
+        RuntimeNetworkServerConfig {
+            auth: RuntimeNetworkAuthConfig::bearer_tokens(["secret-token"]),
+            ..RuntimeNetworkServerConfig::default()
+        },
+    );
+    let request = serde_json::json!({
+        "request_id": "net-auth",
+        "graph_idx": 0,
+        "inputs": {
+            "x": { "dtype": "f32", "shape": [2], "data": [1.0, 2.0] },
+            "y": { "dtype": "f32", "shape": [2], "data": [10.0, 20.0] }
+        }
+    })
+    .to_string();
+
+    let unauthenticated = format!(
+        "POST /v1/run HTTP/1.1\r\nhost: test\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{request}",
+        request.len()
+    );
+    let (status, body) = http_raw_json(server.local_addr(), &unauthenticated);
+    assert_eq!(status, 401);
+    assert_eq!(body["error"]["code"], "unauthorized");
+    assert_eq!(body["error"]["message"], "request is unauthorized");
+
+    let authenticated = format!(
+        "POST /v1/run HTTP/1.1\r\nhost: test\r\nauthorization: Bearer secret-token\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{request}",
+        request.len()
+    );
+    let (status, body) = http_raw_json(server.local_addr(), &authenticated);
+    assert_eq!(status, 200);
+    assert_eq!(body["request_id"], "net-auth");
+
+    server.shutdown().unwrap();
+}
+
+#[test]
+fn network_server_load_sheds_before_executor_submit() {
+    let dir = tempdir().unwrap();
+    let engine = add_graph_engine(dir.path().join("network-load-shed.rsmf"));
+    let server = start_test_network_server_with_network_config(
+        engine,
+        RuntimeExecutorConfig::default(),
+        RuntimeNetworkServerConfig {
+            load_shedding: RuntimeNetworkLoadSheddingConfig {
+                max_queue_depth: Some(0),
+                ..RuntimeNetworkLoadSheddingConfig::default()
+            },
+            ..RuntimeNetworkServerConfig::default()
+        },
+    );
+    let request = serde_json::json!({
+        "request_id": "net-load-shed",
+        "graph_idx": 0,
+        "inputs": {
+            "x": { "dtype": "f32", "shape": [2], "data": [1.0, 2.0] },
+            "y": { "dtype": "f32", "shape": [2], "data": [10.0, 20.0] }
+        }
+    });
+
+    let (status, body) = http_json(server.local_addr(), "POST", "/v1/run", Some(&request));
+    assert_eq!(status, 503);
+    assert_eq!(body["error"]["code"], "overloaded");
+    assert_eq!(
+        body["error"]["message"],
+        "request rejected by load shedding"
+    );
+
+    let (status, metrics) = http_json(server.local_addr(), "GET", "/metrics", None);
+    assert_eq!(status, 200);
+    assert_eq!(metrics["submitted"], 0);
+
+    server.shutdown().unwrap();
+}
+
+#[test]
 fn network_server_sanitizes_runtime_error_response() {
     let dir = tempdir().unwrap();
     let engine = add_graph_engine(dir.path().join("network-sanitized-error.rsmf"));

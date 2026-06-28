@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::fmt;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
@@ -28,6 +29,10 @@ pub struct RuntimeNetworkServerConfig {
     pub read_timeout: Duration,
     /// Per-connection write timeout.
     pub write_timeout: Duration,
+    /// Optional bearer-token authentication policy.
+    pub auth: RuntimeNetworkAuthConfig,
+    /// Optional transport-level overload rejection policy.
+    pub load_shedding: RuntimeNetworkLoadSheddingConfig,
 }
 
 impl Default for RuntimeNetworkServerConfig {
@@ -39,8 +44,61 @@ impl Default for RuntimeNetworkServerConfig {
             max_response_body_bytes: 64 * 1024 * 1024,
             read_timeout: Duration::from_secs(10),
             write_timeout: Duration::from_secs(10),
+            auth: RuntimeNetworkAuthConfig::default(),
+            load_shedding: RuntimeNetworkLoadSheddingConfig::default(),
         }
     }
+}
+
+/// Authentication policy for the dependency-light HTTP server.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct RuntimeNetworkAuthConfig {
+    /// Accepted bearer tokens. Empty means authentication is disabled.
+    pub bearer_tokens: Vec<String>,
+}
+
+impl RuntimeNetworkAuthConfig {
+    /// Build bearer-token authentication from accepted token strings.
+    #[must_use]
+    pub fn bearer_tokens(tokens: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        Self {
+            bearer_tokens: tokens.into_iter().map(Into::into).collect(),
+        }
+    }
+
+    fn is_enabled(&self) -> bool {
+        !self.bearer_tokens.is_empty()
+    }
+
+    fn accepts(&self, token: &str) -> bool {
+        self.bearer_tokens
+            .iter()
+            .any(|candidate| constant_time_str_eq(candidate, token))
+    }
+}
+
+impl fmt::Debug for RuntimeNetworkAuthConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RuntimeNetworkAuthConfig")
+            .field(
+                "bearer_tokens",
+                &format_args!("<{} configured>", self.bearer_tokens.len()),
+            )
+            .finish()
+    }
+}
+
+/// Local load-shedding policy for the dependency-light HTTP server.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct RuntimeNetworkLoadSheddingConfig {
+    /// Reject `POST /v1/run` when executor queue depth is at or above this
+    /// threshold. `None` disables the queue-depth transport gate.
+    pub max_queue_depth: Option<usize>,
+    /// Reject `POST /v1/run` when active executor request count is at or above
+    /// this threshold. `None` disables the active-request transport gate.
+    pub max_active_requests: Option<usize>,
+    /// Reject `POST /v1/run` while queued-memory pressure is soft or hard.
+    pub reject_on_memory_pressure: bool,
 }
 
 /// JSON request accepted by `POST /v1/run`.
@@ -356,13 +414,15 @@ struct RuntimeNetworkServerState {
     inflight: Mutex<HashMap<String, Option<RuntimeCancellationToken>>>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct RuntimeNetworkLimits {
     max_header_bytes: usize,
     max_body_bytes: usize,
     max_response_body_bytes: usize,
     read_timeout: Duration,
     write_timeout: Duration,
+    auth: RuntimeNetworkAuthConfig,
+    load_shedding: RuntimeNetworkLoadSheddingConfig,
 }
 
 impl From<&RuntimeNetworkServerConfig> for RuntimeNetworkLimits {
@@ -373,6 +433,8 @@ impl From<&RuntimeNetworkServerConfig> for RuntimeNetworkLimits {
             max_response_body_bytes: config.max_response_body_bytes,
             read_timeout: config.read_timeout,
             write_timeout: config.write_timeout,
+            auth: config.auth.clone(),
+            load_shedding: config.load_shedding.clone(),
         }
     }
 }
@@ -426,6 +488,7 @@ struct RuntimeHttpRequest {
     method: String,
     path: String,
     content_type: Option<String>,
+    authorization: Option<String>,
     body: Vec<u8>,
 }
 
@@ -441,6 +504,7 @@ fn network_accept_loop(
             Ok((stream, _)) => {
                 let executor = Arc::clone(&executor);
                 let state = Arc::clone(&state);
+                let limits = limits.clone();
                 std::thread::spawn(move || {
                     handle_network_connection(stream, executor, state, limits);
                 });
@@ -459,11 +523,11 @@ fn handle_network_connection(
     state: Arc<RuntimeNetworkServerState>,
     limits: RuntimeNetworkLimits,
 ) {
-    let response = read_http_request(&mut stream, limits)
-        .and_then(|request| route_network_request(request, &executor, &state));
+    let response = read_http_request(&mut stream, limits.clone())
+        .and_then(|request| route_network_request(request, &executor, &state, limits.clone()));
     match response {
         Ok(body) => {
-            if let Err(error) = write_json_response(&mut stream, 200, "OK", &body, limits) {
+            if let Err(error) = write_json_response(&mut stream, 200, "OK", &body, limits.clone()) {
                 let _ = write_network_error_response(&mut stream, &error, limits);
             }
         }
@@ -477,7 +541,9 @@ fn route_network_request(
     request: RuntimeHttpRequest,
     executor: &RuntimeExecutor,
     state: &RuntimeNetworkServerState,
+    limits: RuntimeNetworkLimits,
 ) -> Result<serde_json::Value> {
+    validate_network_auth(&request, &limits.auth)?;
     match (request.method.as_str(), request.path.as_str()) {
         ("GET", "/health") => Ok(serde_json::json!({
             "status": "ok",
@@ -489,6 +555,7 @@ fn route_network_request(
         }
         ("POST", "/v1/run") => {
             validate_json_content_type(request.content_type.as_deref())?;
+            enforce_network_load_shedding(executor, &limits.load_shedding)?;
             handle_network_run(request.body, executor, state)
         }
         _ if request.method == "GET" && request.path.starts_with("/v1/requests/") => {
@@ -526,6 +593,70 @@ fn route_network_request(
             reason: format!("unsupported route {} {}", request.method, request.path),
         }),
     }
+}
+
+fn validate_network_auth(
+    request: &RuntimeHttpRequest,
+    config: &RuntimeNetworkAuthConfig,
+) -> Result<()> {
+    if !config.is_enabled() || request.path == "/health" {
+        return Ok(());
+    }
+    let Some(header) = request.authorization.as_deref() else {
+        return Err(RuntimeError::NetworkUnauthorized);
+    };
+    let Some(token) = header.strip_prefix("Bearer ") else {
+        return Err(RuntimeError::NetworkUnauthorized);
+    };
+    if config.accepts(token.trim()) {
+        Ok(())
+    } else {
+        Err(RuntimeError::NetworkUnauthorized)
+    }
+}
+
+fn enforce_network_load_shedding(
+    executor: &RuntimeExecutor,
+    config: &RuntimeNetworkLoadSheddingConfig,
+) -> Result<()> {
+    if config.max_queue_depth.is_none()
+        && config.max_active_requests.is_none()
+        && !config.reject_on_memory_pressure
+    {
+        return Ok(());
+    }
+    let metrics = executor.metrics()?;
+    if let Some(limit) = config.max_queue_depth
+        && metrics.current_queue_depth >= limit
+    {
+        return Err(RuntimeError::NetworkOverloaded {
+            reason: format!(
+                "queue depth {} is at or above configured limit {limit}",
+                metrics.current_queue_depth
+            ),
+        });
+    }
+    if let Some(limit) = config.max_active_requests
+        && metrics.active_requests >= limit
+    {
+        return Err(RuntimeError::NetworkOverloaded {
+            reason: format!(
+                "active requests {} is at or above configured limit {limit}",
+                metrics.active_requests
+            ),
+        });
+    }
+    if config.reject_on_memory_pressure
+        && metrics.memory_pressure_level != RuntimeMemoryPressureLevel::Normal
+    {
+        return Err(RuntimeError::NetworkOverloaded {
+            reason: format!(
+                "queued-memory pressure is {:?}",
+                metrics.memory_pressure_level
+            ),
+        });
+    }
+    Ok(())
 }
 
 fn handle_network_run(
@@ -683,6 +814,7 @@ fn read_http_request(
 
     let mut content_length = 0usize;
     let mut content_type = None;
+    let mut authorization = None;
     for line in lines {
         if let Some((name, value)) = line.split_once(':')
             && name.trim().eq_ignore_ascii_case("content-length")
@@ -698,6 +830,10 @@ fn read_http_request(
             && name.trim().eq_ignore_ascii_case("content-type")
         {
             content_type = Some(value.trim().to_string());
+        } else if let Some((name, value)) = line.split_once(':')
+            && name.trim().eq_ignore_ascii_case("authorization")
+        {
+            authorization = Some(value.trim().to_string());
         } else if let Some((name, value)) = line.split_once(':')
             && name.trim().eq_ignore_ascii_case("transfer-encoding")
             && !value.trim().eq_ignore_ascii_case("identity")
@@ -732,6 +868,7 @@ fn read_http_request(
         method,
         path,
         content_type,
+        authorization,
         body: buffer[body_start..body_start + content_length].to_vec(),
     })
 }
@@ -786,6 +923,8 @@ fn network_error_status(error: &RuntimeError) -> (u16, &'static str, &'static st
     match error {
         RuntimeError::NetworkRequestNotFound { .. } => (404, "Not Found", "not_found"),
         RuntimeError::NetworkRequestAlreadyActive { .. } => (409, "Conflict", "conflict"),
+        RuntimeError::NetworkUnauthorized => (401, "Unauthorized", "unauthorized"),
+        RuntimeError::NetworkOverloaded { .. } => (503, "Service Unavailable", "overloaded"),
         RuntimeError::NetworkRequestBodyTooLarge { .. } => {
             (413, "Payload Too Large", "payload_too_large")
         }
@@ -856,6 +995,8 @@ fn network_public_error_message(error: &RuntimeError) -> String {
         RuntimeError::NetworkRequestAlreadyActive { .. } => {
             "request id is already active".to_string()
         }
+        RuntimeError::NetworkUnauthorized => "request is unauthorized".to_string(),
+        RuntimeError::NetworkOverloaded { .. } => "request rejected by load shedding".to_string(),
         RuntimeError::RequestDeadlineExceeded { .. } => "request deadline expired".to_string(),
         RuntimeError::RequestCancelled { .. } => "request was cancelled".to_string(),
         RuntimeError::ExecutorQueueFull { .. }
@@ -872,4 +1013,17 @@ fn network_public_error_message(error: &RuntimeError) -> String {
         RuntimeError::NetworkIo { .. } => "network I/O error".to_string(),
         _ => "runtime request failed".to_string(),
     }
+}
+
+fn constant_time_str_eq(left: &str, right: &str) -> bool {
+    let left = left.as_bytes();
+    let right = right.as_bytes();
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (left, right) in left.iter().zip(right) {
+        diff |= left ^ right;
+    }
+    diff == 0
 }
