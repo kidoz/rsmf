@@ -1,0 +1,23 @@
+# Vendored fork of `block` 0.1.6 (Steven Sheldon, MIT).
+#
+# Upstream `block` 0.1.6 is the last release (2018) and declares an `extern`
+# static of an uninhabited type, which Rust is phasing out (rust-lang/rust#74840,
+# "static of uninhabited type"). It only surfaces on macOS / WGPU-Metal feature
+# builds via `metal` and `wgpu-hal`, but it is a future hard error.
+#
+# This fork changes only the private `Class` placeholder from an uninhabited
+# `enum Class {}` to an inhabited opaque type so the static is legal. The public
+# API and ABI are identical, so `metal` / `wgpu-hal` build unchanged. Pulled in
+# through `[patch.crates-io]` in the workspace root.
+[package]
+name = "block"
+version = "0.1.6"
+edition = "2015"
+authors = [
+    "Steven Sheldon",
+    "rsmf maintainers <ckidoz@gmail.com>",
+]
+description = "Rust interface for Apple's C language extension of blocks (vendored fork fixing the uninhabited-static future-incompat lint)."
+keywords = ["blocks", "osx", "ios", "objective-c"]
+license = "MIT"
+repository = "https://github.com/kidoz/rsmf"

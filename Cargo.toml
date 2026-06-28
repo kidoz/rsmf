@@ -81,6 +81,13 @@ rsmf-moe-runtime = { path = "crates/rsmf-moe-runtime", version = "0.1.0" }
 rsmf-cuda = { path = "crates/rsmf-cuda", version = "0.1.0" }
 rsmf-metal = { path = "crates/rsmf-metal", version = "0.1.0" }
 
+# Vendored fork of `block` 0.1.6 (pulled transitively by `metal` and
+# `wgpu-hal`). Upstream is unmaintained and declares an `extern` static of an
+# uninhabited type, which Rust is phasing out (rust-lang/rust#74840). The fork
+# only fixes that one construct; the public API/ABI are unchanged.
+[patch.crates-io]
+block = { path = "vendor/block" }
+
 [profile.release]
 lto = "thin"
 codegen-units = 1
