@@ -7,10 +7,7 @@ use rsmf_core::{
     DeviceKind, MemoryTier, MoeRole, PlacementManifest, PrefetchIndex, RsmfFile, TensorDescriptor,
 };
 
-use crate::{
-    DeviceBatch, MoeRunOutput, MoeRunReport, MoeRuntimeError, Result, RuntimeBackend,
-    batch_by_destination,
-};
+use crate::{DeviceBatch, MoeRunOutput, MoeRunReport, MoeRuntimeError, Result, RuntimeBackend};
 
 /// Hidden activation used between expert projections.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -20,6 +17,23 @@ pub enum ExpertActivation {
     /// `hidden = silu(gate(x)) * up(x)`. Requires a `moe.role=gate` tensor for
     /// every expert.
     SiluGated,
+}
+
+/// Routing policy used by the generic routed MoE APIs.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum MoeRoutingPolicy {
+    /// Select the single highest-scoring expert for each token.
+    #[default]
+    Top1,
+    /// Select `k` highest-scoring experts for each token.
+    TopK {
+        /// Number of experts selected for every token.
+        k: usize,
+        /// Normalize selected router scores with a stable softmax before
+        /// combining expert outputs. When false, every selected expert uses
+        /// weight `1.0`.
+        normalize: bool,
+    },
 }
 
 /// Runtime construction options.
@@ -32,6 +46,9 @@ pub struct MoeRuntimeOptions {
     /// Enforce non-zero placement device capacity values against the decoded
     /// resident expert tensors planned for that device.
     pub enforce_device_capacity: bool,
+    /// Routing policy used by [`MoeRuntime::prepare_layer`] and the generic
+    /// routed execution APIs.
+    pub routing: MoeRoutingPolicy,
     /// Runtime resource limits checked before large allocations.
     pub limits: RuntimeLimits,
 }
@@ -42,6 +59,7 @@ impl Default for MoeRuntimeOptions {
             prefer_wgpu: false,
             activation: ExpertActivation::Identity,
             enforce_device_capacity: true,
+            routing: MoeRoutingPolicy::Top1,
             limits: RuntimeLimits::default(),
         }
     }
@@ -192,6 +210,110 @@ pub struct PlannedDevice {
     pub prefetch_groups: Vec<String>,
 }
 
+/// Host/device transfer kind needed for a resident expert shard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MoeTransferKind {
+    /// No device transfer is required for this shard.
+    None,
+    /// The resident tensors must move from host memory to a device tier.
+    HostToDevice,
+    /// The resident tensors must move from a device tier back to host memory.
+    DeviceToHost,
+    /// The resident tensors must move between two device ids.
+    PeerToPeer,
+    /// The runtime cannot express the required transfer for this shard.
+    Unsupported,
+}
+
+/// Planned transfer for one resident expert shard.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MoeTransferStep {
+    /// Expert id whose resident tensors are covered by this step.
+    pub expert_id: u32,
+    /// Shard id that owns the expert tensors.
+    pub shard_id: u64,
+    /// Tensor names included in this step.
+    pub tensor_names: Vec<String>,
+    /// Source placement device, when the source is a device.
+    pub source_device_id: Option<u32>,
+    /// Destination placement device, when the destination is a device.
+    pub destination_device_id: Option<u32>,
+    /// Transfer kind.
+    pub kind: MoeTransferKind,
+    /// Planned transfer size in decoded resident bytes.
+    pub bytes: usize,
+    /// Human-readable reason for the selected transfer kind.
+    pub reason: String,
+}
+
+/// Transfer-planning summary for a prepared MoE layer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MoeTransferPlan {
+    /// Planned transfer steps.
+    pub steps: Vec<MoeTransferStep>,
+    /// Sum of bytes for steps that require movement.
+    pub planned_bytes: usize,
+    /// Number of steps marked unsupported.
+    pub unsupported_count: usize,
+}
+
+/// Multi-adapter dispatch capability exposed by a prepared plan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MultiAdapterStatus {
+    /// CPU execution does not use GPU adapters.
+    CpuOnly,
+    /// Requested logical WGPU devices are backed by available WGPU adapters.
+    Available {
+        /// Number of requested placement devices.
+        requested_devices: usize,
+        /// Number of available physical adapters.
+        available_adapters: usize,
+    },
+    /// A single physical WGPU adapter backs multiple logical placement devices.
+    LogicalSingleAdapter {
+        /// Number of requested placement devices.
+        requested_devices: usize,
+        /// Number of available physical adapters.
+        available_adapters: usize,
+    },
+    /// Multi-adapter dispatch is unavailable.
+    Unavailable {
+        /// Human-readable reason.
+        reason: String,
+    },
+}
+
+/// Collective operation kind planned for tensor-parallel execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MoeCollectiveKind {
+    /// Sum equally-shaped partial outputs element-wise.
+    AllReduceSum,
+    /// Concatenate partial outputs in order.
+    Gather,
+}
+
+/// One planned collective operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MoeCollectiveStep {
+    /// Collective kind.
+    pub kind: MoeCollectiveKind,
+    /// Participating placement device ids.
+    pub device_ids: Vec<u32>,
+    /// Number of f32 elements processed by the collective when known.
+    pub element_count: Option<usize>,
+    /// Human-readable reason for this collective.
+    pub reason: String,
+}
+
+/// Tensor-parallel collective plan for a prepared MoE layer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MoeCollectivePlan {
+    /// Planned collective steps.
+    pub steps: Vec<MoeCollectiveStep>,
+    /// True when tensor-parallel execution needs collectives.
+    pub required: bool,
+}
+
 /// Prepared layer placement and residency summary.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MoeLayerPlanReport {
@@ -203,6 +325,8 @@ pub struct MoeLayerPlanReport {
     pub output_width: usize,
     /// Number of routed experts in the layer.
     pub expert_count: usize,
+    /// Routing policy validated for this plan.
+    pub routing_policy: MoeRoutingPolicy,
     /// Total decoded f32 expert bytes resident in this plan.
     pub resident_bytes: usize,
     /// Planned experts.
@@ -213,6 +337,12 @@ pub struct MoeLayerPlanReport {
     pub multi_device: bool,
     /// Human-readable tensor-parallelism status for this plan.
     pub tensor_parallelism: TensorParallelismStatus,
+    /// Planned host/device transfer work for resident expert weights.
+    pub transfer_plan: MoeTransferPlan,
+    /// Multi-adapter dispatch capability for this plan.
+    pub multi_adapter: MultiAdapterStatus,
+    /// Collective operations required by tensor-parallel execution.
+    pub collective_plan: MoeCollectivePlan,
 }
 
 /// Tensor-parallel execution status for a prepared MoE layer.
@@ -226,6 +356,44 @@ pub enum TensorParallelismStatus {
         /// Human-readable reason.
         reason: String,
     },
+}
+
+/// CPU reference collectives used to validate future tensor-parallel backends.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CpuCollectives;
+
+impl CpuCollectives {
+    /// Sum equally-shaped f32 partitions element-wise.
+    pub fn all_reduce_sum(parts: &[&[f32]]) -> Result<Vec<f32>> {
+        let Some(first) = parts.first() else {
+            return Ok(Vec::new());
+        };
+        let mut out = vec![0.0; first.len()];
+        for (idx, part) in parts.iter().enumerate() {
+            if part.len() != first.len() {
+                return Err(MoeRuntimeError::Shape(format!(
+                    "all_reduce_sum part {idx} has length {}, expected {}",
+                    part.len(),
+                    first.len()
+                )));
+            }
+            for (out, value) in out.iter_mut().zip(*part) {
+                *out += value;
+            }
+        }
+        Ok(out)
+    }
+
+    /// Concatenate f32 partitions in order.
+    #[must_use]
+    pub fn gather(parts: &[&[f32]]) -> Vec<f32> {
+        let len = parts.iter().map(|part| part.len()).sum();
+        let mut out = Vec::with_capacity(len);
+        for part in parts {
+            out.extend_from_slice(part);
+        }
+        out
+    }
 }
 
 /// Resident, validated MoE layer plan.
@@ -362,10 +530,20 @@ impl MoeRuntime {
     ///
     /// The returned plan owns decoded f32 router and expert weights, validates
     /// placement capacity/limits, and can be reused across many token batches
-    /// with [`Self::run_prepared_layer_top1`].
+    /// with [`Self::run_prepared_layer_routed`]. The configured
+    /// [`MoeRuntimeOptions::routing`] policy is validated against `moe.top_k`.
     pub fn prepare_layer(&self, layer: u32, input_width: usize) -> Result<MoeLayerPlan> {
-        let loaded = self.load_layer(layer, input_width)?;
-        let report = self.plan_report(layer, input_width, &loaded)?;
+        self.prepare_layer_for_policy(layer, input_width, self.options.routing)
+    }
+
+    fn prepare_layer_for_policy(
+        &self,
+        layer: u32,
+        input_width: usize,
+        routing_policy: MoeRoutingPolicy,
+    ) -> Result<MoeLayerPlan> {
+        let loaded = self.load_layer(layer, input_width, routing_policy)?;
+        let report = self.plan_report(layer, input_width, routing_policy, &loaded)?;
         self.options.limits.check_experts(report.expert_count)?;
         self.options.limits.check_devices(report.devices.len())?;
         for device in &report.devices {
@@ -403,7 +581,7 @@ impl MoeRuntime {
         input: &[f32],
         input_width: usize,
     ) -> Result<MoeRunOutput> {
-        let plan = self.prepare_layer(layer, input_width)?;
+        let plan = self.prepare_layer_for_policy(layer, input_width, MoeRoutingPolicy::Top1)?;
         self.run_prepared_layer_top1(&plan, input)
     }
 
@@ -415,16 +593,47 @@ impl MoeRuntime {
         plan: &MoeLayerPlan,
         input: &[f32],
     ) -> Result<MoeRunOutput> {
+        self.run_prepared_layer_with_policy(plan, input, MoeRoutingPolicy::Top1)
+    }
+
+    /// Run one MoE layer using [`MoeRuntimeOptions::routing`].
+    ///
+    /// This is the generic routed API for top-1 and top-k execution.
+    pub fn run_layer_routed(
+        &self,
+        layer: u32,
+        input: &[f32],
+        input_width: usize,
+    ) -> Result<MoeRunOutput> {
+        let plan = self.prepare_layer(layer, input_width)?;
+        self.run_prepared_layer_routed(&plan, input)
+    }
+
+    /// Run a prepared layer using the plan's routing policy.
+    pub fn run_prepared_layer_routed(
+        &self,
+        plan: &MoeLayerPlan,
+        input: &[f32],
+    ) -> Result<MoeRunOutput> {
+        self.run_prepared_layer_with_policy(plan, input, plan.report.routing_policy)
+    }
+
+    fn run_prepared_layer_with_policy(
+        &self,
+        plan: &MoeLayerPlan,
+        input: &[f32],
+        routing_policy: MoeRoutingPolicy,
+    ) -> Result<MoeRunOutput> {
         let token_count = checked_token_count(input, plan.input_width)?;
         self.options.limits.check_tokens(token_count)?;
 
         let gating_start = Instant::now();
-        let assignments = route_top1(&plan.loaded.router, input, token_count)?;
+        let assignments =
+            route_assignments(&plan.loaded.router, input, token_count, routing_policy)?;
         let gating_time = gating_start.elapsed();
 
         let dispatch_start = Instant::now();
-        let routing_batches = batch_by_destination(&assignments);
-        let device_batches = self.device_batches(&plan.loaded, &routing_batches)?;
+        let device_batches = self.device_batches(&plan.loaded, &assignments)?;
         let dispatch_time = dispatch_start.elapsed();
 
         let compute_start = Instant::now();
@@ -472,7 +681,7 @@ impl MoeRuntime {
         input: &[f32],
         input_width: usize,
     ) -> Result<Vec<f32>> {
-        let plan = self.prepare_layer(layer, input_width)?;
+        let plan = self.prepare_layer_for_policy(layer, input_width, MoeRoutingPolicy::Top1)?;
         self.run_prepared_layer_reference_top1(&plan, input)
     }
 
@@ -482,25 +691,63 @@ impl MoeRuntime {
         plan: &MoeLayerPlan,
         input: &[f32],
     ) -> Result<Vec<f32>> {
+        self.run_prepared_layer_reference_with_policy(plan, input, MoeRoutingPolicy::Top1)
+    }
+
+    /// Run the single-device reference path using [`MoeRuntimeOptions::routing`].
+    pub fn run_layer_reference_routed(
+        &self,
+        layer: u32,
+        input: &[f32],
+        input_width: usize,
+    ) -> Result<Vec<f32>> {
+        let plan = self.prepare_layer(layer, input_width)?;
+        self.run_prepared_layer_reference_routed(&plan, input)
+    }
+
+    /// Run the single-device reference path with a prepared resident plan and
+    /// its routing policy.
+    pub fn run_prepared_layer_reference_routed(
+        &self,
+        plan: &MoeLayerPlan,
+        input: &[f32],
+    ) -> Result<Vec<f32>> {
+        self.run_prepared_layer_reference_with_policy(plan, input, plan.report.routing_policy)
+    }
+
+    fn run_prepared_layer_reference_with_policy(
+        &self,
+        plan: &MoeLayerPlan,
+        input: &[f32],
+        routing_policy: MoeRoutingPolicy,
+    ) -> Result<Vec<f32>> {
         let token_count = checked_token_count(input, plan.input_width)?;
         self.options.limits.check_tokens(token_count)?;
-        let assignments = route_top1(&plan.loaded.router, input, token_count)?;
+        let assignments =
+            route_assignments(&plan.loaded.router, input, token_count, routing_policy)?;
         let total_output_len = output_len(token_count, plan.loaded.output_width)?;
         self.options
             .limits
             .check_output_elements(total_output_len)?;
         let mut output = vec![0.0; total_output_len];
-        for (token_idx, expert_id) in assignments.iter().copied().enumerate() {
+        for assignment in assignments {
             let expert = plan
                 .loaded
                 .experts
-                .get(&expert_id)
-                .ok_or_else(|| MoeRuntimeError::Missing(format!("expert {expert_id}")))?;
-            let input_row =
-                &input[token_idx * plan.input_width..(token_idx + 1) * plan.input_width];
+                .get(&assignment.expert_id)
+                .ok_or_else(|| {
+                    MoeRuntimeError::Missing(format!("expert {}", assignment.expert_id))
+                })?;
+            let input_row = &input[assignment.token_idx * plan.input_width
+                ..(assignment.token_idx + 1) * plan.input_width];
             let row = eval_expert(input_row, expert, self.options.activation)?;
-            let out_start = token_idx * plan.loaded.output_width;
-            output[out_start..out_start + plan.loaded.output_width].copy_from_slice(&row);
+            let out_start = assignment.token_idx * plan.loaded.output_width;
+            for (dst, value) in output[out_start..out_start + plan.loaded.output_width]
+                .iter_mut()
+                .zip(row)
+            {
+                *dst += value * assignment.weight;
+            }
         }
         Ok(output)
     }
@@ -514,7 +761,7 @@ impl MoeRuntime {
         input_width: usize,
         tolerance: f32,
     ) -> Result<MoeCheckedRunOutput> {
-        let plan = self.prepare_layer(layer, input_width)?;
+        let plan = self.prepare_layer_for_policy(layer, input_width, MoeRoutingPolicy::Top1)?;
         self.run_prepared_layer_top1_checked(&plan, input, tolerance)
     }
 
@@ -551,15 +798,59 @@ impl MoeRuntime {
         })
     }
 
-    fn load_layer(&self, layer: u32, input_width: usize) -> Result<LoadedLayer> {
-        let moe = self.file.moe_experts()?;
-        if let Some(top_k) = moe.top_k
-            && top_k != 1
-        {
-            return Err(MoeRuntimeError::Unsupported(format!(
-                "run_layer_top1 requires moe.top_k=1, got {top_k}"
+    /// Run placement-aware routed execution and compare it to the reference path.
+    pub fn run_layer_routed_checked(
+        &self,
+        layer: u32,
+        input: &[f32],
+        input_width: usize,
+        tolerance: f32,
+    ) -> Result<MoeCheckedRunOutput> {
+        let plan = self.prepare_layer(layer, input_width)?;
+        self.run_prepared_layer_routed_checked(&plan, input, tolerance)
+    }
+
+    /// Run a prepared routed layer and compare it to the reference path.
+    pub fn run_prepared_layer_routed_checked(
+        &self,
+        plan: &MoeLayerPlan,
+        input: &[f32],
+        tolerance: f32,
+    ) -> Result<MoeCheckedRunOutput> {
+        if tolerance.is_sign_negative() || !tolerance.is_finite() {
+            return Err(MoeRuntimeError::Shape(format!(
+                "reference tolerance must be non-negative and finite, got {tolerance}"
             )));
         }
+        let routed_start = Instant::now();
+        let routed = self.run_prepared_layer_routed(plan, input)?;
+        let routed_wall_time = routed_start.elapsed();
+        let reference_start = Instant::now();
+        let reference_output = self.run_prepared_layer_reference_routed(plan, input)?;
+        let reference_wall_time = reference_start.elapsed();
+        let max_abs_diff = max_abs_diff(&routed.output, &reference_output)?;
+        Ok(MoeCheckedRunOutput {
+            comparison: MoeReferenceComparison {
+                max_abs_diff,
+                tolerance,
+                passed: max_abs_diff <= tolerance,
+                routed_wall_time,
+                reference_wall_time,
+                speedup: speedup(reference_wall_time, routed_wall_time),
+            },
+            routed,
+            reference_output,
+        })
+    }
+
+    fn load_layer(
+        &self,
+        layer: u32,
+        input_width: usize,
+        routing_policy: MoeRoutingPolicy,
+    ) -> Result<LoadedLayer> {
+        let moe = self.file.moe_experts()?;
+        validate_top_k_metadata(moe.top_k, routing_policy)?;
 
         let mut router_entries = moe
             .entries
@@ -593,6 +884,7 @@ impl MoeRuntime {
                 router_entry.tensor_name
             )));
         }
+        validate_routing_policy(routing_policy, router.rows)?;
         let router_rows = u32::try_from(router.rows).map_err(|_| {
             MoeRuntimeError::Shape(format!(
                 "router {} row count exceeds u32::MAX",
@@ -751,6 +1043,7 @@ impl MoeRuntime {
         &self,
         layer: u32,
         input_width: usize,
+        routing_policy: MoeRoutingPolicy,
         loaded: &LoadedLayer,
     ) -> Result<MoeLayerPlanReport> {
         let mut experts = Vec::with_capacity(loaded.experts.len());
@@ -785,22 +1078,130 @@ impl MoeRuntime {
             )?;
         }
 
+        let transfer_plan = self.transfer_plan(&experts)?;
+        let collective_plan = collective_plan_for_devices(&devices);
         let devices = devices
             .into_values()
             .map(PlannedDeviceBuilder::finish)
             .collect::<Vec<_>>();
         let multi_device = devices.len() > 1;
+        let multi_adapter = self.multi_adapter_status(&devices);
         Ok(MoeLayerPlanReport {
             layer,
             input_width,
             output_width: loaded.output_width,
             expert_count: loaded.experts.len(),
+            routing_policy,
             resident_bytes,
             experts,
             devices,
             multi_device,
             tensor_parallelism: TensorParallelismStatus::NotRequired,
+            transfer_plan,
+            multi_adapter,
+            collective_plan,
         })
+    }
+
+    fn transfer_plan(&self, experts: &[PlannedExpert]) -> Result<MoeTransferPlan> {
+        let mut steps = Vec::with_capacity(experts.len());
+        let mut planned_bytes = 0usize;
+        let mut unsupported_count = 0usize;
+        for expert in experts {
+            let descriptor = self.device_descriptor(expert.device_id)?;
+            let mut tensor_names = vec![expert.up_tensor.clone(), expert.down_tensor.clone()];
+            if let Some(gate_tensor) = &expert.gate_tensor {
+                tensor_names.push(gate_tensor.clone());
+            }
+            let (kind, source_device_id, destination_device_id, reason) =
+                match (descriptor.kind, descriptor.tier) {
+                    (DeviceKind::Cpu, _) | (_, MemoryTier::Ram) => (
+                        MoeTransferKind::None,
+                        None,
+                        None,
+                        "expert tensors remain host-resident".to_string(),
+                    ),
+                    (_, MemoryTier::Vram) => (
+                        MoeTransferKind::HostToDevice,
+                        None,
+                        Some(descriptor.id),
+                        format!(
+                            "expert tensors are resident on {:?} {:?}",
+                            descriptor.kind, descriptor.tier
+                        ),
+                    ),
+                    _ => (
+                        MoeTransferKind::Unsupported,
+                        None,
+                        Some(descriptor.id),
+                        format!(
+                            "unsupported placement tier {:?} for {:?}",
+                            descriptor.tier, descriptor.kind
+                        ),
+                    ),
+                };
+            if kind == MoeTransferKind::Unsupported {
+                unsupported_count += 1;
+            } else if kind != MoeTransferKind::None {
+                planned_bytes = planned_bytes
+                    .checked_add(expert.resident_bytes)
+                    .ok_or_else(|| {
+                        MoeRuntimeError::Shape("transfer plan byte count overflow".to_string())
+                    })?;
+            }
+            steps.push(MoeTransferStep {
+                expert_id: expert.expert_id,
+                shard_id: expert.shard_id,
+                tensor_names,
+                source_device_id,
+                destination_device_id,
+                kind,
+                bytes: expert.resident_bytes,
+                reason,
+            });
+        }
+        Ok(MoeTransferPlan {
+            steps,
+            planned_bytes,
+            unsupported_count,
+        })
+    }
+
+    fn multi_adapter_status(&self, devices: &[PlannedDevice]) -> MultiAdapterStatus {
+        match &self.backend {
+            RuntimeBackend::CpuFallback { reason } => {
+                if self.options.prefer_wgpu {
+                    MultiAdapterStatus::Unavailable {
+                        reason: reason.clone(),
+                    }
+                } else {
+                    MultiAdapterStatus::CpuOnly
+                }
+            }
+            RuntimeBackend::WgpuCompute {
+                requested_devices,
+                available_adapters,
+                ..
+            } => {
+                let requested = (*requested_devices).max(
+                    devices
+                        .iter()
+                        .filter(|device| device.kind == DeviceKind::Wgpu)
+                        .count(),
+                );
+                if requested <= *available_adapters {
+                    MultiAdapterStatus::Available {
+                        requested_devices: requested,
+                        available_adapters: *available_adapters,
+                    }
+                } else {
+                    MultiAdapterStatus::LogicalSingleAdapter {
+                        requested_devices: requested,
+                        available_adapters: *available_adapters,
+                    }
+                }
+            }
+        }
     }
 
     fn placement_for_shard(&self, shard_id: u64) -> Result<&rsmf_core::PlacementRecord> {
@@ -881,8 +1282,9 @@ impl MoeRuntime {
     fn device_batches(
         &self,
         loaded: &LoadedLayer,
-        batches: &[crate::RoutingBatch],
+        assignments: &[RoutedAssignment],
     ) -> Result<Vec<DeviceBatch>> {
+        let batches = weighted_batches_by_destination(assignments);
         let mut out = Vec::with_capacity(batches.len());
         for batch in batches {
             let expert = loaded
@@ -893,7 +1295,8 @@ impl MoeRuntime {
                 expert_id: batch.expert_id,
                 shard_id: expert.shard_id,
                 device_id: expert.device_id,
-                token_indices: batch.token_indices.clone(),
+                token_indices: batch.token_indices,
+                token_weights: batch.token_weights,
                 prefetch_groups: expert.prefetch_groups.clone(),
             });
         }
@@ -951,11 +1354,16 @@ impl MoeRuntime {
                 let expert = loaded.experts.get(&batch.expert_id).ok_or_else(|| {
                     MoeRuntimeError::Missing(format!("expert {}", batch.expert_id))
                 })?;
-                for &token_idx in &batch.token_indices {
+                for (&token_idx, &weight) in batch.token_indices.iter().zip(&batch.token_weights) {
                     let input_row = &input[token_idx * input_width..(token_idx + 1) * input_width];
                     let row = eval_expert(input_row, expert, self.options.activation)?;
                     let out_start = token_idx * loaded.output_width;
-                    output[out_start..out_start + loaded.output_width].copy_from_slice(&row);
+                    for (dst, value) in output[out_start..out_start + loaded.output_width]
+                        .iter_mut()
+                        .zip(row)
+                    {
+                        *dst += value * weight;
+                    }
                 }
             }
             device_runs.push(DeviceRunReport {
@@ -1042,11 +1450,20 @@ impl MoeRuntime {
                     &hidden,
                     batch.token_indices.len(),
                 )?;
-                for (batch_row, &token_idx) in batch.token_indices.iter().enumerate() {
+                for (batch_row, (&token_idx, &weight)) in batch
+                    .token_indices
+                    .iter()
+                    .zip(&batch.token_weights)
+                    .enumerate()
+                {
                     let src_start = batch_row * loaded.output_width;
                     let dst_start = token_idx * loaded.output_width;
-                    output[dst_start..dst_start + loaded.output_width]
-                        .copy_from_slice(&batch_output[src_start..src_start + loaded.output_width]);
+                    for (dst, value) in output[dst_start..dst_start + loaded.output_width]
+                        .iter_mut()
+                        .zip(&batch_output[src_start..src_start + loaded.output_width])
+                    {
+                        *dst += value * weight;
+                    }
                 }
             }
             device_runs.push(DeviceRunReport {
@@ -1108,6 +1525,20 @@ struct Matrix {
     rows: usize,
     cols: usize,
     data: Vec<f32>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RoutedAssignment {
+    token_idx: usize,
+    expert_id: u32,
+    weight: f32,
+}
+
+#[derive(Debug)]
+struct WeightedRoutingBatch {
+    expert_id: u32,
+    token_indices: Vec<usize>,
+    token_weights: Vec<f32>,
 }
 
 #[derive(Debug)]
@@ -1221,7 +1652,62 @@ fn speedup(reference: Duration, routed: Duration) -> f64 {
     reference.as_secs_f64() / routed_secs
 }
 
-fn route_top1(router: &Matrix, input: &[f32], token_count: usize) -> Result<Vec<u32>> {
+fn validate_top_k_metadata(top_k: Option<u32>, routing_policy: MoeRoutingPolicy) -> Result<()> {
+    let requested = match routing_policy {
+        MoeRoutingPolicy::Top1 => 1,
+        MoeRoutingPolicy::TopK { k, .. } => u32::try_from(k).map_err(|_| {
+            MoeRuntimeError::Shape(format!("routing top-k value {k} exceeds u32::MAX"))
+        })?,
+    };
+    if let Some(top_k) = top_k
+        && top_k != requested
+    {
+        return Err(MoeRuntimeError::Unsupported(format!(
+            "routing policy requires moe.top_k={requested}, got {top_k}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_routing_policy(routing_policy: MoeRoutingPolicy, expert_count: usize) -> Result<()> {
+    match routing_policy {
+        MoeRoutingPolicy::Top1 => Ok(()),
+        MoeRoutingPolicy::TopK { k, .. } => {
+            if k == 0 {
+                return Err(MoeRuntimeError::Shape(
+                    "routing top-k must be greater than zero".to_string(),
+                ));
+            }
+            if k > expert_count {
+                return Err(MoeRuntimeError::Shape(format!(
+                    "routing top-k {k} exceeds expert count {expert_count}"
+                )));
+            }
+            Ok(())
+        }
+    }
+}
+
+fn route_assignments(
+    router: &Matrix,
+    input: &[f32],
+    token_count: usize,
+    routing_policy: MoeRoutingPolicy,
+) -> Result<Vec<RoutedAssignment>> {
+    validate_routing_policy(routing_policy, router.rows)?;
+    match routing_policy {
+        MoeRoutingPolicy::Top1 => route_top1_assignments(router, input, token_count),
+        MoeRoutingPolicy::TopK { k, normalize } => {
+            route_topk_assignments(router, input, token_count, k, normalize)
+        }
+    }
+}
+
+fn route_top1_assignments(
+    router: &Matrix,
+    input: &[f32],
+    token_count: usize,
+) -> Result<Vec<RoutedAssignment>> {
     let mut assignments = Vec::with_capacity(token_count);
     for token_idx in 0..token_count {
         let token = &input[token_idx * router.cols..(token_idx + 1) * router.cols];
@@ -1235,9 +1721,103 @@ fn route_top1(router: &Matrix, input: &[f32], token_count: usize) -> Result<Vec<
                 best_expert = expert_id;
             }
         }
-        assignments.push(best_expert as u32);
+        assignments.push(RoutedAssignment {
+            token_idx,
+            expert_id: best_expert as u32,
+            weight: 1.0,
+        });
     }
     Ok(assignments)
+}
+
+fn route_topk_assignments(
+    router: &Matrix,
+    input: &[f32],
+    token_count: usize,
+    k: usize,
+    normalize: bool,
+) -> Result<Vec<RoutedAssignment>> {
+    let mut assignments =
+        Vec::with_capacity(token_count.checked_mul(k).ok_or_else(|| {
+            MoeRuntimeError::Shape("routing assignment count overflow".to_string())
+        })?);
+    let mut scores = Vec::with_capacity(router.rows);
+    for token_idx in 0..token_count {
+        let token = &input[token_idx * router.cols..(token_idx + 1) * router.cols];
+        scores.clear();
+        for expert_id in 0..router.rows {
+            scores.push((expert_id, dot(router.row(expert_id), token)?));
+        }
+        scores.sort_by(|(left_id, left_score), (right_id, right_score)| {
+            right_score
+                .total_cmp(left_score)
+                .then_with(|| left_id.cmp(right_id))
+        });
+        let selected = &scores[..k];
+        if normalize {
+            let max_score = selected
+                .iter()
+                .map(|(_, score)| *score)
+                .fold(f32::NEG_INFINITY, f32::max);
+            let mut denom = 0.0f32;
+            let mut weights = Vec::with_capacity(k);
+            for (_, score) in selected {
+                let weight = (*score - max_score).exp();
+                denom += weight;
+                weights.push(weight);
+            }
+            if denom == 0.0 || !denom.is_finite() {
+                return Err(MoeRuntimeError::Shape(
+                    "top-k softmax denominator is not finite".to_string(),
+                ));
+            }
+            for ((expert_id, _), weight) in selected.iter().zip(weights) {
+                assignments.push(RoutedAssignment {
+                    token_idx,
+                    expert_id: *expert_id as u32,
+                    weight: weight / denom,
+                });
+            }
+        } else {
+            for (expert_id, _) in selected {
+                assignments.push(RoutedAssignment {
+                    token_idx,
+                    expert_id: *expert_id as u32,
+                    weight: 1.0,
+                });
+            }
+        }
+    }
+    Ok(assignments)
+}
+
+fn weighted_batches_by_destination(assignments: &[RoutedAssignment]) -> Vec<WeightedRoutingBatch> {
+    let mut batches: Vec<WeightedRoutingBatch> = Vec::new();
+    for assignment in assignments {
+        if let Some(batch) = batches
+            .iter_mut()
+            .find(|batch| batch.expert_id == assignment.expert_id)
+        {
+            batch.token_indices.push(assignment.token_idx);
+            batch.token_weights.push(assignment.weight);
+        } else {
+            batches.push(WeightedRoutingBatch {
+                expert_id: assignment.expert_id,
+                token_indices: vec![assignment.token_idx],
+                token_weights: vec![assignment.weight],
+            });
+        }
+    }
+    batches
+}
+
+fn collective_plan_for_devices(
+    _devices: &BTreeMap<u32, PlannedDeviceBuilder>,
+) -> MoeCollectivePlan {
+    MoeCollectivePlan {
+        steps: Vec::new(),
+        required: false,
+    }
 }
 
 fn eval_expert(

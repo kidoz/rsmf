@@ -36,9 +36,11 @@ mod wgpu_compute;
 
 pub use routing::{RoutingBatch, batch_by_destination};
 pub use runtime::{
-    DeviceRunReport, ExpertActivation, MoeCheckedRunOutput, MoeLayerPlan, MoeLayerPlanReport,
-    MoeReferenceComparison, MoeRuntime, MoeRuntimeOptions, PlannedDevice, PlannedExpert,
-    RuntimeLimits, TensorParallelismStatus,
+    CpuCollectives, DeviceRunReport, ExpertActivation, MoeCheckedRunOutput, MoeCollectiveKind,
+    MoeCollectivePlan, MoeCollectiveStep, MoeLayerPlan, MoeLayerPlanReport, MoeReferenceComparison,
+    MoeRoutingPolicy, MoeRuntime, MoeRuntimeOptions, MoeTransferKind, MoeTransferPlan,
+    MoeTransferStep, MultiAdapterStatus, PlannedDevice, PlannedExpert, RuntimeLimits,
+    TensorParallelismStatus,
 };
 
 /// Result alias for the MoE runtime crate.
@@ -83,8 +85,8 @@ pub enum RuntimeBackend {
     },
 }
 
-/// One expert batch after host-side top-1 gating and placement lookup.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// One expert batch after host-side routing and placement lookup.
+#[derive(Debug, Clone, PartialEq)]
 pub struct DeviceBatch {
     /// Expert id selected by the router.
     pub expert_id: u32,
@@ -94,6 +96,8 @@ pub struct DeviceBatch {
     pub device_id: u32,
     /// Token indices routed to this expert.
     pub token_indices: Vec<usize>,
+    /// Per-token combine weights aligned with `token_indices`.
+    pub token_weights: Vec<f32>,
     /// Prefetch groups associated with this expert's variants.
     pub prefetch_groups: Vec<String>,
 }

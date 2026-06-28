@@ -10,7 +10,8 @@ use rsmf_core::{
     PlacementManifest, PlacementRecord, RsmfFile,
 };
 use rsmf_moe_runtime::{
-    ExpertActivation, MoeRuntime, MoeRuntimeError, MoeRuntimeOptions, RuntimeBackend, RuntimeLimits,
+    CpuCollectives, ExpertActivation, MoeRoutingPolicy, MoeRuntime, MoeRuntimeError,
+    MoeRuntimeOptions, MoeTransferKind, RuntimeBackend, RuntimeLimits,
 };
 use tempfile::{TempDir, tempdir};
 
@@ -244,12 +245,20 @@ fn two_shard_runtime_matches_single_device_reference() {
     assert_eq!(parallel.report.device_batches[0].device_id, 0);
     assert_eq!(parallel.report.device_batches[0].token_indices, vec![0, 2]);
     assert_eq!(
+        parallel.report.device_batches[0].token_weights,
+        vec![1.0, 1.0]
+    );
+    assert_eq!(
         parallel.report.device_batches[0].prefetch_groups,
         vec!["layer0.expert0"]
     );
     assert_eq!(parallel.report.device_batches[1].expert_id, 1);
     assert_eq!(parallel.report.device_batches[1].device_id, 1);
     assert_eq!(parallel.report.device_batches[1].token_indices, vec![1, 3]);
+    assert_eq!(
+        parallel.report.device_batches[1].token_weights,
+        vec![1.0, 1.0]
+    );
     assert!(matches!(
         parallel.report.backend,
         RuntimeBackend::CpuFallback { .. }
@@ -266,6 +275,7 @@ fn prepared_layer_plan_reports_residency_and_reuses_weights() {
     assert_eq!(plan.layer(), 0);
     assert_eq!(plan.input_width(), 2);
     assert_eq!(plan.report().expert_count, 2);
+    assert_eq!(plan.report().routing_policy, MoeRoutingPolicy::Top1);
     assert_eq!(plan.report().resident_bytes, 64);
     assert!(plan.report().multi_device);
     assert_eq!(plan.report().devices.len(), 2);
@@ -275,6 +285,15 @@ fn prepared_layer_plan_reports_residency_and_reuses_weights() {
     assert_eq!(plan.report().devices[1].device_id, 1);
     assert_eq!(plan.report().devices[1].resident_bytes, 32);
     assert_eq!(plan.report().devices[1].expert_ids, vec![1]);
+    assert_eq!(plan.report().transfer_plan.steps.len(), 2);
+    assert_eq!(plan.report().transfer_plan.planned_bytes, 64);
+    assert_eq!(plan.report().transfer_plan.unsupported_count, 0);
+    assert_eq!(
+        plan.report().transfer_plan.steps[0].kind,
+        MoeTransferKind::HostToDevice
+    );
+    assert!(!plan.report().collective_plan.required);
+    assert!(plan.report().collective_plan.steps.is_empty());
 
     let input = vec![2.0, 1.0, 1.0, 3.0, 4.0, 0.0, 0.0, 5.0];
     let output = runtime.run_prepared_layer_top1(&plan, &input).unwrap();
@@ -286,6 +305,119 @@ fn prepared_layer_plan_reports_residency_and_reuses_weights() {
     assert_eq!(output.report.device_runs[1].device_id, 1);
     assert_eq!(output.report.device_runs[1].expert_ids, vec![1]);
     assert_eq!(output.report.device_runs[1].token_count, 2);
+}
+
+#[test]
+fn routed_topk_uses_weighted_expert_combine() {
+    let fixture = build_fixture_with(
+        vec![("moe.top_k", "2")],
+        fixture_tensors(),
+        fixture_placement(),
+    );
+    let runtime = MoeRuntime::new(
+        fixture.open(),
+        MoeRuntimeOptions {
+            routing: MoeRoutingPolicy::TopK {
+                k: 2,
+                normalize: false,
+            },
+            ..MoeRuntimeOptions::default()
+        },
+    )
+    .unwrap();
+    let input = vec![2.0, 1.0, 1.0, 3.0, 4.0, 0.0, 0.0, 5.0];
+
+    let routed = runtime.run_layer_routed(0, &input, 2).unwrap();
+    let reference = runtime.run_layer_reference_routed(0, &input, 2).unwrap();
+
+    assert_eq!(routed.output_width, 2);
+    assert_eq!(routed.output, reference);
+    assert_eq!(
+        routed.output,
+        vec![6.0, 3.0, 3.0, 9.0, 12.0, 0.0, 0.0, 15.0]
+    );
+    assert_eq!(routed.report.device_batches.len(), 2);
+    assert_eq!(routed.report.device_batches[0].expert_id, 0);
+    assert_eq!(
+        routed.report.device_batches[0].token_indices,
+        vec![0, 1, 2, 3]
+    );
+    assert_eq!(
+        routed.report.device_batches[0].token_weights,
+        vec![1.0, 1.0, 1.0, 1.0]
+    );
+    assert_eq!(routed.report.device_batches[1].expert_id, 1);
+    assert_eq!(
+        routed.report.device_batches[1].token_indices,
+        vec![0, 1, 2, 3]
+    );
+    assert_eq!(
+        routed.report.device_batches[1].token_weights,
+        vec![1.0, 1.0, 1.0, 1.0]
+    );
+    assert_eq!(
+        routed.report.plan.routing_policy,
+        MoeRoutingPolicy::TopK {
+            k: 2,
+            normalize: false
+        }
+    );
+}
+
+#[test]
+fn routed_topk_checked_reports_reference_match() {
+    let fixture = build_fixture_with(
+        vec![("moe.top_k", "2")],
+        fixture_tensors(),
+        fixture_placement(),
+    );
+    let runtime = MoeRuntime::new(
+        fixture.open(),
+        MoeRuntimeOptions {
+            routing: MoeRoutingPolicy::TopK {
+                k: 2,
+                normalize: true,
+            },
+            ..MoeRuntimeOptions::default()
+        },
+    )
+    .unwrap();
+    let input = vec![2.0, 1.0, 1.0, 3.0, 4.0, 0.0, 0.0, 5.0];
+
+    let checked = runtime.run_layer_routed_checked(0, &input, 2, 0.0).unwrap();
+
+    assert!(checked.comparison.passed);
+    assert_eq!(checked.comparison.max_abs_diff, 0.0);
+    assert_eq!(checked.routed.output, checked.reference_output);
+    assert_eq!(
+        checked.routed.report.plan.routing_policy,
+        MoeRoutingPolicy::TopK {
+            k: 2,
+            normalize: true
+        }
+    );
+}
+
+#[test]
+fn cpu_collectives_sum_and_gather_partitions() {
+    let left = [1.0, 2.0, 3.0];
+    let right = [4.0, 5.0, 6.0];
+
+    let reduced = CpuCollectives::all_reduce_sum(&[&left, &right]).unwrap();
+    let gathered = CpuCollectives::gather(&[&left, &right]);
+
+    assert_eq!(reduced, vec![5.0, 7.0, 9.0]);
+    assert_eq!(gathered, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+}
+
+#[test]
+fn cpu_collectives_reject_mismatched_reduce_shapes() {
+    let left = [1.0, 2.0];
+    let right = [3.0];
+
+    let err = CpuCollectives::all_reduce_sum(&[&left, &right]).unwrap_err();
+
+    assert!(matches!(err, MoeRuntimeError::Shape(message) if message.contains("expected 2")));
 }
 
 #[test]
