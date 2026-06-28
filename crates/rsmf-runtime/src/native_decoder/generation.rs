@@ -524,6 +524,119 @@ pub(crate) fn native_decoder_cpu_step_hidden(
     Ok(NativeDecoderHiddenStepOutput { normalized })
 }
 
+pub(crate) struct NativeDecoderBatchHiddenStepRequest<'a> {
+    pub(crate) cache: &'a mut NativeDecoderKvCache,
+    pub(crate) token_id: i64,
+}
+
+pub(crate) fn native_decoder_cpu_step_hidden_batch(
+    weights: &NativeDecoderWeights,
+    requests: &mut [NativeDecoderBatchHiddenStepRequest<'_>],
+    backend: NativeDecoderBackend,
+    performance: &NativeDecoderPerformanceOptions,
+) -> Result<Vec<Vec<f32>>> {
+    if requests.is_empty() {
+        return Ok(Vec::new());
+    }
+    let rows = requests.len();
+    let hidden_size = weights.config.hidden_size;
+    let kv_width = weights.config.key_value_width();
+    let mut hidden_states = Vec::with_capacity(rows * hidden_size);
+    for request in requests.iter() {
+        let token_index =
+            validate_native_decoder_token_id(request.token_id, weights.config.vocab_size)?;
+        validate_native_decoder_step_cache(weights, request.cache)?;
+        let embed_start = token_index.checked_mul(hidden_size).ok_or_else(|| {
+            native_decoder_cpu_shape_error("step_batch", "embedding offset overflow")
+        })?;
+        let embed_end = embed_start.checked_add(hidden_size).ok_or_else(|| {
+            native_decoder_cpu_shape_error("step_batch", "embedding end overflow")
+        })?;
+        hidden_states.extend_from_slice(
+            weights
+                .token_embedding
+                .get(embed_start..embed_end)
+                .ok_or_else(|| {
+                    native_decoder_cpu_shape_error(
+                        "step_batch",
+                        format!("token embedding missing row {token_index}"),
+                    )
+                })?,
+        );
+    }
+
+    let mut layer_updates = (0..rows)
+        .map(|_| Vec::with_capacity(weights.layers.len()))
+        .collect::<Vec<Vec<(Vec<f32>, Vec<f32>)>>>();
+    for (layer_idx, layer_weights) in weights.layers.iter().enumerate() {
+        let cpu_weights = layer_weights.as_cpu();
+        hidden_states = native_decoder_cpu_llama_cached_step_batch(
+            &weights.config,
+            &hidden_states,
+            requests,
+            layer_idx,
+            NativeDecoderLinearBackend {
+                backend,
+                performance,
+            },
+            cpu_weights,
+            &mut layer_updates,
+        )?;
+    }
+
+    for (request, updates) in requests.iter_mut().zip(layer_updates) {
+        for (layer_cache, (key, value)) in request.cache.layers.iter_mut().zip(updates) {
+            append_native_decoder_layer_cache(
+                layer_cache,
+                &key,
+                &value,
+                request.cache.position,
+                kv_width,
+                request.cache.page_size_tokens,
+            )?;
+        }
+        request.cache.position += 1;
+    }
+
+    let normalized = native_decoder_cpu_rms_norm(
+        &hidden_states,
+        rows,
+        hidden_size,
+        &weights.final_norm,
+        weights.config.rms_norm_eps,
+    )?;
+    Ok(normalized
+        .chunks(hidden_size)
+        .map(<[f32]>::to_vec)
+        .collect())
+}
+
+fn validate_native_decoder_step_cache(
+    weights: &NativeDecoderWeights,
+    cache: &NativeDecoderKvCache,
+) -> Result<()> {
+    if cache.layers.len() != weights.config.num_hidden_layers {
+        return Err(native_decoder_cpu_shape_error(
+            "step_batch",
+            format!(
+                "cache has {} layers, expected {}",
+                cache.layers.len(),
+                weights.config.num_hidden_layers
+            ),
+        ));
+    }
+    if cache.position >= weights.config.max_position_embeddings {
+        return Err(native_decoder_cpu_shape_error(
+            "step_batch",
+            format!(
+                "position {} exceeds max_position_embeddings {}",
+                cache.position, weights.config.max_position_embeddings
+            ),
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn native_decoder_cpu_step_from_normalized(
     normalized: &[f32],
     hidden_size: usize,
@@ -719,6 +832,467 @@ pub(crate) fn native_decoder_cpu_llama_cached_step(
     })
 }
 
+fn native_decoder_cpu_llama_cached_step_batch(
+    config: &NativeDecoderConfig,
+    hidden_states: &[f32],
+    requests: &[NativeDecoderBatchHiddenStepRequest<'_>],
+    layer_idx: usize,
+    linear_backend: NativeDecoderLinearBackend<'_>,
+    weights: NativeDecoderCpuLayerWeights<'_>,
+    layer_updates: &mut [Vec<(Vec<f32>, Vec<f32>)>],
+) -> Result<Vec<f32>> {
+    if config.family != NativeDecoderFamily::Llama {
+        return Err(RuntimeError::UnsupportedNativeDecoder {
+            family: format!("{:?}", config.family),
+        });
+    }
+    config.validate()?;
+    let rows = requests.len();
+    let hidden_size = config.hidden_size;
+    let intermediate_size = config.intermediate_size;
+    let head_dim = config.head_dim();
+    let kv_width = config.key_value_width();
+    validate_cpu_matrix_len(
+        "llama_cached_step_batch",
+        "hidden_states",
+        hidden_states.len(),
+        rows,
+        hidden_size,
+    )?;
+    if layer_updates.len() != rows {
+        return Err(native_decoder_cpu_shape_error(
+            "llama_cached_step_batch",
+            format!(
+                "layer update rows mismatch: got {}, expected {rows}",
+                layer_updates.len()
+            ),
+        ));
+    }
+    for request in requests {
+        let layer_cache = request.cache.layers.get(layer_idx).ok_or_else(|| {
+            native_decoder_cpu_shape_error(
+                "llama_cached_step_batch",
+                format!("cache missing layer {layer_idx}"),
+            )
+        })?;
+        validate_native_decoder_layer_cache(
+            layer_cache,
+            request.cache.position,
+            kv_width,
+            request.cache.page_size_tokens,
+        )?;
+    }
+
+    let normalized = native_decoder_cpu_rms_norm(
+        hidden_states,
+        rows,
+        hidden_size,
+        weights.input_layernorm,
+        config.rms_norm_eps,
+    )?;
+    let NativeDecoderQkvBatchOutput {
+        mut query,
+        mut key,
+        value,
+    } = native_decoder_qkv_projection_batch(
+        &normalized,
+        rows,
+        hidden_size,
+        kv_width,
+        linear_backend,
+        weights,
+    )?;
+
+    for (row, request) in requests.iter().enumerate() {
+        let query_start = row * hidden_size;
+        let key_start = row * kv_width;
+        native_decoder_cpu_apply_llama_rope(
+            &mut query[query_start..query_start + hidden_size],
+            1,
+            config.num_attention_heads,
+            head_dim,
+            request.cache.position,
+            config.rope_theta,
+        )?;
+        native_decoder_cpu_apply_llama_rope(
+            &mut key[key_start..key_start + kv_width],
+            1,
+            config.num_key_value_heads,
+            head_dim,
+            request.cache.position,
+            config.rope_theta,
+        )?;
+    }
+
+    let NativeDecoderCachedAttentionBatchOutput {
+        attention_rows,
+        updates,
+    } = native_decoder_cpu_layer_cached_attention_batch(NativeDecoderLayerAttentionBatchInput {
+        query: &query,
+        key: &key,
+        value: &value,
+        requests,
+        layer_idx,
+        rows,
+        hidden_size,
+        kv_width,
+        num_attention_heads: config.num_attention_heads,
+        num_key_value_heads: config.num_key_value_heads,
+        head_dim,
+        implementation: linear_backend.performance.attention,
+    })?;
+    for (row_updates, update) in layer_updates.iter_mut().zip(updates) {
+        row_updates.push(update);
+    }
+
+    let attention_projected = native_decoder_projection_batch(
+        &attention_rows,
+        rows,
+        hidden_size,
+        weights.o_proj,
+        weights.o_proj_quantized,
+        hidden_size,
+        linear_backend,
+    )?;
+    let attention_residual = add_same_shape(
+        "llama_cached_step_batch",
+        hidden_states,
+        &attention_projected,
+        "attention residual",
+    )?;
+    let mlp_normalized = native_decoder_cpu_rms_norm(
+        &attention_residual,
+        rows,
+        hidden_size,
+        weights.post_attention_layernorm,
+        config.rms_norm_eps,
+    )?;
+    let NativeDecoderGateUpBatchOutput { gate, up } = native_decoder_gate_up_projection_batch(
+        &mlp_normalized,
+        rows,
+        hidden_size,
+        intermediate_size,
+        linear_backend,
+        weights,
+    )?;
+    let activated = gate
+        .iter()
+        .zip(up.iter())
+        .map(|(gate, up)| native_decoder_cpu_silu(*gate) * up)
+        .collect::<Vec<_>>();
+    let mlp_projected = native_decoder_projection_batch(
+        &activated,
+        rows,
+        intermediate_size,
+        weights.down_proj,
+        weights.down_proj_quantized,
+        hidden_size,
+        linear_backend,
+    )?;
+    add_same_shape(
+        "llama_cached_step_batch",
+        &attention_residual,
+        &mlp_projected,
+        "mlp residual",
+    )
+}
+
+struct NativeDecoderQkvBatchOutput {
+    query: Vec<f32>,
+    key: Vec<f32>,
+    value: Vec<f32>,
+}
+
+fn native_decoder_qkv_projection_batch(
+    input: &[f32],
+    rows: usize,
+    hidden_size: usize,
+    kv_width: usize,
+    linear_backend: NativeDecoderLinearBackend<'_>,
+    weights: NativeDecoderCpuLayerWeights<'_>,
+) -> Result<NativeDecoderQkvBatchOutput> {
+    if weights.q_proj_quantized.is_none()
+        && weights.k_proj_quantized.is_none()
+        && weights.v_proj_quantized.is_none()
+    {
+        validate_cpu_matrix_len(
+            "qkv_projection_batch",
+            "input",
+            input.len(),
+            rows,
+            hidden_size,
+        )?;
+        validate_cpu_matrix_len(
+            "qkv_projection_batch",
+            "q_proj",
+            weights.q_proj.len(),
+            hidden_size,
+            hidden_size,
+        )?;
+        validate_cpu_matrix_len(
+            "qkv_projection_batch",
+            "k_proj",
+            weights.k_proj.len(),
+            kv_width,
+            hidden_size,
+        )?;
+        validate_cpu_matrix_len(
+            "qkv_projection_batch",
+            "v_proj",
+            weights.v_proj.len(),
+            kv_width,
+            hidden_size,
+        )?;
+        let fused_out_features = hidden_size
+            .checked_add(kv_width)
+            .and_then(|value| value.checked_add(kv_width))
+            .ok_or_else(|| {
+                native_decoder_cpu_shape_error("qkv_projection_batch", "fused width overflow")
+            })?;
+        let fused_weight_len = cpu_element_count(
+            "qkv_projection_batch",
+            "fused weight",
+            fused_out_features,
+            hidden_size,
+        )?;
+        let mut fused_weight = Vec::with_capacity(fused_weight_len);
+        fused_weight.extend_from_slice(weights.q_proj);
+        fused_weight.extend_from_slice(weights.k_proj);
+        fused_weight.extend_from_slice(weights.v_proj);
+        let fused = native_decoder_backend_linear(
+            input,
+            rows,
+            hidden_size,
+            &fused_weight,
+            fused_out_features,
+            linear_backend.backend,
+            linear_backend.performance,
+        )?;
+        let mut query = Vec::with_capacity(rows * hidden_size);
+        let mut key = Vec::with_capacity(rows * kv_width);
+        let mut value = Vec::with_capacity(rows * kv_width);
+        for row in 0..rows {
+            let fused_start = row * fused_out_features;
+            let query_end = fused_start + hidden_size;
+            let key_end = query_end + kv_width;
+            let value_end = key_end + kv_width;
+            query.extend_from_slice(&fused[fused_start..query_end]);
+            key.extend_from_slice(&fused[query_end..key_end]);
+            value.extend_from_slice(&fused[key_end..value_end]);
+        }
+        return Ok(NativeDecoderQkvBatchOutput { query, key, value });
+    }
+
+    Ok(NativeDecoderQkvBatchOutput {
+        query: native_decoder_projection_batch(
+            input,
+            rows,
+            hidden_size,
+            weights.q_proj,
+            weights.q_proj_quantized,
+            hidden_size,
+            linear_backend,
+        )?,
+        key: native_decoder_projection_batch(
+            input,
+            rows,
+            hidden_size,
+            weights.k_proj,
+            weights.k_proj_quantized,
+            kv_width,
+            linear_backend,
+        )?,
+        value: native_decoder_projection_batch(
+            input,
+            rows,
+            hidden_size,
+            weights.v_proj,
+            weights.v_proj_quantized,
+            kv_width,
+            linear_backend,
+        )?,
+    })
+}
+
+struct NativeDecoderLayerAttentionBatchInput<'a> {
+    query: &'a [f32],
+    key: &'a [f32],
+    value: &'a [f32],
+    requests: &'a [NativeDecoderBatchHiddenStepRequest<'a>],
+    layer_idx: usize,
+    rows: usize,
+    hidden_size: usize,
+    kv_width: usize,
+    num_attention_heads: usize,
+    num_key_value_heads: usize,
+    head_dim: usize,
+    implementation: NativeDecoderAttentionImplementation,
+}
+
+struct NativeDecoderCachedAttentionBatchOutput {
+    attention_rows: Vec<f32>,
+    updates: Vec<(Vec<f32>, Vec<f32>)>,
+}
+
+fn native_decoder_cpu_layer_cached_attention_batch(
+    input: NativeDecoderLayerAttentionBatchInput<'_>,
+) -> Result<NativeDecoderCachedAttentionBatchOutput> {
+    if input.requests.len() != input.rows {
+        return Err(native_decoder_cpu_shape_error(
+            "layer_cached_attention_batch",
+            format!(
+                "request rows mismatch: got {}, expected {}",
+                input.requests.len(),
+                input.rows
+            ),
+        ));
+    }
+    validate_cpu_matrix_len(
+        "layer_cached_attention_batch",
+        "query",
+        input.query.len(),
+        input.rows,
+        input.hidden_size,
+    )?;
+    validate_cpu_matrix_len(
+        "layer_cached_attention_batch",
+        "key",
+        input.key.len(),
+        input.rows,
+        input.kv_width,
+    )?;
+    validate_cpu_matrix_len(
+        "layer_cached_attention_batch",
+        "value",
+        input.value.len(),
+        input.rows,
+        input.kv_width,
+    )?;
+    let mut attention_rows = Vec::with_capacity(input.rows * input.hidden_size);
+    let mut updates = Vec::with_capacity(input.rows);
+    for (row, request) in input.requests.iter().enumerate() {
+        let query_start = row * input.hidden_size;
+        let key_start = row * input.kv_width;
+        let current_key = input.key[key_start..key_start + input.kv_width].to_vec();
+        let current_value = input.value[key_start..key_start + input.kv_width].to_vec();
+        let layer_cache = request.cache.layers.get(input.layer_idx).ok_or_else(|| {
+            native_decoder_cpu_shape_error(
+                "layer_cached_attention_batch",
+                format!("cache missing layer {}", input.layer_idx),
+            )
+        })?;
+        let attention =
+            native_decoder_cpu_layer_cached_attention(NativeDecoderLayerAttentionInput {
+                query: &input.query[query_start..query_start + input.hidden_size],
+                cache: layer_cache,
+                current_key: &current_key,
+                current_value: &current_value,
+                page_size_tokens: request.cache.page_size_tokens,
+                cache_len: request.cache.position + 1,
+                num_attention_heads: input.num_attention_heads,
+                num_key_value_heads: input.num_key_value_heads,
+                head_dim: input.head_dim,
+                implementation: input.implementation,
+            })?;
+        attention_rows.extend_from_slice(&attention);
+        updates.push((current_key, current_value));
+    }
+    Ok(NativeDecoderCachedAttentionBatchOutput {
+        attention_rows,
+        updates,
+    })
+}
+
+struct NativeDecoderGateUpBatchOutput {
+    gate: Vec<f32>,
+    up: Vec<f32>,
+}
+
+fn native_decoder_gate_up_projection_batch(
+    input: &[f32],
+    rows: usize,
+    hidden_size: usize,
+    intermediate_size: usize,
+    linear_backend: NativeDecoderLinearBackend<'_>,
+    weights: NativeDecoderCpuLayerWeights<'_>,
+) -> Result<NativeDecoderGateUpBatchOutput> {
+    if weights.gate_proj_quantized.is_none() && weights.up_proj_quantized.is_none() {
+        validate_cpu_matrix_len(
+            "gate_up_projection_batch",
+            "input",
+            input.len(),
+            rows,
+            hidden_size,
+        )?;
+        validate_cpu_matrix_len(
+            "gate_up_projection_batch",
+            "gate_proj",
+            weights.gate_proj.len(),
+            intermediate_size,
+            hidden_size,
+        )?;
+        validate_cpu_matrix_len(
+            "gate_up_projection_batch",
+            "up_proj",
+            weights.up_proj.len(),
+            intermediate_size,
+            hidden_size,
+        )?;
+        let fused_out_features = intermediate_size.checked_mul(2).ok_or_else(|| {
+            native_decoder_cpu_shape_error("gate_up_projection_batch", "fused width overflow")
+        })?;
+        let fused_weight_len = cpu_element_count(
+            "gate_up_projection_batch",
+            "fused weight",
+            fused_out_features,
+            hidden_size,
+        )?;
+        let mut fused_weight = Vec::with_capacity(fused_weight_len);
+        fused_weight.extend_from_slice(weights.gate_proj);
+        fused_weight.extend_from_slice(weights.up_proj);
+        let fused = native_decoder_backend_linear(
+            input,
+            rows,
+            hidden_size,
+            &fused_weight,
+            fused_out_features,
+            linear_backend.backend,
+            linear_backend.performance,
+        )?;
+        let mut gate = Vec::with_capacity(rows * intermediate_size);
+        let mut up = Vec::with_capacity(rows * intermediate_size);
+        for row in 0..rows {
+            let fused_start = row * fused_out_features;
+            let gate_end = fused_start + intermediate_size;
+            let up_end = gate_end + intermediate_size;
+            gate.extend_from_slice(&fused[fused_start..gate_end]);
+            up.extend_from_slice(&fused[gate_end..up_end]);
+        }
+        return Ok(NativeDecoderGateUpBatchOutput { gate, up });
+    }
+
+    Ok(NativeDecoderGateUpBatchOutput {
+        gate: native_decoder_projection_batch(
+            input,
+            rows,
+            hidden_size,
+            weights.gate_proj,
+            weights.gate_proj_quantized,
+            intermediate_size,
+            linear_backend,
+        )?,
+        up: native_decoder_projection_batch(
+            input,
+            rows,
+            hidden_size,
+            weights.up_proj,
+            weights.up_proj_quantized,
+            intermediate_size,
+            linear_backend,
+        )?,
+    })
+}
+
 fn native_decoder_projection(
     input: &[f32],
     in_features: usize,
@@ -742,6 +1316,42 @@ fn native_decoder_projection(
         out_features,
         backend,
         performance,
+    )
+}
+
+fn native_decoder_projection_batch(
+    input: &[f32],
+    rows: usize,
+    in_features: usize,
+    weight: &[f32],
+    weight_quantized: Option<&NativeDecoderQuantizedMatrix>,
+    out_features: usize,
+    linear_backend: NativeDecoderLinearBackend<'_>,
+) -> Result<Vec<f32>> {
+    validate_cpu_matrix_len("projection_batch", "input", input.len(), rows, in_features)?;
+    if let Some(quantized) = weight_quantized {
+        let mut output = Vec::with_capacity(rows * out_features);
+        for row in 0..rows {
+            let start = row * in_features;
+            let row_output = quantized.matvec(&input[start..start + in_features])?;
+            validate_cpu_vector_len(
+                "projection_batch_quantized",
+                "output",
+                row_output.len(),
+                out_features,
+            )?;
+            output.extend(row_output);
+        }
+        return Ok(output);
+    }
+    native_decoder_backend_linear(
+        input,
+        rows,
+        in_features,
+        weight,
+        out_features,
+        linear_backend.backend,
+        linear_backend.performance,
     )
 }
 

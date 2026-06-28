@@ -38,16 +38,23 @@ pub struct NativeDecoderContinuousBatchReport {
     pub fused_lm_head_batches: usize,
     /// Total rows projected by fused LM-head calls.
     pub fused_lm_head_rows: usize,
+    /// Number of fused multi-request CPU hidden-step calls issued for
+    /// compatible continued requests.
+    pub fused_qkv_attention_mlp_batches: usize,
+    /// Total rows processed by fused hidden-step calls. F32 Q/K/V and MLP
+    /// gate/up projections are dispatched as combined batched backend linear
+    /// calls; cached attention still observes request-local KV cache state.
+    pub fused_qkv_attention_mlp_rows: usize,
 }
 
 impl NativeDecoderSession {
     /// Generate multiple token-id requests by interleaving decode steps across
     /// active requests.
     ///
-    /// This is a native token-level scheduling primitive. It does not yet fuse
-    /// projection kernels across requests, but it exposes the correct execution
-    /// contract for per-request stop, cancellation, deadline, and tenant-aware
-    /// serving layers.
+    /// This is a native token-level scheduling primitive. Compatible continued
+    /// requests share combined batched f32 Q/K/V, MLP gate/up, and LM-head
+    /// projection dispatch while preserving each request's own KV cache, stop,
+    /// cancellation, and deadline contract.
     pub fn generate_token_ids_continuous_batch(
         &self,
         requests: Vec<NativeDecoderContinuousBatchRequest>,
@@ -235,23 +242,32 @@ fn native_decoder_generate_continuous_batch(
             if stop || generated >= request.options.max_new_tokens {
                 completed.push((request.index, complete_active_request(request)));
             } else {
-                let hidden = native_decoder_cpu_step_hidden(
-                    weights,
-                    &mut request.cache,
+                continuations.push(Continuation {
+                    request,
                     next_token_id,
-                    request.backend,
-                    &request.options.performance,
-                )?;
-                continuations.push((request, hidden.normalized));
+                    normalized: Vec::new(),
+                });
             }
         }
         if !continuations.is_empty() {
-            let fused_rows = assign_continuation_logits(weights, &mut continuations)?;
+            let fused_hidden_rows = assign_continuation_hidden_steps(weights, &mut continuations)?;
+            if fused_hidden_rows > 1 {
+                report.fused_qkv_attention_mlp_batches =
+                    report.fused_qkv_attention_mlp_batches.saturating_add(1);
+                report.fused_qkv_attention_mlp_rows = report
+                    .fused_qkv_attention_mlp_rows
+                    .saturating_add(fused_hidden_rows);
+            }
+            let mut logit_continuations = continuations
+                .into_iter()
+                .map(|continuation| (continuation.request, continuation.normalized))
+                .collect::<Vec<_>>();
+            let fused_rows = assign_continuation_logits(weights, &mut logit_continuations)?;
             if fused_rows > 1 {
                 report.fused_lm_head_batches = report.fused_lm_head_batches.saturating_add(1);
                 report.fused_lm_head_rows = report.fused_lm_head_rows.saturating_add(fused_rows);
             }
-            next_active.extend(continuations.into_iter().map(|(request, _)| request));
+            next_active.extend(logit_continuations.into_iter().map(|(request, _)| request));
         }
         active = next_active;
     }
@@ -260,6 +276,60 @@ fn native_decoder_generate_continuous_batch(
         completed.into_iter().map(|(_, output)| output).collect(),
         report,
     ))
+}
+
+struct Continuation {
+    request: ActiveRequest,
+    next_token_id: i64,
+    normalized: Vec<f32>,
+}
+
+fn assign_continuation_hidden_steps(
+    weights: &NativeDecoderWeights,
+    continuations: &mut [Continuation],
+) -> Result<usize> {
+    if continuations.is_empty() {
+        return Ok(0);
+    }
+    let first_backend = continuations[0].request.backend;
+    let first_performance = continuations[0].request.options.performance.clone();
+    let compatible = continuations.iter().all(|continuation| {
+        continuation.request.backend == first_backend
+            && continuation.request.options.performance == first_performance
+    });
+    if !compatible || continuations.len() == 1 {
+        for continuation in continuations {
+            continuation.normalized = native_decoder_cpu_step_hidden(
+                weights,
+                &mut continuation.request.cache,
+                continuation.next_token_id,
+                continuation.request.backend,
+                &continuation.request.options.performance,
+            )?
+            .normalized;
+        }
+        return Ok(0);
+    }
+
+    let normalized = {
+        let mut batch = continuations
+            .iter_mut()
+            .map(|continuation| NativeDecoderBatchHiddenStepRequest {
+                cache: &mut continuation.request.cache,
+                token_id: continuation.next_token_id,
+            })
+            .collect::<Vec<_>>();
+        native_decoder_cpu_step_hidden_batch(
+            weights,
+            &mut batch,
+            first_backend,
+            &first_performance,
+        )?
+    };
+    for (continuation, normalized) in continuations.iter_mut().zip(normalized) {
+        continuation.normalized = normalized;
+    }
+    Ok(continuations.len())
 }
 
 fn assign_continuation_logits(

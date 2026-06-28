@@ -132,6 +132,12 @@ fn runs_embedded_onnx_add_graph_from_rsmf() {
         RuntimeCapability::Available
     ));
     assert!(matches!(
+        handle
+            .capability_report()
+            .native_decoder_fused_qkv_attention_mlp,
+        RuntimeCapability::Available
+    ));
+    assert!(matches!(
         handle.capability_report().serving_bearer_auth,
         RuntimeCapability::Available
     ));

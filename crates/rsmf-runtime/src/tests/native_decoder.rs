@@ -1691,6 +1691,7 @@ fn engine_native_decoder_continuous_batch_interleaves_decode_steps() {
         },
         ..NativeDecoderRunOptions::default()
     };
+    let scalar_options = options.clone();
 
     let (outputs, report) = session
         .generate_token_ids_continuous_batch(vec![
@@ -1716,9 +1717,25 @@ fn engine_native_decoder_continuous_batch_interleaves_decode_steps() {
     assert_eq!(outputs[1].request_id, "second");
     assert_eq!(outputs[0].output.generated_token_ids, vec![1, 2]);
     assert_eq!(outputs[1].output.generated_token_ids, vec![1, 2]);
+    let first_scalar = session
+        .generate_token_ids(&[0], scalar_options.clone())
+        .unwrap();
+    let second_scalar = session.generate_token_ids(&[0], scalar_options).unwrap();
+    assert_eq!(
+        outputs[0].output.generated_token_ids,
+        first_scalar.generated_token_ids
+    );
+    assert_eq!(
+        outputs[1].output.generated_token_ids,
+        second_scalar.generated_token_ids
+    );
+    assert_eq!(outputs[0].output.logits, first_scalar.logits);
+    assert_eq!(outputs[1].output.logits, second_scalar.logits);
     assert_eq!(report.admitted_requests, 2);
     assert_eq!(report.decode_rounds, 2);
     assert_eq!(report.scheduled_decode_steps, 4);
+    assert_eq!(report.fused_qkv_attention_mlp_batches, 1);
+    assert_eq!(report.fused_qkv_attention_mlp_rows, 2);
     assert_eq!(report.fused_lm_head_batches, 1);
     assert_eq!(report.fused_lm_head_rows, 2);
 }

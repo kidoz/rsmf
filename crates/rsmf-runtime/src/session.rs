@@ -177,7 +177,9 @@ pub struct RuntimeCapabilityReport {
     pub native_decoder_qk_family_direct_kernels: RuntimeCapability,
     /// Native continuous batching can fuse compatible LM-head projection rows.
     pub native_decoder_fused_lm_head_continuous_batching: RuntimeCapability,
-    /// Native continuous batching fused Q/K/V, attention, and MLP kernels.
+    /// Native continuous batching can fuse compatible CPU hidden-step rows with
+    /// combined f32 Q/K/V and MLP gate/up projection dispatch while preserving
+    /// request-local cached attention and KV semantics.
     pub native_decoder_fused_qkv_attention_mlp: RuntimeCapability,
     /// Native decoder Metal/WGPU execution path.
     pub native_decoder_metal_wgpu: RuntimeCapability,
@@ -429,9 +431,7 @@ pub(crate) fn runtime_capability_report() -> RuntimeCapabilityReport {
         native_decoder_i8_q8_q4_direct_kernels: RuntimeCapability::Available,
         native_decoder_qk_family_direct_kernels: RuntimeCapability::Available,
         native_decoder_fused_lm_head_continuous_batching: RuntimeCapability::Available,
-        native_decoder_fused_qkv_attention_mlp: RuntimeCapability::unavailable(
-            "continuous batching interleaves decode steps and fuses LM-head projection only; Q/K/V, attention, and MLP are not fused across requests",
-        ),
+        native_decoder_fused_qkv_attention_mlp: RuntimeCapability::Available,
         native_decoder_metal_wgpu: RuntimeCapability::unavailable(
             "Metal/WGPU native decoder kernels are not implemented in this build",
         ),
