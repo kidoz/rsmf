@@ -4,10 +4,10 @@ use super::assert_close_slice;
 
 use rsmf_core::RsmfFile;
 use rsmf_core::writer::{
-    AssetInput, RsmfWriter, TensorInput, VariantInput, convert_f32_to_q4_0_bytes,
-    convert_f32_to_q8_0_bytes,
+    AssetInput, RsmfWriter, TensorInput, VariantInput, convert_f32_to_q3_k_bytes,
+    convert_f32_to_q4_0_bytes, convert_f32_to_q8_0_bytes,
 };
-use rsmf_core::{LogicalDtype, TargetTag};
+use rsmf_core::{EncodingKind, LayoutTag, LogicalDtype, StorageDtype, TargetTag, VariantMeta};
 use serde::Deserialize;
 use tempfile::tempdir;
 
@@ -1599,6 +1599,86 @@ fn engine_native_decoder_q4_projection_variants_use_direct_quantized_kernels() {
 }
 
 #[test]
+fn native_decoder_qk_quantized_matvec_matches_tensor_decode() {
+    let input = (0..256)
+        .map(|idx| ((idx % 17) as f32 - 8.0) / 9.0)
+        .collect::<Vec<_>>();
+    for (storage_dtype, bytes) in [
+        (
+            StorageDtype::Q3K,
+            convert_f32_to_q3_k_bytes(&qk_reference_f32_bytes()),
+        ),
+        (StorageDtype::Q4K, q4_k_test_block()),
+        (StorageDtype::Q5K, q5_k_test_block()),
+        (StorageDtype::Q6K, q6_k_test_block()),
+    ] {
+        let decoded = decode_qk_variant_f32(storage_dtype, bytes.clone());
+        let expected = decoded
+            .iter()
+            .zip(input.iter())
+            .map(|(weight, input)| weight * input)
+            .sum::<f32>();
+        let matrix = qk_quantized_matrix(storage_dtype, 1, 256, bytes);
+        let actual = matrix.matvec(&input).unwrap();
+
+        assert_close_slice(&actual, &[expected], 1e-5);
+    }
+}
+
+#[test]
+fn engine_native_decoder_qk_projection_variants_are_retained_for_direct_kernels() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("native-decode-qk-projections.rsmf");
+    let engine = tiny_native_decoder_generation_engine_with_qk_projection_variants(path.clone());
+    let file = RsmfFile::open(path).unwrap();
+    let mut variants = std::collections::HashMap::new();
+    for tensor in &file.manifest().tensors {
+        if let Some(variant) = tensor.packed_variants.first().copied() {
+            variants.insert(tensor.name.clone(), variant);
+        }
+    }
+    let weights = engine
+        .native_decoder_weights_with_options(&NativeDecoderWeightOptions {
+            tensor_variants: variants,
+            allow_lossy_quantized: true,
+        })
+        .unwrap();
+
+    assert!(matches!(
+        weights.layers[0].q_proj_quantized,
+        Some(NativeDecoderQuantizedMatrix::Q3K { .. })
+    ));
+    assert!(matches!(
+        weights.layers[0].k_proj_quantized,
+        Some(NativeDecoderQuantizedMatrix::Q4K { .. })
+    ));
+    assert!(matches!(
+        weights.layers[0].v_proj_quantized,
+        Some(NativeDecoderQuantizedMatrix::Q5K { .. })
+    ));
+    assert!(matches!(
+        weights.layers[0].o_proj_quantized,
+        Some(NativeDecoderQuantizedMatrix::Q6K { .. })
+    ));
+    assert!(matches!(
+        weights.layers[0].gate_proj_quantized,
+        Some(NativeDecoderQuantizedMatrix::Q3K { .. })
+    ));
+    assert!(matches!(
+        weights.layers[0].up_proj_quantized,
+        Some(NativeDecoderQuantizedMatrix::Q4K { .. })
+    ));
+    assert!(matches!(
+        weights.layers[0].down_proj_quantized,
+        Some(NativeDecoderQuantizedMatrix::Q5K { .. })
+    ));
+    assert!(matches!(
+        weights.lm_head_quantized,
+        Some(NativeDecoderQuantizedMatrix::Q6K { .. })
+    ));
+}
+
+#[test]
 fn engine_native_decoder_continuous_batch_interleaves_decode_steps() {
     let dir = tempdir().unwrap();
     let engine = tiny_native_decoder_generation_engine(dir.path().join("native-decode.rsmf"));
@@ -1890,6 +1970,179 @@ fn tiny_native_decoder_generation_engine_with_q4_projection_variants(
     }
     writer.write_to_path(&path).unwrap();
     Engine::new(RsmfFile::open(path).unwrap()).unwrap()
+}
+
+fn tiny_native_decoder_generation_engine_with_qk_projection_variants(
+    path: std::path::PathBuf,
+) -> Engine {
+    let config = tiny_native_decoder_cpu_config();
+    let mut writer = RsmfWriter::new()
+        .with_metadata("model.arch", "llama")
+        .with_asset(AssetInput::new(
+            NATIVE_DECODER_CONFIG_ASSET,
+            tiny_native_decoder_generation_config_json().into_bytes(),
+        ))
+        .with_asset(AssetInput::new(
+            NATIVE_DECODER_TOKENIZER_ASSET,
+            tiny_native_decoder_tokenizer_json().into_bytes(),
+        ));
+    for expected in expected_native_decoder_tensors(&config).unwrap() {
+        let values =
+            tiny_native_decoder_generation_tensor_values(&expected.tensor_name, &expected.shape);
+        let mut tensor = native_decoder_tensor_with_dtype_values(
+            &expected.tensor_name,
+            expected.shape.clone(),
+            LogicalDtype::F32,
+            values,
+        );
+        if let Some(storage_dtype) = qk_storage_for_tensor(&expected.tensor_name) {
+            let element_count = expected
+                .shape
+                .iter()
+                .try_fold(1usize, |count, dim| {
+                    count.checked_mul(usize::try_from(*dim).unwrap())
+                })
+                .unwrap();
+            tensor.packed.push(packed_qk_variant(
+                storage_dtype,
+                qk_test_bytes_for_storage(storage_dtype, element_count),
+            ));
+        }
+        writer = writer.with_tensor(tensor);
+    }
+    writer.write_to_path(&path).unwrap();
+    Engine::new(RsmfFile::open(path).unwrap()).unwrap()
+}
+
+fn qk_storage_for_tensor(tensor_name: &str) -> Option<StorageDtype> {
+    if tensor_name == "lm_head.weight" || tensor_name.ends_with(".self_attn.o_proj.weight") {
+        Some(StorageDtype::Q6K)
+    } else if tensor_name.ends_with(".self_attn.q_proj.weight")
+        || tensor_name.ends_with(".mlp.gate_proj.weight")
+    {
+        Some(StorageDtype::Q3K)
+    } else if tensor_name.ends_with(".self_attn.k_proj.weight")
+        || tensor_name.ends_with(".mlp.up_proj.weight")
+    {
+        Some(StorageDtype::Q4K)
+    } else if tensor_name.ends_with(".self_attn.v_proj.weight")
+        || tensor_name.ends_with(".mlp.down_proj.weight")
+    {
+        Some(StorageDtype::Q5K)
+    } else {
+        None
+    }
+}
+
+fn qk_quantized_matrix(
+    storage_dtype: StorageDtype,
+    rows: usize,
+    cols: usize,
+    bytes: Vec<u8>,
+) -> NativeDecoderQuantizedMatrix {
+    match storage_dtype {
+        StorageDtype::Q3K => NativeDecoderQuantizedMatrix::Q3K { rows, cols, bytes },
+        StorageDtype::Q4K => NativeDecoderQuantizedMatrix::Q4K { rows, cols, bytes },
+        StorageDtype::Q5K => NativeDecoderQuantizedMatrix::Q5K { rows, cols, bytes },
+        StorageDtype::Q6K => NativeDecoderQuantizedMatrix::Q6K { rows, cols, bytes },
+        other => panic!("unexpected QK storage dtype {other:?}"),
+    }
+}
+
+fn decode_qk_variant_f32(storage_dtype: StorageDtype, bytes: Vec<u8>) -> Vec<f32> {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("qk-reference.rsmf");
+    let mut tensor = native_decoder_tensor_with_dtype_values(
+        "qk.weight",
+        vec![1, 256],
+        LogicalDtype::F32,
+        vec![0.0; 256],
+    );
+    tensor.packed.push(packed_qk_variant(storage_dtype, bytes));
+    RsmfWriter::new()
+        .with_tensor(tensor)
+        .write_to_path(&path)
+        .unwrap();
+    let file = RsmfFile::open(path).unwrap();
+    let variant_idx = file.manifest().tensors[0].packed_variants[0];
+    file.tensor_view_variant("qk.weight", variant_idx)
+        .unwrap()
+        .decode_f32()
+        .unwrap()
+}
+
+fn packed_qk_variant(storage_dtype: StorageDtype, bytes: Vec<u8>) -> VariantInput {
+    VariantInput {
+        target: TargetTag::CpuGeneric,
+        encoding: EncodingKind::BlockQuantized,
+        storage_dtype: Some(storage_dtype),
+        layout: LayoutTag::Blocked,
+        alignment: 64,
+        bytes,
+        meta: VariantMeta {
+            block_shape: vec![256],
+            group_size: 16,
+            scale_dtype: Some(StorageDtype::Logical(LogicalDtype::F16)),
+            zero_point_dtype: None,
+            extra: vec![],
+        },
+    }
+}
+
+fn qk_test_bytes_for_storage(storage_dtype: StorageDtype, element_count: usize) -> Vec<u8> {
+    let block = match storage_dtype {
+        StorageDtype::Q3K => convert_f32_to_q3_k_bytes(&qk_reference_f32_bytes()),
+        StorageDtype::Q4K => q4_k_test_block(),
+        StorageDtype::Q5K => q5_k_test_block(),
+        StorageDtype::Q6K => q6_k_test_block(),
+        other => panic!("unexpected QK storage dtype {other:?}"),
+    };
+    let block_bytes = block.len();
+    let blocks = element_count.div_ceil(256);
+    let mut bytes = Vec::with_capacity(blocks * block_bytes);
+    for _ in 0..blocks {
+        bytes.extend_from_slice(&block);
+    }
+    bytes
+}
+
+fn qk_reference_f32_bytes() -> Vec<u8> {
+    (0..256)
+        .flat_map(|idx| {
+            let value = ((idx % 9) as f32 - 4.0) / 3.0;
+            value.to_le_bytes()
+        })
+        .collect()
+}
+
+fn q4_k_test_block() -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(144);
+    bytes.extend_from_slice(&half::f16::from_f32(0.125).to_le_bytes());
+    bytes.extend_from_slice(&half::f16::from_f32(0.03125).to_le_bytes());
+    bytes.extend_from_slice(&[1, 2, 3, 4, 5, 6, 0x41, 0x82, 0xc3, 0x04, 0x45, 0x86]);
+    bytes.extend((0..128).map(|idx| ((idx * 13 + 7) & 0xff) as u8));
+    bytes
+}
+
+fn q5_k_test_block() -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(176);
+    bytes.extend_from_slice(&half::f16::from_f32(0.0625).to_le_bytes());
+    bytes.extend_from_slice(&half::f16::from_f32(0.015625).to_le_bytes());
+    bytes.extend_from_slice(&[1, 3, 5, 7, 9, 11, 0x21, 0x43, 0x65, 0x87, 0xa9, 0xcb]);
+    bytes.extend((0..32).map(|idx| ((idx * 11 + 5) & 0xff) as u8));
+    bytes.extend((0..128).map(|idx| ((idx * 17 + 3) & 0xff) as u8));
+    bytes
+}
+
+fn q6_k_test_block() -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(210);
+    bytes.extend((0..128).map(|idx| ((idx * 19 + 1) & 0xff) as u8));
+    bytes.extend((0..64).map(|idx| ((idx * 23 + 9) & 0xff) as u8));
+    bytes.extend([
+        1u8, 2, 3, 4, 253, 254, 255, 1, 2, 3, 4, 5, 252, 253, 254, 255,
+    ]);
+    bytes.extend_from_slice(&half::f16::from_f32(0.0078125).to_le_bytes());
+    bytes
 }
 
 fn tiny_native_decoder_config_json() -> String {

@@ -129,7 +129,7 @@ fn runs_embedded_onnx_add_graph_from_rsmf() {
         handle
             .capability_report()
             .native_decoder_qk_family_direct_kernels,
-        RuntimeCapability::Unavailable { .. }
+        RuntimeCapability::Available
     ));
     assert!(matches!(
         handle.capability_report().serving_bearer_auth,

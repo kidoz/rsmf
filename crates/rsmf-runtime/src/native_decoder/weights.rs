@@ -34,6 +34,42 @@ pub enum NativeDecoderQuantizedMatrix {
         /// Owned block bytes.
         bytes: Vec<u8>,
     },
+    /// RSMF/GGUF-style Q3_K super-blocks.
+    Q3K {
+        /// Row count.
+        rows: usize,
+        /// Column count.
+        cols: usize,
+        /// Owned block bytes.
+        bytes: Vec<u8>,
+    },
+    /// RSMF/GGUF-style Q4_K super-blocks.
+    Q4K {
+        /// Row count.
+        rows: usize,
+        /// Column count.
+        cols: usize,
+        /// Owned block bytes.
+        bytes: Vec<u8>,
+    },
+    /// RSMF/GGUF-style Q5_K super-blocks.
+    Q5K {
+        /// Row count.
+        rows: usize,
+        /// Column count.
+        cols: usize,
+        /// Owned block bytes.
+        bytes: Vec<u8>,
+    },
+    /// RSMF/GGUF-style Q6_K super-blocks.
+    Q6K {
+        /// Row count.
+        rows: usize,
+        /// Column count.
+        cols: usize,
+        /// Owned block bytes.
+        bytes: Vec<u8>,
+    },
 }
 
 impl NativeDecoderQuantizedMatrix {
@@ -42,7 +78,12 @@ impl NativeDecoderQuantizedMatrix {
     pub fn resident_bytes(&self) -> usize {
         match self {
             Self::RawI8 { values, .. } => values.len(),
-            Self::Q8_0 { bytes, .. } | Self::Q4_0 { bytes, .. } => bytes.len(),
+            Self::Q8_0 { bytes, .. }
+            | Self::Q4_0 { bytes, .. }
+            | Self::Q3K { bytes, .. }
+            | Self::Q4K { bytes, .. }
+            | Self::Q5K { bytes, .. }
+            | Self::Q6K { bytes, .. } => bytes.len(),
         }
     }
 
@@ -162,9 +203,220 @@ impl NativeDecoderQuantizedMatrix {
                 }
                 Ok(output)
             }
+            Self::Q3K { rows, cols, bytes } => quantized_k_matvec(
+                input,
+                bytes,
+                qk_matvec_spec(
+                    "quantized_matvec_q3_k",
+                    *rows,
+                    *cols,
+                    Q3_K_BLOCK_BYTES,
+                    q3_k_value,
+                ),
+            ),
+            Self::Q4K { rows, cols, bytes } => quantized_k_matvec(
+                input,
+                bytes,
+                qk_matvec_spec(
+                    "quantized_matvec_q4_k",
+                    *rows,
+                    *cols,
+                    Q4_K_BLOCK_BYTES,
+                    q4_k_value,
+                ),
+            ),
+            Self::Q5K { rows, cols, bytes } => quantized_k_matvec(
+                input,
+                bytes,
+                qk_matvec_spec(
+                    "quantized_matvec_q5_k",
+                    *rows,
+                    *cols,
+                    Q5_K_BLOCK_BYTES,
+                    q5_k_value,
+                ),
+            ),
+            Self::Q6K { rows, cols, bytes } => quantized_k_matvec(
+                input,
+                bytes,
+                qk_matvec_spec(
+                    "quantized_matvec_q6_k",
+                    *rows,
+                    *cols,
+                    Q6_K_BLOCK_BYTES,
+                    q6_k_value,
+                ),
+            ),
         }
     }
 }
+
+#[derive(Clone, Copy)]
+struct QkMatvecSpec {
+    op: &'static str,
+    rows: usize,
+    cols: usize,
+    block_elements: usize,
+    block_bytes: usize,
+    decode: fn(&[u8], usize) -> f32,
+}
+
+fn qk_matvec_spec(
+    op: &'static str,
+    rows: usize,
+    cols: usize,
+    block_bytes: usize,
+    decode: fn(&[u8], usize) -> f32,
+) -> QkMatvecSpec {
+    QkMatvecSpec {
+        op,
+        rows,
+        cols,
+        block_elements: QK_SUPER_BLOCK_ELEMENTS,
+        block_bytes,
+        decode,
+    }
+}
+
+fn quantized_k_matvec(input: &[f32], bytes: &[u8], spec: QkMatvecSpec) -> Result<Vec<f32>> {
+    validate_cpu_vector_len(spec.op, "input", input.len(), spec.cols)?;
+    let element_count = cpu_element_count(spec.op, "weight", spec.rows, spec.cols)?;
+    let expected_blocks = element_count.div_ceil(spec.block_elements);
+    validate_cpu_vector_len(
+        spec.op,
+        "bytes",
+        bytes.len(),
+        expected_blocks
+            .checked_mul(spec.block_bytes)
+            .ok_or_else(|| native_decoder_cpu_shape_error(spec.op, "byte count overflow"))?,
+    )?;
+    let mut output = vec![0.0f32; spec.rows];
+    for (row, output_value) in output.iter_mut().enumerate().take(spec.rows) {
+        let mut sum = 0.0f32;
+        for (col, input_value) in input.iter().enumerate().take(spec.cols) {
+            let index = row * spec.cols + col;
+            let block_index = index / spec.block_elements;
+            let block_offset = index % spec.block_elements;
+            let byte_offset = block_index * spec.block_bytes;
+            sum += *input_value
+                * (spec.decode)(
+                    &bytes[byte_offset..byte_offset + spec.block_bytes],
+                    block_offset,
+                );
+        }
+        *output_value = sum;
+    }
+    Ok(output)
+}
+
+fn q3_k_value(block: &[u8], offset: usize) -> f32 {
+    let super_scale = f16::from_le_bytes([block[108], block[109]]).to_f32();
+    let hmask = &block[..32];
+    let qs = &block[32..96];
+    let low = (qs[offset / 4] >> ((offset % 4) * 2)) & 0x03;
+    let high = if (hmask[offset / 8] & (1 << (offset % 8))) != 0 {
+        4
+    } else {
+        0
+    };
+    ((low | high) as i8 - 4) as f32 * super_scale
+}
+
+fn q4_k_value(block: &[u8], offset: usize) -> f32 {
+    let d = f16::from_le_bytes([block[0], block[1]]).to_f32();
+    let min = f16::from_le_bytes([block[2], block[3]]).to_f32();
+    let scales = &block[4..16];
+    let qs = &block[16..144];
+    let group = offset / 64;
+    let within = offset % 64;
+    let qs_off = group * 32;
+    if within < 32 {
+        let (scale, min_scale) = get_scale_min_k4(group * 2, scales);
+        d * scale as f32 * (qs[qs_off + within] & 0x0f) as f32 - min * min_scale as f32
+    } else {
+        let (scale, min_scale) = get_scale_min_k4(group * 2 + 1, scales);
+        d * scale as f32 * (qs[qs_off + within - 32] >> 4) as f32 - min * min_scale as f32
+    }
+}
+
+fn q5_k_value(block: &[u8], offset: usize) -> f32 {
+    let d = f16::from_le_bytes([block[0], block[1]]).to_f32();
+    let min = f16::from_le_bytes([block[2], block[3]]).to_f32();
+    let scales = &block[4..16];
+    let qh = &block[16..48];
+    let qs = &block[48..176];
+    let group = offset / 64;
+    let within = offset % 64;
+    let qs_off = group * 32;
+    let u1 = 1u8 << (group * 2);
+    let u2 = 2u8 << (group * 2);
+    if within < 32 {
+        let (scale, min_scale) = get_scale_min_k4(group * 2, scales);
+        let high_bit = if (qh[within] & u1) != 0 { 16.0 } else { 0.0 };
+        d * scale as f32 * ((qs[qs_off + within] & 0x0f) as f32 + high_bit) - min * min_scale as f32
+    } else {
+        let lane = within - 32;
+        let (scale, min_scale) = get_scale_min_k4(group * 2 + 1, scales);
+        let high_bit = if (qh[lane] & u2) != 0 { 16.0 } else { 0.0 };
+        d * scale as f32 * ((qs[qs_off + lane] >> 4) as f32 + high_bit) - min * min_scale as f32
+    }
+}
+
+fn q6_k_value(block: &[u8], offset: usize) -> f32 {
+    let ql = &block[..128];
+    let qh = &block[128..192];
+    let sc = &block[192..208];
+    let d = f16::from_le_bytes([block[208], block[209]]).to_f32();
+    let group = offset / 128;
+    let within = offset % 128;
+    let ql_off = group * 64;
+    let qh_off = group * 32;
+    let sc_off = group * 8;
+    let (q, scale_index) = if within < 32 {
+        let lane = within;
+        (
+            ((ql[ql_off + lane] & 0x0f) | ((qh[qh_off + lane] & 0x03) << 4)) as i8 - 32,
+            lane / 16,
+        )
+    } else if within < 64 {
+        let lane = within - 32;
+        (
+            ((ql[ql_off + lane + 32] & 0x0f) | (((qh[qh_off + lane] >> 2) & 0x03) << 4)) as i8 - 32,
+            lane / 16 + 2,
+        )
+    } else if within < 96 {
+        let lane = within - 64;
+        (
+            ((ql[ql_off + lane] >> 4) | (((qh[qh_off + lane] >> 4) & 0x03) << 4)) as i8 - 32,
+            lane / 16 + 4,
+        )
+    } else {
+        let lane = within - 96;
+        (
+            ((ql[ql_off + lane + 32] >> 4) | (((qh[qh_off + lane] >> 6) & 0x03) << 4)) as i8 - 32,
+            lane / 16 + 6,
+        )
+    };
+    d * sc[sc_off + scale_index] as i8 as f32 * q as f32
+}
+
+fn get_scale_min_k4(index: usize, scales: &[u8]) -> (u8, u8) {
+    if index < 4 {
+        let d = scales[index] & 63;
+        let m = scales[index + 4] & 63;
+        (d, m)
+    } else {
+        let d = (scales[index + 4] & 0x0f) | ((scales[index - 4] >> 6) << 4);
+        let m = (scales[index + 4] >> 4) | ((scales[index] >> 6) << 4);
+        (d, m)
+    }
+}
+
+const QK_SUPER_BLOCK_ELEMENTS: usize = 256;
+const Q3_K_BLOCK_BYTES: usize = 110;
+const Q4_K_BLOCK_BYTES: usize = 144;
+const Q5_K_BLOCK_BYTES: usize = 176;
+const Q6_K_BLOCK_BYTES: usize = 210;
 
 /// Owned LLaMA-style layer weights decoded for native decoder execution.
 #[derive(Debug, Clone, PartialEq)]
@@ -564,6 +816,16 @@ impl NativeDecoderQuantizedMatrix {
                 cols,
                 bytes: view.bytes.to_vec(),
             }));
+        }
+        if view.encoding == EncodingKind::BlockQuantized {
+            let bytes = view.bytes.to_vec();
+            return Ok(match view.storage_dtype {
+                StorageDtype::Q3K => Some(Self::Q3K { rows, cols, bytes }),
+                StorageDtype::Q4K => Some(Self::Q4K { rows, cols, bytes }),
+                StorageDtype::Q5K => Some(Self::Q5K { rows, cols, bytes }),
+                StorageDtype::Q6K => Some(Self::Q6K { rows, cols, bytes }),
+                _ => None,
+            });
         }
         Ok(None)
     }

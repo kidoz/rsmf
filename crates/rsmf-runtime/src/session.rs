@@ -427,9 +427,7 @@ pub(crate) fn runtime_capability_report() -> RuntimeCapabilityReport {
             "ONNX external initializer binding currently requires an ORT-owned value; borrowed RSMF mmap initializer lifetimes are not exposed safely",
         ),
         native_decoder_i8_q8_q4_direct_kernels: RuntimeCapability::Available,
-        native_decoder_qk_family_direct_kernels: RuntimeCapability::unavailable(
-            "QK-family direct kernels are not implemented; Q3_K/Q4_K/Q5_K/Q6_K variants still use the f32 decode path",
-        ),
+        native_decoder_qk_family_direct_kernels: RuntimeCapability::Available,
         native_decoder_fused_lm_head_continuous_batching: RuntimeCapability::Available,
         native_decoder_fused_qkv_attention_mlp: RuntimeCapability::unavailable(
             "continuous batching interleaves decode steps and fuses LM-head projection only; Q/K/V, attention, and MLP are not fused across requests",
