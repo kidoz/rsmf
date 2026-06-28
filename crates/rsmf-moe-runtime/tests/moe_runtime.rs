@@ -306,11 +306,25 @@ fn prepared_layer_plan_reports_residency_and_reuses_weights() {
     assert_eq!(output.report.device_runs[0].token_count, 2);
     assert_eq!(output.report.device_runs[0].weight_cache_hits, 0);
     assert_eq!(output.report.device_runs[0].weight_cache_misses, 0);
+    assert_eq!(
+        output.report.device_runs[0].transfer.kind,
+        MoeTransferKind::None
+    );
+    assert_eq!(output.report.device_runs[0].transfer.bytes, 0);
+    assert_eq!(output.report.device_runs[0].transfer.cache_hits, 0);
+    assert_eq!(output.report.device_runs[0].transfer.cache_misses, 0);
     assert_eq!(output.report.device_runs[1].device_id, 1);
     assert_eq!(output.report.device_runs[1].expert_ids, vec![1]);
     assert_eq!(output.report.device_runs[1].token_count, 2);
     assert_eq!(output.report.device_runs[1].weight_cache_hits, 0);
     assert_eq!(output.report.device_runs[1].weight_cache_misses, 0);
+    assert_eq!(
+        output.report.device_runs[1].transfer.kind,
+        MoeTransferKind::None
+    );
+    assert_eq!(output.report.device_runs[1].transfer.bytes, 0);
+    assert_eq!(output.report.device_runs[1].transfer.cache_hits, 0);
+    assert_eq!(output.report.device_runs[1].transfer.cache_misses, 0);
 }
 
 #[test]
@@ -607,6 +621,24 @@ fn wgpu_preference_matches_reference_or_falls_back() {
                 .iter()
                 .map(|run| run.weight_cache_misses)
                 .sum::<usize>();
+            let first_transfer_bytes = parallel
+                .report
+                .device_runs
+                .iter()
+                .map(|run| run.transfer.bytes)
+                .sum::<usize>();
+            let first_transfer_hits = parallel
+                .report
+                .device_runs
+                .iter()
+                .map(|run| run.transfer.cache_hits)
+                .sum::<usize>();
+            let first_transfer_misses = parallel
+                .report
+                .device_runs
+                .iter()
+                .map(|run| run.transfer.cache_misses)
+                .sum::<usize>();
             let second_hits = second
                 .report
                 .device_runs
@@ -619,9 +651,47 @@ fn wgpu_preference_matches_reference_or_falls_back() {
                 .iter()
                 .map(|run| run.weight_cache_misses)
                 .sum::<usize>();
+            let second_transfer_bytes = second
+                .report
+                .device_runs
+                .iter()
+                .map(|run| run.transfer.bytes)
+                .sum::<usize>();
+            let second_transfer_hits = second
+                .report
+                .device_runs
+                .iter()
+                .map(|run| run.transfer.cache_hits)
+                .sum::<usize>();
+            let second_transfer_misses = second
+                .report
+                .device_runs
+                .iter()
+                .map(|run| run.transfer.cache_misses)
+                .sum::<usize>();
             assert!(first_misses >= 4);
+            assert_eq!(first_transfer_bytes, 64);
+            assert_eq!(first_transfer_hits, 0);
+            assert_eq!(first_transfer_misses, first_misses);
+            assert!(
+                parallel
+                    .report
+                    .device_runs
+                    .iter()
+                    .all(|run| run.transfer.kind == MoeTransferKind::HostToDevice)
+            );
             assert!(second_hits >= first_misses);
             assert_eq!(second_misses, 0);
+            assert_eq!(second_transfer_bytes, 0);
+            assert_eq!(second_transfer_hits, second_hits);
+            assert_eq!(second_transfer_misses, 0);
+            assert!(
+                second
+                    .report
+                    .device_runs
+                    .iter()
+                    .all(|run| run.transfer.kind == MoeTransferKind::HostToDevice)
+            );
             match &parallel.report.plan.multi_adapter {
                 MultiAdapterStatus::Available {
                     requested_devices,

@@ -41,7 +41,7 @@ pub use runtime::{
     MoeCollectivePlan, MoeCollectiveStep, MoeLayerPlan, MoeLayerPlanReport, MoeReferenceComparison,
     MoeRoutingPolicy, MoeRuntime, MoeRuntimeOptions, MoeTransferKind, MoeTransferPlan,
     MoeTransferStep, MultiAdapterStatus, PlannedDevice, PlannedExpert, RuntimeLimits,
-    TensorParallelismStatus,
+    TensorParallelismStatus, TransferRunReport,
 };
 
 /// Result alias for the MoE runtime crate.

@@ -257,6 +257,23 @@ pub struct MoeTransferPlan {
     pub unsupported_count: usize,
 }
 
+/// Executed transfer metrics observed during one placement-device run.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TransferRunReport {
+    /// Transfer kind observed by this execution path.
+    pub kind: MoeTransferKind,
+    /// Executed transfer bytes.
+    ///
+    /// CPU and already-cached device weights report zero.
+    pub bytes: usize,
+    /// Wall time spent materializing the transfer.
+    pub duration: Duration,
+    /// Number of resident weight cache hits observed by this transfer path.
+    pub cache_hits: usize,
+    /// Number of resident weight cache misses observed by this transfer path.
+    pub cache_misses: usize,
+}
+
 /// Multi-adapter dispatch capability exposed by a prepared plan.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MultiAdapterStatus {
@@ -456,6 +473,12 @@ pub struct DeviceRunReport {
     /// CPU execution reports zero because host matrices are already resident in
     /// the prepared plan.
     pub weight_cache_misses: usize,
+    /// Executed transfer work observed while running this placement device.
+    ///
+    /// CPU/RAM execution reports [`MoeTransferKind::None`] with zero bytes. The
+    /// WGPU path reports host-to-device resident weight uploads on cache misses
+    /// and zero bytes on cache hits.
+    pub transfer: TransferRunReport,
     /// Compute time spent while executing this device's batches.
     pub compute_time: Duration,
 }
@@ -1423,6 +1446,13 @@ impl MoeRuntime {
                 token_count: device_token_count,
                 weight_cache_hits: 0,
                 weight_cache_misses: 0,
+                transfer: TransferRunReport {
+                    kind: MoeTransferKind::None,
+                    bytes: 0,
+                    duration: Duration::ZERO,
+                    cache_hits: 0,
+                    cache_misses: 0,
+                },
                 compute_time: device_start.elapsed(),
             },
         ))
@@ -1527,8 +1557,7 @@ impl MoeRuntime {
         let batch_count = batches.len();
         let mut expert_ids = BTreeSet::new();
         let mut device_token_count = 0usize;
-        let mut weight_cache_hits = 0usize;
-        let mut weight_cache_misses = 0usize;
+        let mut transfer = WgpuTransferStats::default();
         for batch in batches {
             expert_ids.insert(batch.expert_id);
             device_token_count = device_token_count
@@ -1554,11 +1583,7 @@ impl MoeRuntime {
                 &batch_input,
                 batch.token_indices.len(),
             )?;
-            add_cache_event(
-                &mut weight_cache_hits,
-                &mut weight_cache_misses,
-                up.cache_hit,
-            )?;
+            record_wgpu_transfer(&mut transfer, &up)?;
             let hidden = match self.options.activation {
                 ExpertActivation::Identity => up.values,
                 ExpertActivation::SiluGated => {
@@ -1578,11 +1603,7 @@ impl MoeRuntime {
                         &batch_input,
                         batch.token_indices.len(),
                     )?;
-                    add_cache_event(
-                        &mut weight_cache_hits,
-                        &mut weight_cache_misses,
-                        gate_values.cache_hit,
-                    )?;
+                    record_wgpu_transfer(&mut transfer, &gate_values)?;
                     up.values
                         .into_iter()
                         .zip(gate_values.values)
@@ -1598,11 +1619,7 @@ impl MoeRuntime {
                 &hidden,
                 batch.token_indices.len(),
             )?;
-            add_cache_event(
-                &mut weight_cache_hits,
-                &mut weight_cache_misses,
-                batch_output.cache_hit,
-            )?;
+            record_wgpu_transfer(&mut transfer, &batch_output)?;
             for (batch_row, (&token_idx, &weight)) in batch
                 .token_indices
                 .iter()
@@ -1626,8 +1643,9 @@ impl MoeRuntime {
                 expert_ids: expert_ids.into_iter().collect(),
                 batch_count,
                 token_count: device_token_count,
-                weight_cache_hits,
-                weight_cache_misses,
+                weight_cache_hits: transfer.cache_hits,
+                weight_cache_misses: transfer.cache_misses,
+                transfer: transfer.into_report(),
                 compute_time: device_start.elapsed(),
             },
         ))
@@ -1800,8 +1818,51 @@ fn accumulate_output(output: &mut [f32], device_output: &[f32]) -> Result<()> {
 }
 
 #[cfg(feature = "wgpu")]
-fn add_cache_event(hits: &mut usize, misses: &mut usize, hit: bool) -> Result<()> {
-    let counter = if hit { hits } else { misses };
+#[derive(Debug, Default)]
+struct WgpuTransferStats {
+    bytes: usize,
+    duration: Duration,
+    cache_hits: usize,
+    cache_misses: usize,
+}
+
+#[cfg(feature = "wgpu")]
+impl WgpuTransferStats {
+    fn into_report(self) -> TransferRunReport {
+        TransferRunReport {
+            kind: MoeTransferKind::HostToDevice,
+            bytes: self.bytes,
+            duration: self.duration,
+            cache_hits: self.cache_hits,
+            cache_misses: self.cache_misses,
+        }
+    }
+}
+
+#[cfg(feature = "wgpu")]
+fn record_wgpu_transfer(
+    stats: &mut WgpuTransferStats,
+    output: &crate::wgpu_compute::WgpuMatmulOutput,
+) -> Result<()> {
+    add_cache_event(
+        &mut stats.cache_hits,
+        &mut stats.cache_misses,
+        output.cache_hit,
+    )?;
+    stats.bytes = stats
+        .bytes
+        .checked_add(output.transfer_bytes)
+        .ok_or_else(|| MoeRuntimeError::Shape("WGPU transfer byte count overflow".to_string()))?;
+    stats.duration = stats
+        .duration
+        .checked_add(output.transfer_time)
+        .ok_or_else(|| MoeRuntimeError::Shape("WGPU transfer duration overflow".to_string()))?;
+    Ok(())
+}
+
+#[cfg(feature = "wgpu")]
+fn add_cache_event(hits: &mut usize, misses: &mut usize, cache_hit: bool) -> Result<()> {
+    let counter = if cache_hit { hits } else { misses };
     *counter = counter
         .checked_add(1)
         .ok_or_else(|| MoeRuntimeError::Shape("WGPU weight cache counter overflow".to_string()))?;
