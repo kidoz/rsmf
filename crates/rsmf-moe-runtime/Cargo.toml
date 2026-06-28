@@ -6,7 +6,7 @@ rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Experimental MoE expert-parallel proof-of-concept runtime for RSMF."
+description = "Placement-aware MoE expert-parallel runtime for RSMF."
 publish = false
 
 [dependencies]
@@ -23,7 +23,7 @@ optional = true
 
 [features]
 default = []
-# Probe WGPU availability for the expert-parallel PoC. The default runtime
+# Probe WGPU availability for expert-parallel execution. The default runtime
 # remains CPU-only so CI can run without an adapter.
 wgpu = ["dep:rsmf-wgpu", "dep:wgpu"]
 

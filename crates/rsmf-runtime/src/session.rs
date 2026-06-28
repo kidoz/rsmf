@@ -453,7 +453,7 @@ pub(crate) fn runtime_capability_report() -> RuntimeCapabilityReport {
             "tenant quotas are local to one RuntimeExecutor; no distributed quota store is implemented",
         ),
         r6_multi_device_expert_runtime: RuntimeCapability::unavailable(
-            "production multi-device/expert execution is not implemented in rsmf-runtime; rsmf-moe-runtime remains a separate proof-of-concept crate",
+            "multi-device/expert execution is provided by the optional rsmf-moe-runtime crate, not by rsmf-runtime graph sessions",
         ),
     }
 }

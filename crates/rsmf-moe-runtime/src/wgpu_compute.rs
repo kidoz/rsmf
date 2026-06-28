@@ -1,4 +1,4 @@
-//! Small WGPU compute executor for the MoE proof-of-concept runtime.
+//! Small WGPU compute executor for the MoE runtime.
 
 use std::borrow::Cow;
 use std::sync::mpsc;

@@ -258,6 +258,65 @@ fn two_shard_runtime_matches_single_device_reference() {
 }
 
 #[test]
+fn prepared_layer_plan_reports_residency_and_reuses_weights() {
+    let fixture = build_fixture();
+    let runtime = MoeRuntime::new(fixture.open(), MoeRuntimeOptions::default()).unwrap();
+    let plan = runtime.prepare_layer(0, 2).unwrap();
+
+    assert_eq!(plan.layer(), 0);
+    assert_eq!(plan.input_width(), 2);
+    assert_eq!(plan.report().expert_count, 2);
+    assert_eq!(plan.report().resident_bytes, 64);
+    assert!(plan.report().multi_device);
+    assert_eq!(plan.report().devices.len(), 2);
+    assert_eq!(plan.report().devices[0].device_id, 0);
+    assert_eq!(plan.report().devices[0].resident_bytes, 32);
+    assert_eq!(plan.report().devices[0].expert_ids, vec![0]);
+    assert_eq!(plan.report().devices[1].device_id, 1);
+    assert_eq!(plan.report().devices[1].resident_bytes, 32);
+    assert_eq!(plan.report().devices[1].expert_ids, vec![1]);
+
+    let input = vec![2.0, 1.0, 1.0, 3.0, 4.0, 0.0, 0.0, 5.0];
+    let output = runtime.run_prepared_layer_top1(&plan, &input).unwrap();
+    assert_eq!(output.report.plan, plan.report().clone());
+    assert_eq!(output.report.device_runs.len(), 2);
+    assert_eq!(output.report.device_runs[0].device_id, 0);
+    assert_eq!(output.report.device_runs[0].expert_ids, vec![0]);
+    assert_eq!(output.report.device_runs[0].token_count, 2);
+    assert_eq!(output.report.device_runs[1].device_id, 1);
+    assert_eq!(output.report.device_runs[1].expert_ids, vec![1]);
+    assert_eq!(output.report.device_runs[1].token_count, 2);
+}
+
+#[test]
+fn checked_layer_run_reports_reference_match_and_speedup() {
+    let fixture = build_fixture();
+    let runtime = MoeRuntime::new(fixture.open(), MoeRuntimeOptions::default()).unwrap();
+    let input = vec![2.0, 1.0, 1.0, 3.0, 4.0, 0.0, 0.0, 5.0];
+
+    let checked = runtime.run_layer_top1_checked(0, &input, 2, 0.0).unwrap();
+
+    assert!(checked.comparison.passed);
+    assert_eq!(checked.comparison.max_abs_diff, 0.0);
+    assert_eq!(checked.routed.output, checked.reference_output);
+    assert!(checked.comparison.speedup.is_finite() || checked.comparison.speedup.is_infinite());
+}
+
+#[test]
+fn prepared_layer_rejects_device_capacity_overflow() {
+    let mut placement = fixture_placement();
+    placement.devices[0].capacity_bytes = 16;
+    let fixture = build_fixture_with(Vec::new(), fixture_tensors(), placement);
+    let runtime = MoeRuntime::new(fixture.open(), MoeRuntimeOptions::default()).unwrap();
+
+    let err = runtime.prepare_layer(0, 2).unwrap_err();
+
+    assert!(
+        matches!(err, MoeRuntimeError::Shape(message) if message.contains("exceeding manifest capacity 16"))
+    );
+}
+
+#[test]
 fn runtime_limits_reject_excessive_token_count() {
     let fixture = build_fixture();
     let runtime = MoeRuntime::new(

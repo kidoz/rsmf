@@ -1,14 +1,17 @@
-//! Minimal expert-parallel runtime proof of concept for RSMF MoE files.
+//! Placement-aware expert-parallel runtime for RSMF MoE files.
 //!
 //! The crate consumes the metadata added in the MoE, placement, sharding, tier,
-//! and prefetch milestones. It intentionally stays small: host-side top-1
-//! gating, token batching by destination expert, per-expert F32 matmuls, and a
-//! reference single-device path used for correctness checks.
+//! and prefetch milestones. It prepares resident validated layer plans,
+//! performs host-side top-1 gating, batches tokens by destination expert and
+//! placement device, runs per-expert F32 matmuls, and exposes a measured
+//! single-device reference check.
 //!
 //! GPU execution is feature-gated behind `wgpu`. In the default build the
 //! runtime reports a CPU fallback and still exercises the same routing,
 //! placement, and sharded-read contracts. With the feature enabled and an
 //! adapter available, expert matmuls run through a small WGPU compute shader.
+//! Tensor-parallel collectives are not implemented yet and are reported
+//! explicitly in prepared layer plans.
 //!
 //! ```
 //! use rsmf_moe_runtime::batch_by_destination;
@@ -32,12 +35,16 @@ mod runtime;
 mod wgpu_compute;
 
 pub use routing::{RoutingBatch, batch_by_destination};
-pub use runtime::{ExpertActivation, MoeRuntime, MoeRuntimeOptions, RuntimeLimits};
+pub use runtime::{
+    DeviceRunReport, ExpertActivation, MoeCheckedRunOutput, MoeLayerPlan, MoeLayerPlanReport,
+    MoeReferenceComparison, MoeRuntime, MoeRuntimeOptions, PlannedDevice, PlannedExpert,
+    RuntimeLimits, TensorParallelismStatus,
+};
 
 /// Result alias for the MoE runtime crate.
 pub type Result<T> = std::result::Result<T, MoeRuntimeError>;
 
-/// Errors returned by the MoE proof-of-concept runtime.
+/// Errors returned by the MoE runtime.
 #[derive(Debug, thiserror::Error)]
 pub enum MoeRuntimeError {
     /// Error propagated from `rsmf-core`.
@@ -62,9 +69,10 @@ pub enum RuntimeBackend {
         /// Human-readable reason for the fallback.
         reason: String,
     },
-    /// WGPU was requested and a compute device was selected. The PoC uses one
-    /// WGPU device as a logical executor for the placement devices recorded in
-    /// the file when multiple physical adapters are not available.
+    /// WGPU was requested and a compute device was selected. The current WGPU
+    /// executor uses one physical adapter as a logical executor for the
+    /// placement devices recorded in the file when multiple physical adapters
+    /// are not available.
     WgpuCompute {
         /// Number of WGPU placement devices requested by the placement manifest.
         requested_devices: usize,
@@ -95,6 +103,8 @@ pub struct DeviceBatch {
 pub struct MoeRunReport {
     /// Backend status for this run.
     pub backend: RuntimeBackend,
+    /// Prepared layer placement and residency summary.
+    pub plan: MoeLayerPlanReport,
     /// Number of input tokens.
     pub token_count: usize,
     /// Input model width.
@@ -103,6 +113,8 @@ pub struct MoeRunReport {
     pub output_width: usize,
     /// Token batches grouped by destination expert/device.
     pub device_batches: Vec<DeviceBatch>,
+    /// Per-device execution metrics.
+    pub device_runs: Vec<DeviceRunReport>,
     /// Host gating time.
     pub gating_time: Duration,
     /// Dispatch grouping and placement lookup time.
