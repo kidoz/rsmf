@@ -177,7 +177,8 @@ pub(crate) fn native_decoder_generate_with_backend_and_prefix_cache(
     match backend {
         NativeDecoderBackend::CpuReference
         | NativeDecoderBackend::CpuThreaded
-        | NativeDecoderBackend::AppleCpuAccelerate => native_decoder_cpu_greedy_decode(
+        | NativeDecoderBackend::AppleCpuAccelerate
+        | NativeDecoderBackend::MetalWgpuLmHead => native_decoder_cpu_greedy_decode(
             weights,
             input_token_ids,
             options,
@@ -186,7 +187,6 @@ pub(crate) fn native_decoder_generate_with_backend_and_prefix_cache(
         ),
         NativeDecoderBackend::Auto
         | NativeDecoderBackend::Accelerated
-        | NativeDecoderBackend::MetalWgpuLmHead
         | NativeDecoderBackend::MetalWgpuFullDecoder
         | NativeDecoderBackend::OrtCoreMl => Err(RuntimeError::NativeDecoderBackendUnavailable {
             backend: format!("{backend:?}"),
@@ -1396,10 +1396,12 @@ pub(crate) fn native_decoder_cpu_logits(
                     .unwrap_or(1)
             }),
         ),
+        NativeDecoderBackend::MetalWgpuLmHead => {
+            native_decoder_wgpu_linear(normalized, 1, hidden_size, lm_head, vocab_size)
+        }
         NativeDecoderBackend::CpuReference
         | NativeDecoderBackend::Auto
         | NativeDecoderBackend::Accelerated
-        | NativeDecoderBackend::MetalWgpuLmHead
         | NativeDecoderBackend::MetalWgpuFullDecoder
         | NativeDecoderBackend::OrtCoreMl => {
             native_decoder_cpu_linear(normalized, 1, hidden_size, lm_head, vocab_size)
@@ -1437,10 +1439,16 @@ pub(crate) fn native_decoder_cpu_logits_batch(
                 input.performance,
             )?
         }
+        NativeDecoderBackend::MetalWgpuLmHead => native_decoder_wgpu_linear(
+            input.normalized,
+            input.rows,
+            input.hidden_size,
+            input.lm_head,
+            input.vocab_size,
+        )?,
         NativeDecoderBackend::CpuReference
         | NativeDecoderBackend::Auto
         | NativeDecoderBackend::Accelerated
-        | NativeDecoderBackend::MetalWgpuLmHead
         | NativeDecoderBackend::MetalWgpuFullDecoder
         | NativeDecoderBackend::OrtCoreMl => native_decoder_cpu_linear(
             input.normalized,

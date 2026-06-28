@@ -21,6 +21,7 @@ regex.workspace = true
 minijinja.workspace = true
 half.workspace = true
 tracing = { workspace = true, optional = true }
+rsmf-wgpu = { workspace = true, optional = true }
 
 [features]
 default = ["tracing", "ort-api-23-allocator-stats"]
@@ -33,6 +34,12 @@ ort-api-23-allocator-stats = ["ort/api-23"]
 # linear projections. Non-macOS builds compile the feature but fall back to the
 # CPU reference backend.
 apple-accelerate = []
+# Enables the native decoder Metal/WGPU LM-head projection backend through the
+# reusable WGPU compute kernel. On macOS this uses WGPU's Metal backend when the
+# selected adapter is Metal-backed.
+wgpu = ["dep:rsmf-wgpu"]
+# Enables ORT CoreML execution-provider registration for graph payload sessions.
+coreml = ["ort/coreml"]
 
 [dev-dependencies]
 tempfile.workspace = true

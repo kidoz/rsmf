@@ -3,7 +3,7 @@ use std::fmt::Debug;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use ndarray::ArrayD;
-use ort::ep::CPUExecutionProvider;
+use ort::ep::{CPUExecutionProvider, ExecutionProviderDispatch};
 use ort::memory::{AllocationDevice, AllocatorType, MemoryInfo, MemoryType};
 use ort::session::{RunOptions, Session};
 use ort::value::DynValue;
@@ -485,11 +485,12 @@ impl Engine {
             .execution_providers
             .iter()
             .map(|provider| match provider {
-                ExecutionProvider::Cpu { arena } => CPUExecutionProvider::default()
+                ExecutionProvider::Cpu { arena } => Ok(CPUExecutionProvider::default()
                     .with_arena_allocator(*arena)
-                    .build(),
+                    .build()),
+                ExecutionProvider::CoreMl { require } => coreml_execution_provider(*require),
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>>>()?;
         if !execution_providers.is_empty() {
             builder = builder
                 .with_execution_providers(execution_providers)
@@ -668,6 +669,24 @@ impl Engine {
             other => RuntimeError::Core(other),
         })
     }
+}
+
+#[cfg(feature = "coreml")]
+fn coreml_execution_provider(require: bool) -> Result<ExecutionProviderDispatch> {
+    let provider = ort::ep::CoreML::default().build();
+    Ok(if require {
+        provider.error_on_failure()
+    } else {
+        provider.fail_silently()
+    })
+}
+
+#[cfg(not(feature = "coreml"))]
+fn coreml_execution_provider(_require: bool) -> Result<ExecutionProviderDispatch> {
+    Err(RuntimeError::Ort {
+        stage: "configure CoreML execution provider",
+        message: "rsmf-runtime was built without the coreml feature".to_string(),
+    })
 }
 
 fn run_with_cpu_io_binding(

@@ -1236,7 +1236,6 @@ fn engine_native_decoder_rejects_reserved_gpu_and_coreml_backends() {
     let engine = tiny_native_decoder_generation_engine(dir.path().join("native-decode.rsmf"));
 
     for (backend, expected_name) in [
-        (NativeDecoderBackend::MetalWgpuLmHead, "metal_wgpu_lm_head"),
         (
             NativeDecoderBackend::MetalWgpuFullDecoder,
             "metal_wgpu_full_decoder",
@@ -1256,6 +1255,63 @@ fn engine_native_decoder_rejects_reserved_gpu_and_coreml_backends() {
         assert!(
             matches!(err, RuntimeError::NativeDecoderBackendUnavailable { backend, .. } if backend == expected_name)
         );
+    }
+}
+
+#[cfg(not(feature = "wgpu"))]
+#[test]
+fn engine_native_decoder_rejects_wgpu_lm_head_without_feature() {
+    let dir = tempdir().unwrap();
+    let engine = tiny_native_decoder_generation_engine(dir.path().join("native-decode.rsmf"));
+    let err = engine
+        .native_decoder_greedy_decode(
+            &[0],
+            NativeDecoderRunOptions {
+                backend: NativeDecoderBackend::MetalWgpuLmHead,
+                ..NativeDecoderRunOptions::default()
+            },
+        )
+        .unwrap_err();
+
+    assert!(
+        matches!(err, RuntimeError::NativeDecoderBackendUnavailable { backend, .. } if backend == "metal_wgpu_lm_head")
+    );
+}
+
+#[cfg(feature = "wgpu")]
+#[test]
+fn engine_native_decoder_wgpu_lm_head_matches_cpu_or_reports_device_unavailable() {
+    let dir = tempdir().unwrap();
+    let engine = tiny_native_decoder_generation_engine(dir.path().join("native-decode.rsmf"));
+    let cpu = engine
+        .native_decoder_greedy_decode(
+            &[0],
+            NativeDecoderRunOptions {
+                backend: NativeDecoderBackend::CpuReference,
+                max_new_tokens: 2,
+                ..NativeDecoderRunOptions::default()
+            },
+        )
+        .unwrap();
+    let actual = engine.native_decoder_greedy_decode(
+        &[0],
+        NativeDecoderRunOptions {
+            backend: NativeDecoderBackend::MetalWgpuLmHead,
+            max_new_tokens: 2,
+            ..NativeDecoderRunOptions::default()
+        },
+    );
+
+    match actual {
+        Ok(output) => {
+            assert_eq!(output.backend, NativeDecoderBackend::MetalWgpuLmHead);
+            assert_eq!(output.generated_token_ids, cpu.generated_token_ids);
+            assert_eq!(output.logits, cpu.logits);
+        }
+        Err(RuntimeError::NativeDecoderBackendUnavailable { backend, .. }) => {
+            assert_eq!(backend, "metal_wgpu_lm_head");
+        }
+        Err(error) => panic!("unexpected WGPU LM-head error: {error}"),
     }
 }
 

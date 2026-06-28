@@ -137,6 +137,26 @@ fn runs_embedded_onnx_add_graph_from_rsmf() {
             .native_decoder_fused_qkv_attention_mlp,
         RuntimeCapability::Available
     ));
+    #[cfg(feature = "wgpu")]
+    assert!(matches!(
+        handle.capability_report().native_decoder_metal_wgpu,
+        RuntimeCapability::Available | RuntimeCapability::Unavailable { .. }
+    ));
+    #[cfg(not(feature = "wgpu"))]
+    assert!(matches!(
+        handle.capability_report().native_decoder_metal_wgpu,
+        RuntimeCapability::Unavailable { .. }
+    ));
+    #[cfg(all(feature = "coreml", target_vendor = "apple"))]
+    assert!(matches!(
+        handle.capability_report().ort_coreml_execution_provider,
+        RuntimeCapability::Available
+    ));
+    #[cfg(not(all(feature = "coreml", target_vendor = "apple")))]
+    assert!(matches!(
+        handle.capability_report().ort_coreml_execution_provider,
+        RuntimeCapability::Unavailable { .. }
+    ));
     assert!(matches!(
         handle.capability_report().serving_bearer_auth,
         RuntimeCapability::Available
@@ -217,6 +237,44 @@ fn runtime_allocator_stats_parse_common_ort_counters() {
             max_alloc_size_bytes: Some(1024),
             allocation_count: Some(7),
             reserve_count: Some(2),
+            ..
+        }
+    ));
+}
+
+#[cfg(not(feature = "coreml"))]
+#[test]
+fn coreml_execution_provider_requires_feature() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("coreml-provider-unavailable.rsmf");
+    RsmfWriter::new()
+        .with_tensor(TensorInput {
+            name: "fixture.weight".to_string(),
+            dtype: LogicalDtype::F32,
+            shape: vec![1],
+            shard_id: 0,
+            metadata: Vec::new(),
+            canonical: VariantInput::canonical_raw(0.0f32.to_le_bytes().to_vec()),
+            packed: Vec::new(),
+        })
+        .with_graph(GraphInput::onnx(tiny_add_onnx_model()))
+        .write_to_path(&path)
+        .unwrap();
+    let engine = Engine::new(RsmfFile::open(path).unwrap()).unwrap();
+    let err = engine
+        .session_handle(
+            0,
+            SessionOptions {
+                execution_providers: vec![ExecutionProvider::CoreMl { require: true }],
+                ..SessionOptions::default()
+            },
+        )
+        .unwrap_err();
+
+    assert!(matches!(
+        err,
+        RuntimeError::Ort {
+            stage: "configure CoreML execution provider",
             ..
         }
     ));

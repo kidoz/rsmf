@@ -13,10 +13,13 @@ pub(crate) fn resolve_native_decoder_backend(
                 Ok(NativeDecoderBackend::CpuReference)
             }
         }
-        NativeDecoderBackend::MetalWgpuLmHead => Err(RuntimeError::NativeDecoderBackendUnavailable {
-            backend: "metal_wgpu_lm_head".to_string(),
-            reason: "Metal/WGPU LM-head projection kernels are not implemented yet".to_string(),
-        }),
+        NativeDecoderBackend::MetalWgpuLmHead => {
+            if native_decoder_wgpu_linear_available() {
+                Ok(NativeDecoderBackend::MetalWgpuLmHead)
+            } else {
+                Err(native_decoder_wgpu_unavailable_error())
+            }
+        }
         NativeDecoderBackend::MetalWgpuFullDecoder => {
             Err(RuntimeError::NativeDecoderBackendUnavailable {
                 backend: "metal_wgpu_full_decoder".to_string(),
@@ -28,6 +31,10 @@ pub(crate) fn resolve_native_decoder_backend(
             reason: "ORT CoreML execution provider applies to graph payloads, not the native decoder path yet".to_string(),
         }),
     }
+}
+
+pub(crate) fn native_decoder_wgpu_linear_available() -> bool {
+    native_decoder_wgpu_executor().is_ok()
 }
 
 pub(crate) fn apple_accelerate_available() -> bool {
@@ -61,6 +68,69 @@ pub(crate) fn native_decoder_backend_linear(
         ),
         _ => native_decoder_cpu_linear(input, rows, in_features, weight, out_features),
     }
+}
+
+#[cfg(feature = "wgpu")]
+pub(crate) fn native_decoder_wgpu_linear(
+    input: &[f32],
+    rows: usize,
+    in_features: usize,
+    weight: &[f32],
+    out_features: usize,
+) -> Result<Vec<f32>> {
+    native_decoder_wgpu_executor()?
+        .linear(input, rows, in_features, weight, out_features)
+        .map_err(|error| RuntimeError::NativeDecoderBackendUnavailable {
+            backend: "metal_wgpu_lm_head".to_string(),
+            reason: error.to_string(),
+        })
+}
+
+#[cfg(not(feature = "wgpu"))]
+pub(crate) fn native_decoder_wgpu_linear(
+    _input: &[f32],
+    _rows: usize,
+    _in_features: usize,
+    _weight: &[f32],
+    _out_features: usize,
+) -> Result<Vec<f32>> {
+    Err(native_decoder_wgpu_unavailable_error())
+}
+
+#[cfg(feature = "wgpu")]
+fn native_decoder_wgpu_executor() -> Result<&'static rsmf_wgpu::WgpuLinearExecutor> {
+    static EXECUTOR: std::sync::OnceLock<
+        std::result::Result<rsmf_wgpu::WgpuLinearExecutor, String>,
+    > = std::sync::OnceLock::new();
+    match EXECUTOR.get_or_init(|| rsmf_wgpu::WgpuLinearExecutor::new().map_err(|e| e.to_string())) {
+        Ok(executor) => Ok(executor),
+        Err(reason) => Err(RuntimeError::NativeDecoderBackendUnavailable {
+            backend: "metal_wgpu_lm_head".to_string(),
+            reason: reason.clone(),
+        }),
+    }
+}
+
+#[cfg(not(feature = "wgpu"))]
+fn native_decoder_wgpu_executor() -> Result<()> {
+    Err(native_decoder_wgpu_unavailable_error())
+}
+
+fn native_decoder_wgpu_unavailable_error() -> RuntimeError {
+    RuntimeError::NativeDecoderBackendUnavailable {
+        backend: "metal_wgpu_lm_head".to_string(),
+        reason: native_decoder_wgpu_unavailable_reason(),
+    }
+}
+
+#[cfg(feature = "wgpu")]
+fn native_decoder_wgpu_unavailable_reason() -> String {
+    "WGPU device initialization failed or no compatible adapter is available".to_string()
+}
+
+#[cfg(not(feature = "wgpu"))]
+fn native_decoder_wgpu_unavailable_reason() -> String {
+    "rsmf-runtime was built without the wgpu feature".to_string()
 }
 
 #[cfg(all(target_os = "macos", feature = "apple-accelerate"))]

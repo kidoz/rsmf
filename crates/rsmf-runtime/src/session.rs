@@ -249,6 +249,12 @@ pub enum ExecutionProvider {
         /// Enable ORT's CPU memory arena.
         arena: bool,
     },
+    /// ORT CoreML execution provider for ONNX graph payloads.
+    CoreMl {
+        /// Return an error if CoreML EP registration fails instead of allowing
+        /// ORT to fall back to later providers.
+        require: bool,
+    },
 }
 
 impl Default for ExecutionProvider {
@@ -432,12 +438,8 @@ pub(crate) fn runtime_capability_report() -> RuntimeCapabilityReport {
         native_decoder_qk_family_direct_kernels: RuntimeCapability::Available,
         native_decoder_fused_lm_head_continuous_batching: RuntimeCapability::Available,
         native_decoder_fused_qkv_attention_mlp: RuntimeCapability::Available,
-        native_decoder_metal_wgpu: RuntimeCapability::unavailable(
-            "Metal/WGPU native decoder kernels are not implemented in this build",
-        ),
-        ort_coreml_execution_provider: RuntimeCapability::unavailable(
-            "CoreML execution provider registration is not implemented in the default ORT graph runtime",
-        ),
+        native_decoder_metal_wgpu: native_decoder_metal_wgpu_capability(),
+        ort_coreml_execution_provider: ort_coreml_capability(),
         sentencepiece_model_protobuf: RuntimeCapability::Available,
         serving_bearer_auth: RuntimeCapability::Available,
         serving_load_shedding: RuntimeCapability::Available,
@@ -454,6 +456,38 @@ pub(crate) fn runtime_capability_report() -> RuntimeCapabilityReport {
             "production multi-device/expert execution is not implemented in rsmf-runtime; rsmf-moe-runtime remains a separate proof-of-concept crate",
         ),
     }
+}
+
+#[cfg(feature = "wgpu")]
+fn native_decoder_metal_wgpu_capability() -> RuntimeCapability {
+    if crate::native_decoder::native_decoder_wgpu_linear_available() {
+        RuntimeCapability::Available
+    } else {
+        RuntimeCapability::unavailable(
+            "WGPU device initialization failed or no compatible adapter is available",
+        )
+    }
+}
+
+#[cfg(not(feature = "wgpu"))]
+fn native_decoder_metal_wgpu_capability() -> RuntimeCapability {
+    RuntimeCapability::unavailable("rsmf-runtime was built without the wgpu feature")
+}
+
+#[cfg(feature = "coreml")]
+fn ort_coreml_capability() -> RuntimeCapability {
+    if cfg!(target_vendor = "apple") {
+        RuntimeCapability::Available
+    } else {
+        RuntimeCapability::unavailable(
+            "CoreML execution provider is available only on Apple targets",
+        )
+    }
+}
+
+#[cfg(not(feature = "coreml"))]
+fn ort_coreml_capability() -> RuntimeCapability {
+    RuntimeCapability::unavailable("rsmf-runtime was built without the coreml feature")
 }
 
 #[cfg(feature = "ort-api-23-allocator-stats")]

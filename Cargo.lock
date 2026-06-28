@@ -2495,6 +2495,7 @@ dependencies = [
  "ort",
  "regex",
  "rsmf-core",
+ "rsmf-wgpu",
  "serde",
  "serde_json",
  "tempfile",
