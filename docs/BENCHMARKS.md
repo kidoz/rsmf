@@ -82,11 +82,15 @@ Measures host-side dispatch grouping:
 - builds a deterministic stream of 4096 token → expert assignments,
 - calls `rsmf_moe_runtime::batch_by_destination`,
 - reports throughput as tokens/second through Criterion's `Throughput::Elements`.
+- builds a tiny two-shard RSMF MoE fixture once, prepares a resident
+  `MoeLayerPlan`, and measures `run_prepared_layer_routed` with top-k routing.
 
-This isolates the routing-to-batch step. End-to-end MoE layer timings are exposed
-per run through `MoeRunReport` (`gating_time`, `dispatch_time`, `compute_time`,
-`combine_time`, and `tokens_per_second()`), because those timings depend on the
-fixture's expert dimensions and whether shard bytes fault from storage.
+The grouping benchmark isolates the routing-to-batch step. The prepared top-k
+benchmark exercises routing, weighted expert combine, and resident plan reuse on
+a tiny deterministic fixture. End-to-end MoE layer timings are also exposed per
+run through `MoeRunReport` (`gating_time`, `dispatch_time`, `compute_time`,
+`combine_time`, and `tokens_per_second()`), because those timings depend on
+expert dimensions and backend selection.
 
 Source: `crates/rsmf-bench/benches/moe_dispatch.rs`.
 

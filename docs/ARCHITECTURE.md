@@ -92,12 +92,13 @@ rsmf-core  (library)           ← format, reader, writer, validator, selection
   backend selectors currently return typed unavailable errors.
 - `rsmf-moe-runtime` is the optional placement-aware MoE runtime foundation.
   It prepares resident validated layer plans from `moe.*`, sharding,
-  `PlacementManifest`, and prefetch metadata; performs host-side top-1 gating;
-  batches tokens by destination expert and placement device; exposes
-  per-device residency and execution metrics; runs WGPU expert matmuls when
+  `PlacementManifest`, and prefetch metadata; performs host-side top-1 or
+  top-k routing; batches weighted token assignments by destination expert and
+  placement device; exposes transfer-plan, residency, multi-adapter capability,
+  collective-contract, and execution metrics; runs WGPU expert matmuls when
   available; and provides measured CPU reference comparison. Its optional
-  `wgpu` feature reports CPU fallback when no adapter is available. Top-k
-  routing, real tensor-parallel collectives, and multi-adapter execution remain
+  `wgpu` feature reports CPU fallback when no adapter is available. Real
+  tensor-parallel device collectives and physical multi-adapter execution remain
   future work.
 - `rsmf-python` enables high-performance access to RSMF models from Python. See the "Python surface" section below.
 

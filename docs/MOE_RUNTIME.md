@@ -12,16 +12,18 @@ For one MoE layer, the runtime:
 
 1. Reads `moe.*` metadata to find the layer router and expert `up` / `down`
    tensors.
-2. Runs host-side top-1 gating with a router tensor shaped
-   `[n_experts, input_width]`.
+2. Runs host-side routing with a router tensor shaped
+   `[n_experts, input_width]`. `run_layer_top1` remains the compatibility
+   path; `run_layer_routed` uses `MoeRuntimeOptions::routing` for top-1 or
+   top-k routing.
 3. Batches tokens by destination expert.
 4. Resolves each expert's `shard_id` through `PlacementManifest`.
 5. Loads expert weights through the normal `RsmfFile` sharded tensor path.
 6. Prepares a resident `MoeLayerPlan` with decoded router/expert weights,
    per-device resident byte accounting, placement capacity checks, and
    prefetch-group summaries.
-7. Runs F32 expert matmuls by placement device and scatters rows back into
-   token order.
+7. Runs F32 expert matmuls by placement device and scatters weighted rows back
+   into token order.
 
 The reference path uses the same router and expert math without placement-based
 batching. Tests compare the two paths on a fixed 2-shard fixture.
@@ -36,6 +38,9 @@ the measured routed/reference wall-time ratio.
 The runtime is intentionally stricter than the metadata index:
 
 - `run_layer_top1` only accepts `moe.top_k=1` when `moe.top_k` is present.
+- `run_layer_routed` accepts `MoeRoutingPolicy::TopK` when `moe.top_k` is
+  absent or matches the requested `k`; selected experts are combined with either
+  stable-softmax weights or equal `1.0` weights.
 - A layer must have exactly one router tensor, and router tensors must not set
   `moe.expert`.
 - Each router row must have a matching expert id with exactly one `up` and one
@@ -44,14 +49,26 @@ The runtime is intentionally stricter than the metadata index:
 - Expert `up` / `down` / `gate` tensors must live on the same `shard_id` so a
   placement record names one owning device for the expert.
 - Placement device capacity is enforced when `capacity_bytes` is non-zero.
-- Shared MoE experts are rejected by this crate; the runtime covers routed top-1
-  experts only.
+- Shared MoE experts are rejected by this crate; the runtime covers routed
+  expert-sharded layers where each expert is resident on one primary shard.
 
 `MoeRuntimeOptions::limits` rejects oversized token batches, decoded rank-2
 tensors, prepared-layer device/expert counts, per-device resident bytes, and
 output buffers before the runtime allocates large working memory. The defaults
 are deliberately finite and can be widened or disabled per field by callers
 that own the deployment envelope.
+
+Prepared plans also report:
+
+- `MoeTransferPlan`, an observability contract for host/device transfer intent
+  based on placement device kind and memory tier,
+- `MultiAdapterStatus`, which distinguishes CPU-only execution, available WGPU
+  adapter coverage, and logical single-adapter fallback,
+- `MoeCollectivePlan`, currently empty because expert-sharded execution does
+  not require tensor-parallel collectives.
+
+`CpuCollectives` provides hermetic reference `all_reduce_sum` and `gather`
+helpers for future tensor-parallel backend validation.
 
 ## WGPU Execution And Fallback
 
@@ -78,13 +95,14 @@ while preserving the placement and routing contract.
 - `combine_time`
 - `tokens_per_second()`
 
-Tensor-parallel collectives are not implemented yet. Prepared layer plans report
-`TensorParallelismStatus::NotRequired` for the current expert-sharded contract
-where each expert is owned by one shard/device. Future tensor-sliced experts
-must report an explicit unavailable status until real collectives exist.
+Device-backed tensor-parallel collectives are not implemented yet. Prepared
+layer plans report `TensorParallelismStatus::NotRequired` for the current
+expert-sharded contract where each expert is owned by one shard/device. Future
+tensor-sliced experts must report an explicit unavailable status until real
+collectives exist.
 
-The Criterion `moe_dispatch` bench isolates token batching throughput. Use it
-with:
+The Criterion `moe_dispatch` bench isolates token batching throughput and also
+includes a tiny end-to-end routed top-k fixture. Use it with:
 
 ```sh
 cargo bench -p rsmf-bench --bench moe_dispatch
