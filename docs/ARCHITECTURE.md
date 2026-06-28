@@ -96,10 +96,10 @@ rsmf-core  (library)           ← format, reader, writer, validator, selection
   top-k routing; batches weighted token assignments by destination expert and
   placement device; exposes transfer-plan, residency, multi-adapter capability,
   collective-contract, and execution metrics; runs WGPU expert matmuls when
-  available; and provides measured CPU reference comparison. Its optional
-  `wgpu` feature reports CPU fallback when no adapter is available. Real
-  tensor-parallel device collectives and physical multi-adapter execution remain
-  future work.
+  available through a physical-adapter executor pool; and provides measured CPU
+  reference comparison. Its optional `wgpu` feature reports CPU fallback when no
+  adapter is available. Real tensor-parallel device collectives and peer
+  transfer execution remain future work.
 - `rsmf-python` enables high-performance access to RSMF models from Python. See the "Python surface" section below.
 
 ## Module map inside `rsmf-core`

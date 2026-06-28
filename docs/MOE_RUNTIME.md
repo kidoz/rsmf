@@ -74,9 +74,18 @@ helpers for future tensor-parallel backend validation.
 
 The optional `wgpu` feature runs expert `up` / `down` matmuls through a small
 WGPU compute shader when an adapter is available. The shader pipeline is created
-once per runtime and reused across expert batches. A single physical adapter may
-back multiple logical WGPU placement devices in the current implementation; the
-placement records are still used for routing and reporting.
+once per physical adapter executor and reused across expert batches. Runtime
+construction enumerates physical WGPU adapters, creates an executor pool up to
+the number of logical WGPU placement devices, and assigns logical placement
+device ids to physical executors. If fewer physical adapters are available than
+logical placement devices, multiple logical devices share an executor and the
+plan reports `MultiAdapterStatus::Partial` or
+`MultiAdapterStatus::LogicalSingleAdapter`, depending on how many physical
+executors are active.
+
+Mixed placement is supported at the batch boundary: WGPU placement devices use
+the executor pool, while unmapped/CPU placement devices fall back to the CPU
+expert path.
 
 If the build lacks the feature, or no adapter is available, the runtime reports
 `RuntimeBackend::CpuFallback` and continues on CPU. This keeps CI hardware-free
