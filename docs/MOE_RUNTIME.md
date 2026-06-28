@@ -88,6 +88,12 @@ WGPU placement-device groups are dispatched in scoped host threads per physical
 executor slot. Each slot processes its assigned logical devices sequentially,
 then the host combines per-device outputs after the scoped threads join.
 
+Resident WGPU matrix cache misses are reported as executable
+`HostToDevice` transfer stages in each `DeviceRunReport::transfer`: cache
+misses upload decoded resident weight bytes and record elapsed upload time,
+while cache hits report zero transfer bytes. CPU/RAM execution reports
+`MoeTransferKind::None` with zero transfer bytes.
+
 Mixed placement is supported at the batch boundary: WGPU placement devices use
 the executor pool, while unmapped/CPU placement devices fall back to the CPU
 expert path.
@@ -104,6 +110,7 @@ while preserving the placement and routing contract.
 - per-run `device_batches`
 - per-device `device_runs`
 - per-device WGPU `weight_cache_hits` / `weight_cache_misses`
+- per-device executed `transfer` kind, bytes, duration, and cache events
 - `gating_time`
 - `dispatch_time`
 - `compute_time`

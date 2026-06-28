@@ -96,8 +96,9 @@ rsmf-core  (library)           ← format, reader, writer, validator, selection
   top-k routing; batches weighted token assignments by destination expert and
   placement device; exposes transfer-plan, residency, multi-adapter capability,
   collective-contract, and execution metrics; runs WGPU expert matmuls through
-  a physical-adapter executor pool with resident weight-buffer caching and
-  per-adapter scoped dispatch; and provides measured CPU reference comparison.
+  a physical-adapter executor pool with resident weight-buffer caching,
+  observed host-to-device transfer metrics for cache misses, and per-adapter
+  scoped dispatch; and provides measured CPU reference comparison.
   Its optional `wgpu` feature reports CPU fallback when no adapter is
   available. Real tensor-parallel device collectives and peer transfer
   execution remain future work.
