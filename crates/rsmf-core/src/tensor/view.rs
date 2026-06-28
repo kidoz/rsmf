@@ -6,7 +6,7 @@
 //! for the target type, [`TensorView::as_slice`] returns a zero-copy reference.
 
 use bytemuck::Pod;
-use half::f16;
+use half::{bf16, f16};
 use wide::f32x8;
 
 #[cfg(feature = "tracing")]
@@ -160,13 +160,19 @@ impl<'a> TensorView<'a> {
                     return Ok(out);
                 }
 
-                if self.descriptor.dtype != LogicalDtype::F32 {
-                    return Err(RsmfError::unsupported(format!(
-                        "decode_f32 on Raw variant requires logical dtype F32, got {:?}",
-                        self.descriptor.dtype
-                    )));
+                match self.descriptor.dtype {
+                    LogicalDtype::F32 => self.to_vec::<f32>(),
+                    LogicalDtype::F16 => decode_raw_f16_to_f32(self.bytes),
+                    LogicalDtype::BF16 => decode_raw_bf16_to_f32(self.bytes),
+                    LogicalDtype::I8 => {
+                        Ok(self.bytes.iter().map(|value| *value as i8 as f32).collect())
+                    }
+                    LogicalDtype::I16 => decode_raw_i16_to_f32(self.bytes),
+                    LogicalDtype::I32 => decode_raw_i32_to_f32(self.bytes),
+                    dtype => Err(RsmfError::unsupported(format!(
+                        "decode_f32 on Raw variant does not support logical dtype {dtype:?}"
+                    ))),
                 }
-                self.to_vec::<f32>()
             }
             EncodingKind::CastF16 => {
                 if self.bytes.len() % 2 != 0 {
@@ -325,4 +331,48 @@ impl<'a> TensorView<'a> {
             .map(|s| s.to_vec())
             .map_err(|e| RsmfError::unsupported(format!("alignment: {e:?}")))
     }
+}
+
+fn decode_raw_f16_to_f32(bytes: &[u8]) -> Result<Vec<f32>> {
+    if bytes.len() % 2 != 0 {
+        return Err(RsmfError::structural("Raw F16 length not even".to_string()));
+    }
+    Ok(bytes
+        .chunks_exact(2)
+        .map(|chunk| f16::from_le_bytes([chunk[0], chunk[1]]).to_f32())
+        .collect())
+}
+
+fn decode_raw_bf16_to_f32(bytes: &[u8]) -> Result<Vec<f32>> {
+    if bytes.len() % 2 != 0 {
+        return Err(RsmfError::structural(
+            "Raw BF16 length not even".to_string(),
+        ));
+    }
+    Ok(bytes
+        .chunks_exact(2)
+        .map(|chunk| bf16::from_le_bytes([chunk[0], chunk[1]]).to_f32())
+        .collect())
+}
+
+fn decode_raw_i16_to_f32(bytes: &[u8]) -> Result<Vec<f32>> {
+    if bytes.len() % 2 != 0 {
+        return Err(RsmfError::structural("Raw I16 length not even".to_string()));
+    }
+    Ok(bytes
+        .chunks_exact(2)
+        .map(|chunk| i16::from_le_bytes([chunk[0], chunk[1]]) as f32)
+        .collect())
+}
+
+fn decode_raw_i32_to_f32(bytes: &[u8]) -> Result<Vec<f32>> {
+    if bytes.len() % 4 != 0 {
+        return Err(RsmfError::structural(
+            "Raw I32 length not divisible by 4".to_string(),
+        ));
+    }
+    Ok(bytes
+        .chunks_exact(4)
+        .map(|chunk| i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]) as f32)
+        .collect())
 }
