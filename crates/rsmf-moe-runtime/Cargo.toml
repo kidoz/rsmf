@@ -21,11 +21,15 @@ optional = true
 workspace = true
 optional = true
 
+[dependencies.pollster]
+workspace = true
+optional = true
+
 [features]
 default = []
 # Probe WGPU availability for expert-parallel execution. The default runtime
 # remains CPU-only so CI can run without an adapter.
-wgpu = ["dep:rsmf-wgpu", "dep:wgpu"]
+wgpu = ["dep:rsmf-wgpu", "dep:wgpu", "dep:pollster"]
 
 [dev-dependencies]
 tempfile.workspace = true

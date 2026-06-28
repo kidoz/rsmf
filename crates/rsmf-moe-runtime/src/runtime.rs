@@ -269,6 +269,16 @@ pub enum MultiAdapterStatus {
         /// Number of available physical adapters.
         available_adapters: usize,
     },
+    /// Multiple physical adapters are active, but fewer than the requested
+    /// logical WGPU placement devices.
+    Partial {
+        /// Number of requested placement devices.
+        requested_devices: usize,
+        /// Number of available physical adapters.
+        available_adapters: usize,
+        /// Number of physical adapters actively used by the executor pool.
+        active_adapters: usize,
+    },
     /// A single physical WGPU adapter backs multiple logical placement devices.
     LogicalSingleAdapter {
         /// Number of requested placement devices.
@@ -480,7 +490,7 @@ pub struct MoeRuntime {
     backend: RuntimeBackend,
     options: MoeRuntimeOptions,
     #[cfg(feature = "wgpu")]
-    wgpu: Option<crate::wgpu_compute::WgpuExecutor>,
+    wgpu: Option<crate::wgpu_compute::WgpuExecutorPool>,
 }
 
 impl MoeRuntime {
@@ -1181,6 +1191,7 @@ impl MoeRuntime {
             RuntimeBackend::WgpuCompute {
                 requested_devices,
                 available_adapters,
+                active_adapters,
                 ..
             } => {
                 let requested = (*requested_devices).max(
@@ -1189,15 +1200,21 @@ impl MoeRuntime {
                         .filter(|device| device.kind == DeviceKind::Wgpu)
                         .count(),
                 );
-                if requested <= *available_adapters {
+                if requested <= *active_adapters {
                     MultiAdapterStatus::Available {
                         requested_devices: requested,
-                        available_adapters: *available_adapters,
+                        available_adapters: *active_adapters,
+                    }
+                } else if *active_adapters > 1 {
+                    MultiAdapterStatus::Partial {
+                        requested_devices: requested,
+                        available_adapters: (*active_adapters).max(*available_adapters),
+                        active_adapters: *active_adapters,
                     }
                 } else {
                     MultiAdapterStatus::LogicalSingleAdapter {
                         requested_devices: requested,
-                        available_adapters: *available_adapters,
+                        available_adapters: (*active_adapters).max(*available_adapters),
                     }
                 }
             }
@@ -1340,47 +1357,75 @@ impl MoeRuntime {
         let mut output = vec![0.0; total_output_len];
         let mut device_runs = Vec::new();
         for (device_id, batches) in batches_by_device(device_batches) {
-            let device_start = Instant::now();
-            let batch_count = batches.len();
-            let mut expert_ids = BTreeSet::new();
-            let mut device_token_count = 0usize;
-            for batch in batches {
-                expert_ids.insert(batch.expert_id);
-                device_token_count = device_token_count
-                    .checked_add(batch.token_indices.len())
-                    .ok_or_else(|| {
-                        MoeRuntimeError::Shape("device token count overflow".to_string())
-                    })?;
-                let expert = loaded.experts.get(&batch.expert_id).ok_or_else(|| {
-                    MoeRuntimeError::Missing(format!("expert {}", batch.expert_id))
-                })?;
-                for (&token_idx, &weight) in batch.token_indices.iter().zip(&batch.token_weights) {
-                    let input_row = &input[token_idx * input_width..(token_idx + 1) * input_width];
-                    let row = eval_expert(input_row, expert, self.options.activation)?;
-                    let out_start = token_idx * loaded.output_width;
-                    for (dst, value) in output[out_start..out_start + loaded.output_width]
-                        .iter_mut()
-                        .zip(row)
-                    {
-                        *dst += value * weight;
-                    }
+            let (device_output, device_run) = self.compute_device_batches_cpu(
+                loaded,
+                input,
+                input_width,
+                token_count,
+                device_id,
+                &batches,
+            )?;
+            accumulate_output(&mut output, &device_output)?;
+            device_runs.push(device_run);
+        }
+        Ok((output, device_runs))
+    }
+
+    fn compute_device_batches_cpu(
+        &self,
+        loaded: &LoadedLayer,
+        input: &[f32],
+        input_width: usize,
+        token_count: usize,
+        device_id: u32,
+        batches: &[&DeviceBatch],
+    ) -> Result<(Vec<f32>, DeviceRunReport)> {
+        let total_output_len = output_len(token_count, loaded.output_width)?;
+        self.options
+            .limits
+            .check_output_elements(total_output_len)?;
+        let mut output = vec![0.0; total_output_len];
+        let device_start = Instant::now();
+        let batch_count = batches.len();
+        let mut expert_ids = BTreeSet::new();
+        let mut device_token_count = 0usize;
+        for batch in batches {
+            expert_ids.insert(batch.expert_id);
+            device_token_count = device_token_count
+                .checked_add(batch.token_indices.len())
+                .ok_or_else(|| MoeRuntimeError::Shape("device token count overflow".to_string()))?;
+            let expert = loaded
+                .experts
+                .get(&batch.expert_id)
+                .ok_or_else(|| MoeRuntimeError::Missing(format!("expert {}", batch.expert_id)))?;
+            for (&token_idx, &weight) in batch.token_indices.iter().zip(&batch.token_weights) {
+                let input_row = &input[token_idx * input_width..(token_idx + 1) * input_width];
+                let row = eval_expert(input_row, expert, self.options.activation)?;
+                let out_start = token_idx * loaded.output_width;
+                for (dst, value) in output[out_start..out_start + loaded.output_width]
+                    .iter_mut()
+                    .zip(row)
+                {
+                    *dst += value * weight;
                 }
             }
-            device_runs.push(DeviceRunReport {
+        }
+        Ok((
+            output,
+            DeviceRunReport {
                 device_id,
                 expert_ids: expert_ids.into_iter().collect(),
                 batch_count,
                 token_count: device_token_count,
                 compute_time: device_start.elapsed(),
-            });
-        }
-        Ok((output, device_runs))
+            },
+        ))
     }
 
     #[cfg(feature = "wgpu")]
     fn compute_batches_wgpu(
         &self,
-        executor: &crate::wgpu_compute::WgpuExecutor,
+        executor_pool: &crate::wgpu_compute::WgpuExecutorPool,
         loaded: &LoadedLayer,
         input: &[f32],
         input_width: usize,
@@ -1394,6 +1439,19 @@ impl MoeRuntime {
         let mut output = vec![0.0; total_output_len];
         let mut device_runs = Vec::new();
         for (device_id, batches) in batches_by_device(device_batches) {
+            let Some(executor) = executor_pool.executor_for_device(device_id) else {
+                let (device_output, device_run) = self.compute_device_batches_cpu(
+                    loaded,
+                    input,
+                    input_width,
+                    token_count,
+                    device_id,
+                    &batches,
+                )?;
+                accumulate_output(&mut output, &device_output)?;
+                device_runs.push(device_run);
+                continue;
+            };
             let device_start = Instant::now();
             let batch_count = batches.len();
             let mut expert_ids = BTreeSet::new();
@@ -1627,6 +1685,20 @@ fn batches_by_device(device_batches: &[DeviceBatch]) -> BTreeMap<u32, Vec<&Devic
         out.entry(batch.device_id).or_default().push(batch);
     }
     out
+}
+
+fn accumulate_output(output: &mut [f32], device_output: &[f32]) -> Result<()> {
+    if output.len() != device_output.len() {
+        return Err(MoeRuntimeError::Shape(format!(
+            "device output length {} does not match output length {}",
+            device_output.len(),
+            output.len()
+        )));
+    }
+    for (dst, value) in output.iter_mut().zip(device_output) {
+        *dst += value;
+    }
+    Ok(())
 }
 
 fn max_abs_diff(left: &[f32], right: &[f32]) -> Result<f32> {
@@ -1932,7 +2004,10 @@ fn set_once(
 fn select_backend(
     placement: &PlacementManifest,
     prefer_wgpu: bool,
-) -> (RuntimeBackend, Option<crate::wgpu_compute::WgpuExecutor>) {
+) -> (
+    RuntimeBackend,
+    Option<crate::wgpu_compute::WgpuExecutorPool>,
+) {
     if !prefer_wgpu {
         return (
             RuntimeBackend::CpuFallback {
@@ -1957,7 +2032,7 @@ fn select_backend(
         );
     }
 
-    let Some(executor) = crate::wgpu_compute::WgpuExecutor::new() else {
+    let Some(executor_pool) = crate::wgpu_compute::WgpuExecutorPool::new(placement) else {
         return (
             RuntimeBackend::CpuFallback {
                 reason: format!(
@@ -1967,13 +2042,20 @@ fn select_backend(
             None,
         );
     };
+    let adapter_names = executor_pool.adapter_names();
+    let adapter_name = adapter_names
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "unknown WGPU adapter".to_string());
     (
         RuntimeBackend::WgpuCompute {
-            requested_devices,
-            available_adapters: 1,
-            adapter_name: executor.adapter_name().to_string(),
+            requested_devices: executor_pool.requested_devices(),
+            available_adapters: executor_pool.available_adapters(),
+            active_adapters: executor_pool.active_adapters(),
+            adapter_name,
+            adapter_names,
         },
-        Some(executor),
+        Some(executor_pool),
     )
 }
 

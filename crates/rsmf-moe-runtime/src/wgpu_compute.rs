@@ -1,8 +1,11 @@
 //! Small WGPU compute executor for the MoE runtime.
 
 use std::borrow::Cow;
+use std::collections::BTreeMap;
 use std::sync::mpsc;
 
+use pollster::FutureExt;
+use rsmf_core::{DeviceKind, PlacementManifest};
 use wgpu::util::DeviceExt;
 
 use crate::{MoeRuntimeError, Result};
@@ -58,62 +61,140 @@ pub(crate) struct WgpuExecutor {
     adapter_name: String,
 }
 
-impl WgpuExecutor {
-    pub(crate) fn new() -> Option<Self> {
-        let caps = rsmf_wgpu::detect_capabilities()?;
-        let adapter_name = caps.info.name.clone();
-        let handle = rsmf_wgpu::request_device(&caps)?;
-        let shader = handle
-            .device
-            .create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("rsmf-moe matmul shader"),
-                source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(SHADER)),
-            });
-        let bind_group_layout =
-            handle
-                .device
-                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                    label: Some("rsmf-moe matmul bgl"),
-                    entries: &[
-                        storage_entry(0, true),
-                        storage_entry(1, true),
-                        storage_entry(2, false),
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 3,
-                            visibility: wgpu::ShaderStages::COMPUTE,
-                            ty: wgpu::BindingType::Buffer {
-                                ty: wgpu::BufferBindingType::Uniform,
-                                has_dynamic_offset: false,
-                                min_binding_size: None,
-                            },
-                            count: None,
-                        },
-                    ],
-                });
-        let pipeline_layout =
-            handle
-                .device
-                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                    label: Some("rsmf-moe matmul pipeline layout"),
-                    bind_group_layouts: &[&bind_group_layout],
-                    push_constant_ranges: &[],
-                });
-        let pipeline = handle
-            .device
-            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("rsmf-moe matmul pipeline"),
-                layout: Some(&pipeline_layout),
-                module: &shader,
-                entry_point: Some("main"),
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-                cache: None,
-            });
+/// Pool of physical WGPU adapter executors mapped to logical placement devices.
+#[derive(Debug)]
+pub(crate) struct WgpuExecutorPool {
+    executors: Vec<WgpuExecutor>,
+    device_assignments: BTreeMap<u32, usize>,
+    requested_devices: usize,
+    available_adapters: usize,
+}
+
+impl WgpuExecutorPool {
+    pub(crate) fn new(placement: &PlacementManifest) -> Option<Self> {
+        let wgpu_device_ids = placement
+            .devices
+            .iter()
+            .filter(|device| device.kind == DeviceKind::Wgpu)
+            .map(|device| device.id)
+            .collect::<Vec<_>>();
+        if wgpu_device_ids.is_empty() {
+            return None;
+        }
+
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+        let adapters = instance.enumerate_adapters(wgpu::Backends::all());
+        if adapters.is_empty() {
+            return None;
+        }
+
+        let requested_devices = wgpu_device_ids.len();
+        let available_adapters = adapters.len();
+        let executor_count = requested_devices.min(available_adapters);
+        let mut executors = Vec::with_capacity(executor_count);
+        for adapter in adapters.into_iter().take(executor_count) {
+            if let Some(executor) = WgpuExecutor::from_adapter(adapter) {
+                executors.push(executor);
+            }
+        }
+        if executors.is_empty() {
+            return None;
+        }
+
+        let mut device_assignments = BTreeMap::new();
+        for (idx, device_id) in wgpu_device_ids.into_iter().enumerate() {
+            device_assignments.insert(device_id, idx % executors.len());
+        }
+
         Some(Self {
-            device: handle.device,
-            queue: handle.queue,
+            executors,
+            device_assignments,
+            requested_devices,
+            available_adapters,
+        })
+    }
+
+    pub(crate) fn executor_for_device(&self, device_id: u32) -> Option<&WgpuExecutor> {
+        self.device_assignments
+            .get(&device_id)
+            .and_then(|executor_idx| self.executors.get(*executor_idx))
+    }
+
+    pub(crate) fn requested_devices(&self) -> usize {
+        self.requested_devices
+    }
+
+    pub(crate) fn available_adapters(&self) -> usize {
+        self.available_adapters
+    }
+
+    pub(crate) fn active_adapters(&self) -> usize {
+        self.executors.len()
+    }
+
+    pub(crate) fn adapter_names(&self) -> Vec<String> {
+        self.executors
+            .iter()
+            .map(|executor| executor.adapter_name().to_string())
+            .collect()
+    }
+}
+
+impl WgpuExecutor {
+    fn from_adapter(adapter: wgpu::Adapter) -> Option<Self> {
+        let info = adapter.get_info();
+        let limits = adapter.limits();
+        let (device, queue) = adapter
+            .request_device(&wgpu::DeviceDescriptor {
+                label: Some("rsmf-moe-runtime"),
+                required_features: wgpu::Features::empty(),
+                required_limits: limits.clone(),
+                memory_hints: wgpu::MemoryHints::default(),
+                trace: wgpu::Trace::Off,
+            })
+            .block_on()
+            .ok()?;
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("rsmf-moe matmul shader"),
+            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(SHADER)),
+        });
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("rsmf-moe matmul bgl"),
+            entries: &[
+                storage_entry(0, true),
+                storage_entry(1, true),
+                storage_entry(2, false),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("rsmf-moe matmul pipeline layout"),
+            bind_group_layouts: &[&bind_group_layout],
+            push_constant_ranges: &[],
+        });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("rsmf-moe matmul pipeline"),
+            layout: Some(&pipeline_layout),
+            module: &shader,
+            entry_point: Some("main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            cache: None,
+        });
+        Some(Self {
+            device,
+            queue,
             bind_group_layout,
             pipeline,
-            adapter_name,
+            adapter_name: info.name,
         })
     }
 

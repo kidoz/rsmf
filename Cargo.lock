@@ -2464,6 +2464,7 @@ dependencies = [
 name = "rsmf-moe-runtime"
 version = "0.1.0"
 dependencies = [
+ "pollster",
  "rsmf-core",
  "rsmf-wgpu",
  "tempfile",

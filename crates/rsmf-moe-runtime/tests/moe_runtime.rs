@@ -9,6 +9,8 @@ use rsmf_core::{
     DeviceDescriptor, DeviceKind, LogicalDtype, MemoryTier, PLACEMENT_FLAG_PIN, PLACEMENT_VERSION,
     PlacementManifest, PlacementRecord, RsmfFile,
 };
+#[cfg(feature = "wgpu")]
+use rsmf_moe_runtime::MultiAdapterStatus;
 use rsmf_moe_runtime::{
     CpuCollectives, ExpertActivation, MoeRoutingPolicy, MoeRuntime, MoeRuntimeError,
     MoeRuntimeOptions, MoeTransferKind, RuntimeBackend, RuntimeLimits,
@@ -581,11 +583,44 @@ fn wgpu_preference_matches_reference_or_falls_back() {
         RuntimeBackend::WgpuCompute {
             requested_devices,
             available_adapters,
+            active_adapters,
             adapter_name,
+            adapter_names,
         } => {
             assert_eq!(*requested_devices, 2);
             assert!(*available_adapters >= 1);
+            assert!(*active_adapters >= 1);
+            assert!(*active_adapters <= *available_adapters);
             assert!(!adapter_name.is_empty());
+            assert_eq!(adapter_names.len(), *active_adapters);
+            assert!(adapter_names.iter().all(|name| !name.is_empty()));
+            match &parallel.report.plan.multi_adapter {
+                MultiAdapterStatus::Available {
+                    requested_devices,
+                    available_adapters,
+                } => {
+                    assert_eq!(*requested_devices, 2);
+                    assert!(*available_adapters >= 2);
+                }
+                MultiAdapterStatus::LogicalSingleAdapter {
+                    requested_devices,
+                    available_adapters,
+                } => {
+                    assert_eq!(*requested_devices, 2);
+                    assert!(*available_adapters >= 1);
+                }
+                MultiAdapterStatus::Partial {
+                    requested_devices,
+                    available_adapters,
+                    active_adapters,
+                } => {
+                    assert_eq!(*requested_devices, 2);
+                    assert!(*available_adapters >= *active_adapters);
+                    assert!(*active_adapters > 1);
+                    assert!(*active_adapters < *requested_devices);
+                }
+                other => panic!("unexpected multi-adapter status: {other:?}"),
+            }
         }
         RuntimeBackend::CpuFallback { reason } => {
             assert!(!reason.is_empty());

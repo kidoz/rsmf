@@ -10,8 +10,9 @@
 //! runtime reports a CPU fallback and still exercises the same routing,
 //! placement, and sharded-read contracts. With the feature enabled and an
 //! adapter available, expert matmuls run through a small WGPU compute shader.
-//! Tensor-parallel collectives are not implemented yet and are reported
-//! explicitly in prepared layer plans.
+//! When multiple physical adapters are exposed by WGPU, logical WGPU placement
+//! devices are assigned across an executor pool. Tensor-parallel collectives are
+//! not implemented yet and are reported explicitly in prepared layer plans.
 //!
 //! ```
 //! use rsmf_moe_runtime::batch_by_destination;
@@ -71,17 +72,19 @@ pub enum RuntimeBackend {
         /// Human-readable reason for the fallback.
         reason: String,
     },
-    /// WGPU was requested and a compute device was selected. The current WGPU
-    /// executor uses one physical adapter as a logical executor for the
-    /// placement devices recorded in the file when multiple physical adapters
-    /// are not available.
+    /// WGPU was requested and at least one physical adapter executor was
+    /// selected.
     WgpuCompute {
         /// Number of WGPU placement devices requested by the placement manifest.
         requested_devices: usize,
         /// Number of WGPU adapters observed by the probe.
         available_adapters: usize,
-        /// Human-readable adapter name.
+        /// Number of physical adapters actively used by the executor pool.
+        active_adapters: usize,
+        /// Human-readable primary adapter name.
         adapter_name: String,
+        /// Human-readable adapter names actively used by the executor pool.
+        adapter_names: Vec<String>,
     },
 }
 
