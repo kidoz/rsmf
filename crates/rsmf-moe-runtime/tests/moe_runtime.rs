@@ -304,9 +304,13 @@ fn prepared_layer_plan_reports_residency_and_reuses_weights() {
     assert_eq!(output.report.device_runs[0].device_id, 0);
     assert_eq!(output.report.device_runs[0].expert_ids, vec![0]);
     assert_eq!(output.report.device_runs[0].token_count, 2);
+    assert_eq!(output.report.device_runs[0].weight_cache_hits, 0);
+    assert_eq!(output.report.device_runs[0].weight_cache_misses, 0);
     assert_eq!(output.report.device_runs[1].device_id, 1);
     assert_eq!(output.report.device_runs[1].expert_ids, vec![1]);
     assert_eq!(output.report.device_runs[1].token_count, 2);
+    assert_eq!(output.report.device_runs[1].weight_cache_hits, 0);
+    assert_eq!(output.report.device_runs[1].weight_cache_misses, 0);
 }
 
 #[test]
@@ -575,10 +579,13 @@ fn wgpu_preference_matches_reference_or_falls_back() {
     )
     .unwrap();
     let input = vec![2.0, 1.0, 1.0, 3.0, 4.0, 0.0, 0.0, 5.0];
-    let parallel = runtime.run_layer_top1(0, &input, 2).unwrap();
+    let plan = runtime.prepare_layer(0, 2).unwrap();
+    let parallel = runtime.run_prepared_layer_top1(&plan, &input).unwrap();
+    let second = runtime.run_prepared_layer_top1(&plan, &input).unwrap();
     let reference = runtime.run_layer_reference_top1(0, &input, 2).unwrap();
 
     assert_close(&parallel.output, &reference, 1e-5);
+    assert_close(&second.output, &reference, 1e-5);
     match &parallel.report.backend {
         RuntimeBackend::WgpuCompute {
             requested_devices,
@@ -594,6 +601,27 @@ fn wgpu_preference_matches_reference_or_falls_back() {
             assert!(!adapter_name.is_empty());
             assert_eq!(adapter_names.len(), *active_adapters);
             assert!(adapter_names.iter().all(|name| !name.is_empty()));
+            let first_misses = parallel
+                .report
+                .device_runs
+                .iter()
+                .map(|run| run.weight_cache_misses)
+                .sum::<usize>();
+            let second_hits = second
+                .report
+                .device_runs
+                .iter()
+                .map(|run| run.weight_cache_hits)
+                .sum::<usize>();
+            let second_misses = second
+                .report
+                .device_runs
+                .iter()
+                .map(|run| run.weight_cache_misses)
+                .sum::<usize>();
+            assert!(first_misses >= 4);
+            assert!(second_hits >= first_misses);
+            assert_eq!(second_misses, 0);
             match &parallel.report.plan.multi_adapter {
                 MultiAdapterStatus::Available {
                     requested_devices,

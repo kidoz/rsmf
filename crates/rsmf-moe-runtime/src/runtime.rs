@@ -446,6 +446,16 @@ pub struct DeviceRunReport {
     pub batch_count: usize,
     /// Number of token rows processed by this device.
     pub token_count: usize,
+    /// Number of resident weight matrix uploads avoided by the WGPU cache.
+    ///
+    /// CPU execution reports zero because host matrices are already resident in
+    /// the prepared plan.
+    pub weight_cache_hits: usize,
+    /// Number of resident weight matrix uploads performed for this device run.
+    ///
+    /// CPU execution reports zero because host matrices are already resident in
+    /// the prepared plan.
+    pub weight_cache_misses: usize,
     /// Compute time spent while executing this device's batches.
     pub compute_time: Duration,
 }
@@ -1357,14 +1367,8 @@ impl MoeRuntime {
         let mut output = vec![0.0; total_output_len];
         let mut device_runs = Vec::new();
         for (device_id, batches) in batches_by_device(device_batches) {
-            let (device_output, device_run) = self.compute_device_batches_cpu(
-                loaded,
-                input,
-                input_width,
-                token_count,
-                device_id,
-                &batches,
-            )?;
+            let (device_output, device_run) =
+                self.compute_device_batches_cpu(loaded, input, input_width, device_id, &batches)?;
             accumulate_output(&mut output, &device_output)?;
             device_runs.push(device_run);
         }
@@ -1376,10 +1380,10 @@ impl MoeRuntime {
         loaded: &LoadedLayer,
         input: &[f32],
         input_width: usize,
-        token_count: usize,
         device_id: u32,
         batches: &[&DeviceBatch],
     ) -> Result<(Vec<f32>, DeviceRunReport)> {
+        let token_count = checked_token_count(input, input_width)?;
         let total_output_len = output_len(token_count, loaded.output_width)?;
         self.options
             .limits
@@ -1417,6 +1421,8 @@ impl MoeRuntime {
                 expert_ids: expert_ids.into_iter().collect(),
                 batch_count,
                 token_count: device_token_count,
+                weight_cache_hits: 0,
+                weight_cache_misses: 0,
                 compute_time: device_start.elapsed(),
             },
         ))
@@ -1438,13 +1444,13 @@ impl MoeRuntime {
             .check_output_elements(total_output_len)?;
         let mut output = vec![0.0; total_output_len];
         let mut device_runs = Vec::new();
+        let mut wgpu_groups: BTreeMap<usize, Vec<(u32, Vec<&DeviceBatch>)>> = BTreeMap::new();
         for (device_id, batches) in batches_by_device(device_batches) {
-            let Some(executor) = executor_pool.executor_for_device(device_id) else {
+            let Some(executor_idx) = executor_pool.executor_slot_for_device(device_id) else {
                 let (device_output, device_run) = self.compute_device_batches_cpu(
                     loaded,
                     input,
                     input_width,
-                    token_count,
                     device_id,
                     &batches,
                 )?;
@@ -1452,87 +1458,179 @@ impl MoeRuntime {
                 device_runs.push(device_run);
                 continue;
             };
-            let device_start = Instant::now();
-            let batch_count = batches.len();
-            let mut expert_ids = BTreeSet::new();
-            let mut device_token_count = 0usize;
-            for batch in batches {
-                expert_ids.insert(batch.expert_id);
-                device_token_count = device_token_count
-                    .checked_add(batch.token_indices.len())
-                    .ok_or_else(|| {
-                        MoeRuntimeError::Shape("device token count overflow".to_string())
-                    })?;
-                let expert = loaded.experts.get(&batch.expert_id).ok_or_else(|| {
-                    MoeRuntimeError::Missing(format!("expert {}", batch.expert_id))
-                })?;
-                let batch_input_len = output_len(batch.token_indices.len(), input_width)?;
-                let mut batch_input = Vec::with_capacity(batch_input_len);
-                for &token_idx in &batch.token_indices {
-                    batch_input.extend_from_slice(
-                        &input[token_idx * input_width..(token_idx + 1) * input_width],
-                    );
-                }
+            wgpu_groups
+                .entry(executor_idx)
+                .or_default()
+                .push((device_id, batches));
+        }
 
-                let up = executor.matmul(
-                    &expert.up.data,
-                    expert.up.rows,
-                    expert.up.cols,
-                    &batch_input,
-                    batch.token_indices.len(),
-                )?;
-                let hidden = match self.options.activation {
-                    ExpertActivation::Identity => up,
-                    ExpertActivation::SiluGated => {
-                        let gate = expert
-                            .gate
-                            .as_ref()
-                            .ok_or_else(|| MoeRuntimeError::Missing("gate tensor".to_string()))?;
-                        let gate_values = executor.matmul(
-                            &gate.data,
-                            gate.rows,
-                            gate.cols,
-                            &batch_input,
-                            batch.token_indices.len(),
-                        )?;
-                        up.into_iter()
-                            .zip(gate_values)
-                            .map(|(up, gate)| up * silu(gate))
-                            .collect()
-                    }
-                };
-                let batch_output = executor.matmul(
-                    &expert.down.data,
-                    expert.down.rows,
-                    expert.down.cols,
-                    &hidden,
-                    batch.token_indices.len(),
-                )?;
-                for (batch_row, (&token_idx, &weight)) in batch
-                    .token_indices
-                    .iter()
-                    .zip(&batch.token_weights)
-                    .enumerate()
+        let parallel_results = std::thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(wgpu_groups.len());
+            for (executor_idx, groups) in wgpu_groups {
+                let executor = executor_pool
+                    .executor_by_slot(executor_idx)
+                    .ok_or_else(|| {
+                        MoeRuntimeError::Missing(format!("WGPU executor slot {executor_idx}"))
+                    })?;
+                handles.push(
+                    scope.spawn(move || -> Result<Vec<(Vec<f32>, DeviceRunReport)>> {
+                        let mut results = Vec::with_capacity(groups.len());
+                        for (device_id, batches) in groups {
+                            results.push(self.compute_device_batches_wgpu(
+                                executor,
+                                loaded,
+                                input,
+                                input_width,
+                                device_id,
+                                &batches,
+                            )?);
+                        }
+                        Ok(results)
+                    }),
+                );
+            }
+
+            let mut out = Vec::with_capacity(handles.len());
+            for handle in handles {
+                let results = handle.join().map_err(|_| {
+                    MoeRuntimeError::Unsupported("WGPU dispatch thread panicked".to_string())
+                })??;
+                out.extend(results);
+            }
+            Ok::<Vec<(Vec<f32>, DeviceRunReport)>, MoeRuntimeError>(out)
+        })?;
+
+        for (device_output, device_run) in parallel_results {
+            accumulate_output(&mut output, &device_output)?;
+            device_runs.push(device_run);
+        }
+        Ok((output, device_runs))
+    }
+
+    #[cfg(feature = "wgpu")]
+    fn compute_device_batches_wgpu(
+        &self,
+        executor: &crate::wgpu_compute::WgpuExecutor,
+        loaded: &LoadedLayer,
+        input: &[f32],
+        input_width: usize,
+        device_id: u32,
+        batches: &[&DeviceBatch],
+    ) -> Result<(Vec<f32>, DeviceRunReport)> {
+        let token_count = checked_token_count(input, input_width)?;
+        let total_output_len = output_len(token_count, loaded.output_width)?;
+        self.options
+            .limits
+            .check_output_elements(total_output_len)?;
+        let mut output = vec![0.0; total_output_len];
+        let device_start = Instant::now();
+        let batch_count = batches.len();
+        let mut expert_ids = BTreeSet::new();
+        let mut device_token_count = 0usize;
+        let mut weight_cache_hits = 0usize;
+        let mut weight_cache_misses = 0usize;
+        for batch in batches {
+            expert_ids.insert(batch.expert_id);
+            device_token_count = device_token_count
+                .checked_add(batch.token_indices.len())
+                .ok_or_else(|| MoeRuntimeError::Shape("device token count overflow".to_string()))?;
+            let expert = loaded
+                .experts
+                .get(&batch.expert_id)
+                .ok_or_else(|| MoeRuntimeError::Missing(format!("expert {}", batch.expert_id)))?;
+            let batch_input_len = output_len(batch.token_indices.len(), input_width)?;
+            let mut batch_input = Vec::with_capacity(batch_input_len);
+            for &token_idx in &batch.token_indices {
+                batch_input.extend_from_slice(
+                    &input[token_idx * input_width..(token_idx + 1) * input_width],
+                );
+            }
+
+            let up = executor.matmul_cached(
+                &expert.up_name,
+                &expert.up.data,
+                expert.up.rows,
+                expert.up.cols,
+                &batch_input,
+                batch.token_indices.len(),
+            )?;
+            add_cache_event(
+                &mut weight_cache_hits,
+                &mut weight_cache_misses,
+                up.cache_hit,
+            )?;
+            let hidden = match self.options.activation {
+                ExpertActivation::Identity => up.values,
+                ExpertActivation::SiluGated => {
+                    let gate = expert
+                        .gate
+                        .as_ref()
+                        .ok_or_else(|| MoeRuntimeError::Missing("gate tensor".to_string()))?;
+                    let gate_name = expert
+                        .gate_name
+                        .as_ref()
+                        .ok_or_else(|| MoeRuntimeError::Missing("gate tensor name".to_string()))?;
+                    let gate_values = executor.matmul_cached(
+                        gate_name,
+                        &gate.data,
+                        gate.rows,
+                        gate.cols,
+                        &batch_input,
+                        batch.token_indices.len(),
+                    )?;
+                    add_cache_event(
+                        &mut weight_cache_hits,
+                        &mut weight_cache_misses,
+                        gate_values.cache_hit,
+                    )?;
+                    up.values
+                        .into_iter()
+                        .zip(gate_values.values)
+                        .map(|(up, gate)| up * silu(gate))
+                        .collect()
+                }
+            };
+            let batch_output = executor.matmul_cached(
+                &expert.down_name,
+                &expert.down.data,
+                expert.down.rows,
+                expert.down.cols,
+                &hidden,
+                batch.token_indices.len(),
+            )?;
+            add_cache_event(
+                &mut weight_cache_hits,
+                &mut weight_cache_misses,
+                batch_output.cache_hit,
+            )?;
+            for (batch_row, (&token_idx, &weight)) in batch
+                .token_indices
+                .iter()
+                .zip(&batch.token_weights)
+                .enumerate()
+            {
+                let src_start = batch_row * loaded.output_width;
+                let dst_start = token_idx * loaded.output_width;
+                for (dst, value) in output[dst_start..dst_start + loaded.output_width]
+                    .iter_mut()
+                    .zip(&batch_output.values[src_start..src_start + loaded.output_width])
                 {
-                    let src_start = batch_row * loaded.output_width;
-                    let dst_start = token_idx * loaded.output_width;
-                    for (dst, value) in output[dst_start..dst_start + loaded.output_width]
-                        .iter_mut()
-                        .zip(&batch_output[src_start..src_start + loaded.output_width])
-                    {
-                        *dst += value * weight;
-                    }
+                    *dst += value * weight;
                 }
             }
-            device_runs.push(DeviceRunReport {
+        }
+        Ok((
+            output,
+            DeviceRunReport {
                 device_id,
                 expert_ids: expert_ids.into_iter().collect(),
                 batch_count,
                 token_count: device_token_count,
+                weight_cache_hits,
+                weight_cache_misses,
                 compute_time: device_start.elapsed(),
-            });
-        }
-        Ok((output, device_runs))
+            },
+        ))
     }
 }
 
@@ -1698,6 +1796,15 @@ fn accumulate_output(output: &mut [f32], device_output: &[f32]) -> Result<()> {
     for (dst, value) in output.iter_mut().zip(device_output) {
         *dst += value;
     }
+    Ok(())
+}
+
+#[cfg(feature = "wgpu")]
+fn add_cache_event(hits: &mut usize, misses: &mut usize, hit: bool) -> Result<()> {
+    let counter = if hit { hits } else { misses };
+    *counter = counter
+        .checked_add(1)
+        .ok_or_else(|| MoeRuntimeError::Shape("WGPU weight cache counter overflow".to_string()))?;
     Ok(())
 }
 

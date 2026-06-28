@@ -2,7 +2,7 @@
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
-use std::sync::mpsc;
+use std::sync::{Mutex, mpsc};
 
 use pollster::FutureExt;
 use rsmf_core::{DeviceKind, PlacementManifest};
@@ -59,6 +59,23 @@ pub(crate) struct WgpuExecutor {
     bind_group_layout: wgpu::BindGroupLayout,
     pipeline: wgpu::ComputePipeline,
     adapter_name: String,
+    matrix_cache: Mutex<BTreeMap<MatrixCacheKey, wgpu::Buffer>>,
+}
+
+/// Output of one WGPU matrix multiplication.
+#[derive(Debug)]
+pub(crate) struct WgpuMatmulOutput {
+    /// Row-major result values.
+    pub(crate) values: Vec<f32>,
+    /// True when the matrix buffer was already resident on the adapter.
+    pub(crate) cache_hit: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct MatrixCacheKey {
+    tensor_name: String,
+    rows: usize,
+    cols: usize,
 }
 
 /// Pool of physical WGPU adapter executors mapped to logical placement devices.
@@ -114,10 +131,15 @@ impl WgpuExecutorPool {
         })
     }
 
-    pub(crate) fn executor_for_device(&self, device_id: u32) -> Option<&WgpuExecutor> {
+    pub(crate) fn executor_slot_for_device(&self, device_id: u32) -> Option<usize> {
         self.device_assignments
             .get(&device_id)
-            .and_then(|executor_idx| self.executors.get(*executor_idx))
+            .copied()
+            .filter(|executor_idx| *executor_idx < self.executors.len())
+    }
+
+    pub(crate) fn executor_by_slot(&self, executor_idx: usize) -> Option<&WgpuExecutor> {
+        self.executors.get(executor_idx)
     }
 
     pub(crate) fn requested_devices(&self) -> usize {
@@ -195,6 +217,7 @@ impl WgpuExecutor {
             bind_group_layout,
             pipeline,
             adapter_name: info.name,
+            matrix_cache: Mutex::new(BTreeMap::new()),
         })
     }
 
@@ -202,16 +225,20 @@ impl WgpuExecutor {
         &self.adapter_name
     }
 
-    pub(crate) fn matmul(
+    pub(crate) fn matmul_cached(
         &self,
+        tensor_name: &str,
         matrix: &[f32],
         rows: usize,
         cols: usize,
         input: &[f32],
         tokens: usize,
-    ) -> Result<Vec<f32>> {
+    ) -> Result<WgpuMatmulOutput> {
         if tokens == 0 {
-            return Ok(Vec::new());
+            return Ok(WgpuMatmulOutput {
+                values: Vec::new(),
+                cache_hit: true,
+            });
         }
         let expected_matrix = rows.checked_mul(cols).ok_or_else(|| {
             MoeRuntimeError::Shape("WGPU matrix element count overflow".to_string())
@@ -236,19 +263,14 @@ impl WgpuExecutor {
             MoeRuntimeError::Shape("WGPU output element count overflow".to_string())
         })?;
         let output_bytes = byte_len(output_len)?;
+        let (matrix_buffer, cache_hit) =
+            self.cached_matrix_buffer(tensor_name, matrix, rows, cols)?;
 
         let input_buffer = self
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("rsmf-moe input"),
                 contents: &f32s_to_le_bytes(input),
-                usage: wgpu::BufferUsages::STORAGE,
-            });
-        let matrix_buffer = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("rsmf-moe matrix"),
-                contents: &f32s_to_le_bytes(matrix),
                 usage: wgpu::BufferUsages::STORAGE,
             });
         let output_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
@@ -316,7 +338,46 @@ impl WgpuExecutor {
         let out = le_bytes_to_f32s(&mapped)?;
         drop(mapped);
         staging_buffer.unmap();
-        Ok(out)
+        Ok(WgpuMatmulOutput {
+            values: out,
+            cache_hit,
+        })
+    }
+
+    fn cached_matrix_buffer(
+        &self,
+        tensor_name: &str,
+        matrix: &[f32],
+        rows: usize,
+        cols: usize,
+    ) -> Result<(wgpu::Buffer, bool)> {
+        let key = MatrixCacheKey {
+            tensor_name: tensor_name.to_string(),
+            rows,
+            cols,
+        };
+        if let Some(buffer) = self
+            .matrix_cache
+            .lock()
+            .map_err(|_| MoeRuntimeError::Unsupported("WGPU matrix cache poisoned".to_string()))?
+            .get(&key)
+            .cloned()
+        {
+            return Ok((buffer, true));
+        }
+
+        let buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("rsmf-moe resident matrix"),
+                contents: &f32s_to_le_bytes(matrix),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+        self.matrix_cache
+            .lock()
+            .map_err(|_| MoeRuntimeError::Unsupported("WGPU matrix cache poisoned".to_string()))?
+            .insert(key, buffer.clone());
+        Ok((buffer, false))
     }
 }
 
