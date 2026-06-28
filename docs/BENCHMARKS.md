@@ -77,20 +77,41 @@ Source: `crates/rsmf-bench/benches/wgpu_upload.rs`.
 
 ### `moe_dispatch`
 
-Measures host-side dispatch grouping:
+Measures host-side dispatch grouping and prepared MoE runtime gates:
 
 - builds a deterministic stream of 4096 token → expert assignments,
 - calls `rsmf_moe_runtime::batch_by_destination`,
 - reports throughput as tokens/second through Criterion's `Throughput::Elements`.
-- builds a tiny two-shard RSMF MoE fixture once, prepares a resident
-  `MoeLayerPlan`, and measures `run_prepared_layer_routed` with top-k routing.
+- builds deterministic local RSMF MoE fixtures for tiny, token-scaling, and
+  expert-scaling cases,
+- measures CPU prepared-plan top-1 and top-k execution,
+- with `--features wgpu`, measures WGPU top-k first-run cache miss and warmed
+  cache-hit execution when a WGPU adapter is available.
 
-The grouping benchmark isolates the routing-to-batch step. The prepared top-k
-benchmark exercises routing, weighted expert combine, and resident plan reuse on
-a tiny deterministic fixture. End-to-end MoE layer timings are also exposed per
-run through `MoeRunReport` (`gating_time`, `dispatch_time`, `compute_time`,
-`combine_time`, and `tokens_per_second()`), because those timings depend on
-expert dimensions and backend selection.
+The grouping benchmark isolates the routing-to-batch step. The prepared runtime
+benchmarks exercise routing, weighted expert combine, resident plan reuse,
+token/expert scaling, WGPU resident weight cache miss/hit behavior, and backend
+selection. End-to-end MoE layer timings are also exposed per run through
+`MoeRunReport` (`gating_time`, `dispatch_time`, `compute_time`, `combine_time`,
+`tokens_per_second()`, and per-device `weight_cache_hits` /
+`weight_cache_misses`).
+
+Hardware-free CPU run:
+
+```sh
+cargo bench -p rsmf-bench --bench moe_dispatch
+```
+
+Fixed-hardware WGPU run:
+
+```sh
+cargo bench -p rsmf-bench --features wgpu --bench moe_dispatch
+```
+
+Record the CPU model, GPU/adapter name, OS, power mode, `rustc -Vv`, command
+line, and whether `RuntimeBackend::WgpuCompute.active_adapters` is `1` or
+greater when comparing results across changes. The WGPU group skips gracefully
+when no adapter is available.
 
 Source: `crates/rsmf-bench/benches/moe_dispatch.rs`.
 
