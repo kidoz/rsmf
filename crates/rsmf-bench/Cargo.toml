@@ -23,7 +23,7 @@ serde_json.workspace = true
 [features]
 default = []
 # Optional GPU-backed upload bench.
-wgpu = ["dep:rsmf-wgpu", "dep:wgpu", "dep:pollster"]
+wgpu = ["dep:rsmf-wgpu", "dep:wgpu", "dep:pollster", "rsmf-moe-runtime/wgpu"]
 
 [dependencies.rsmf-wgpu]
 workspace = true
