@@ -1,4 +1,5 @@
 use super::*;
+use std::sync::{Arc, Mutex};
 
 pub struct NativeDecoderTextGenerateOutput {
     /// Original prompt string.
@@ -18,6 +19,8 @@ pub struct NativeDecoderTextGenerateOutput {
     pub prompt_logits: Vec<Vec<f32>>,
     /// Backend actually used by this run.
     pub backend: NativeDecoderBackend,
+    /// Performance counters for this generation call.
+    pub performance: NativeDecoderPerformanceReport,
 }
 
 /// Resident native decoder memory held by a session.
@@ -25,23 +28,19 @@ pub struct NativeDecoderTextGenerateOutput {
 pub struct NativeDecoderResidencyReport {
     /// Decoded resident weight bytes.
     pub resident_weight_bytes: usize,
-    /// Resident KV-cache bytes currently retained by the session.
-    ///
-    /// The current native decoder session does not retain KV cache across
-    /// generation calls, so this is `0`. Individual [`NativeDecoderKvCache`]
-    /// values expose their own resident byte accounting while generation is
-    /// active.
+    /// Resident KV-cache bytes currently retained by the session prefix cache.
     pub resident_kv_cache_bytes: usize,
 }
 
 /// Resident native decoder session with decoded weights and tokenizer cached in
 /// memory.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct NativeDecoderSession {
     /// Decoded native decoder weights.
     pub weights: NativeDecoderWeights,
     /// Decoded native decoder tokenizer.
     pub tokenizer: NativeDecoderTokenizer,
+    pub(crate) prefix_cache: Arc<Mutex<NativeDecoderPrefixCache>>,
 }
 
 impl NativeDecoderSession {
@@ -50,8 +49,17 @@ impl NativeDecoderSession {
     pub fn residency_report(&self) -> NativeDecoderResidencyReport {
         NativeDecoderResidencyReport {
             resident_weight_bytes: self.weights.resident_bytes(),
-            resident_kv_cache_bytes: 0,
+            resident_kv_cache_bytes: self.prefix_cache_report().resident_bytes,
         }
+    }
+
+    /// Current resident prefix-cache counters for this session.
+    #[must_use]
+    pub fn prefix_cache_report(&self) -> NativeDecoderPrefixCacheReport {
+        self.prefix_cache.lock().map_or_else(
+            |_| NativeDecoderPrefixCacheReport::default(),
+            |cache| cache.report(),
+        )
     }
 
     /// Generate token ids without reloading weights from the RSMF file.
@@ -61,7 +69,13 @@ impl NativeDecoderSession {
         options: NativeDecoderRunOptions,
     ) -> Result<NativeDecoderGenerateOutput> {
         let backend = resolve_native_decoder_backend(options.backend)?;
-        native_decoder_generate_with_backend(&self.weights, input_token_ids, options, backend)
+        native_decoder_generate_with_backend_and_prefix_cache(
+            &self.weights,
+            input_token_ids,
+            options,
+            backend,
+            Some(&self.prefix_cache),
+        )
     }
 
     /// Generate text without reloading weights or tokenizer from the RSMF file.
@@ -83,6 +97,7 @@ impl NativeDecoderSession {
             logits: output.logits,
             prompt_logits: output.prompt_logits,
             backend: output.backend,
+            performance: output.performance,
         })
     }
 
@@ -107,6 +122,7 @@ impl NativeDecoderSession {
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
 pub struct NativeDecoderStepOutput {
     /// Logits for the next token, shape `[vocab_size]`.
     pub logits: Vec<f32>,
@@ -128,6 +144,8 @@ pub struct NativeDecoderGenerateOutput {
     pub prompt_logits: Vec<Vec<f32>>,
     /// Backend actually used by this run.
     pub backend: NativeDecoderBackend,
+    /// Performance counters for this generation call.
+    pub performance: NativeDecoderPerformanceReport,
 }
 
 pub(crate) fn native_decoder_generate_with_backend(
@@ -136,12 +154,32 @@ pub(crate) fn native_decoder_generate_with_backend(
     options: NativeDecoderRunOptions,
     backend: NativeDecoderBackend,
 ) -> Result<NativeDecoderGenerateOutput> {
+    native_decoder_generate_with_backend_and_prefix_cache(
+        weights,
+        input_token_ids,
+        options,
+        backend,
+        None,
+    )
+}
+
+pub(crate) fn native_decoder_generate_with_backend_and_prefix_cache(
+    weights: &NativeDecoderWeights,
+    input_token_ids: &[i64],
+    options: NativeDecoderRunOptions,
+    backend: NativeDecoderBackend,
+    prefix_cache: Option<&Arc<Mutex<NativeDecoderPrefixCache>>>,
+) -> Result<NativeDecoderGenerateOutput> {
     match backend {
         NativeDecoderBackend::CpuReference
         | NativeDecoderBackend::CpuThreaded
-        | NativeDecoderBackend::AppleCpuAccelerate => {
-            native_decoder_cpu_greedy_decode(weights, input_token_ids, options, backend)
-        }
+        | NativeDecoderBackend::AppleCpuAccelerate => native_decoder_cpu_greedy_decode(
+            weights,
+            input_token_ids,
+            options,
+            backend,
+            prefix_cache,
+        ),
         NativeDecoderBackend::Auto
         | NativeDecoderBackend::Accelerated
         | NativeDecoderBackend::MetalWgpuLmHead
@@ -159,6 +197,7 @@ pub(crate) fn native_decoder_cpu_greedy_decode(
     input_token_ids: &[i64],
     options: NativeDecoderRunOptions,
     backend: NativeDecoderBackend,
+    prefix_cache: Option<&Arc<Mutex<NativeDecoderPrefixCache>>>,
 ) -> Result<NativeDecoderGenerateOutput> {
     validate_native_decoder_sampling_options(&options.sampling)?;
     validate_native_decoder_performance_options(&options.performance)?;
@@ -176,6 +215,7 @@ pub(crate) fn native_decoder_cpu_greedy_decode(
             logits: Vec::new(),
             prompt_logits: Vec::new(),
             backend,
+            performance: NativeDecoderPerformanceReport::default(),
         });
     }
 
@@ -197,11 +237,31 @@ pub(crate) fn native_decoder_cpu_greedy_decode(
         native_decoder_kv_cache_with_performance(&weights.config, &options.performance)?;
     let mut last_step = None;
     let mut prompt_logits = Vec::new();
+    let mut prefix_stats = NativeDecoderPrefixCacheRunStats {
+        miss_tokens: input_token_ids.len(),
+        ..NativeDecoderPrefixCacheRunStats::default()
+    };
+    let can_use_prefix_cache =
+        options.performance.prefix_cache_max_entries.is_some() && !options.return_prompt_logits;
+    if can_use_prefix_cache {
+        if let Some(prefix_cache) = prefix_cache {
+            let hit = prefix_cache
+                .lock()
+                .map_err(|_| RuntimeError::CachePoisoned)?
+                .lookup(input_token_ids, backend, &options.performance);
+            if let Some(hit) = hit {
+                prefix_stats.hit_tokens = hit.token_count;
+                prefix_stats.miss_tokens = input_token_ids.len().saturating_sub(hit.token_count);
+                cache = hit.cache;
+                last_step = Some(hit.last_step);
+            }
+        }
+    }
     let prefill_chunk_size = options
         .performance
         .prefill_chunk_size
         .unwrap_or(input_token_ids.len().max(1));
-    for chunk in input_token_ids.chunks(prefill_chunk_size) {
+    for chunk in input_token_ids[prefix_stats.hit_tokens..].chunks(prefill_chunk_size) {
         for &token_id in chunk {
             let step = native_decoder_cpu_step(
                 weights,
@@ -214,6 +274,20 @@ pub(crate) fn native_decoder_cpu_greedy_decode(
                 prompt_logits.push(step.logits.clone());
             }
             last_step = Some(step);
+        }
+    }
+    if can_use_prefix_cache {
+        if let (Some(prefix_cache), Some(last_step)) = (prefix_cache, last_step.as_ref()) {
+            prefix_stats.evictions = prefix_cache
+                .lock()
+                .map_err(|_| RuntimeError::CachePoisoned)?
+                .insert(
+                    input_token_ids,
+                    &cache,
+                    last_step,
+                    backend,
+                    &options.performance,
+                )?;
         }
     }
 
@@ -244,12 +318,31 @@ pub(crate) fn native_decoder_cpu_greedy_decode(
         }
     }
 
+    let prefix_report = prefix_cache
+        .map(|prefix_cache| {
+            prefix_cache
+                .lock()
+                .map_err(|_| RuntimeError::CachePoisoned)
+                .map(|cache| cache.report())
+        })
+        .transpose()?
+        .unwrap_or_default();
+    let performance = NativeDecoderPerformanceReport {
+        prefix_cache_hit_tokens: prefix_stats.hit_tokens,
+        prefix_cache_miss_tokens: prefix_stats.miss_tokens,
+        prefix_cache_entries: prefix_report.entries,
+        prefix_cache_bytes: prefix_report.resident_bytes,
+        prefix_cache_evictions: prefix_stats.evictions,
+        kv_cache_bytes: cache.resident_bytes(),
+    };
+
     Ok(NativeDecoderGenerateOutput {
         token_ids,
         generated_token_ids,
         logits,
         prompt_logits,
         backend,
+        performance,
     })
 }
 
@@ -515,6 +608,7 @@ pub(crate) fn native_decoder_cpu_llama_cached_step(
         num_attention_heads: config.num_attention_heads,
         num_key_value_heads: config.num_key_value_heads,
         head_dim,
+        implementation: linear_backend.performance.attention,
     })?;
     let attention_projected = native_decoder_backend_linear(
         &attention,

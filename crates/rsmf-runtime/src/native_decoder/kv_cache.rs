@@ -214,6 +214,7 @@ pub(crate) struct NativeDecoderLayerAttentionInput<'a> {
     pub(crate) num_attention_heads: usize,
     pub(crate) num_key_value_heads: usize,
     pub(crate) head_dim: usize,
+    pub(crate) implementation: NativeDecoderAttentionImplementation,
 }
 
 pub(crate) fn native_decoder_cpu_layer_cached_attention(
@@ -268,6 +269,21 @@ pub(crate) fn native_decoder_cpu_layer_cached_attention(
         kv_width,
     )?;
 
+    match input.implementation {
+        NativeDecoderAttentionImplementation::Scalar => {
+            native_decoder_cpu_layer_cached_attention_inner(input)
+        }
+        NativeDecoderAttentionImplementation::CpuTiled => {
+            native_decoder_cpu_layer_cached_attention_tiled(input)
+        }
+    }
+}
+
+fn native_decoder_cpu_layer_cached_attention_inner(
+    input: NativeDecoderLayerAttentionInput<'_>,
+) -> Result<Vec<f32>> {
+    let query_width = input.num_attention_heads * input.head_dim;
+    let kv_width = input.num_key_value_heads * input.head_dim;
     let groups = input.num_attention_heads / input.num_key_value_heads;
     let scale = 1.0 / (input.head_dim as f32).sqrt();
     let mut output = vec![0.0f32; query_width];
@@ -275,6 +291,64 @@ pub(crate) fn native_decoder_cpu_layer_cached_attention(
         let kv_head = head / groups;
         let query_offset = head * input.head_dim;
         let mut scores = vec![0.0f32; input.cache_len];
+        for (key_token, score) in scores.iter_mut().enumerate() {
+            let key_values = native_decoder_cache_kv_slice(NativeDecoderCacheSliceRequest {
+                cache: input.cache,
+                current: input.current_key,
+                page_size_tokens: input.page_size_tokens,
+                token: key_token,
+                current_position: input.cache_len - 1,
+                kv_width,
+                kv_head,
+                head_dim: input.head_dim,
+                key: true,
+            })?;
+            *score = dot_product(
+                &input.query[query_offset..query_offset + input.head_dim],
+                key_values,
+            ) * scale;
+        }
+        let max_score = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let mut weight_sum = 0.0f32;
+        for score in &mut scores {
+            *score = (*score - max_score).exp();
+            weight_sum += *score;
+        }
+        let output_offset = head * input.head_dim;
+        for (key_token, score) in scores.iter().enumerate() {
+            let attention_weight = *score / weight_sum;
+            let value_values = native_decoder_cache_kv_slice(NativeDecoderCacheSliceRequest {
+                cache: input.cache,
+                current: input.current_value,
+                page_size_tokens: input.page_size_tokens,
+                token: key_token,
+                current_position: input.cache_len - 1,
+                kv_width,
+                kv_head,
+                head_dim: input.head_dim,
+                key: false,
+            })?;
+            for dim in 0..input.head_dim {
+                output[output_offset + dim] += attention_weight * value_values[dim];
+            }
+        }
+    }
+    Ok(output)
+}
+
+fn native_decoder_cpu_layer_cached_attention_tiled(
+    input: NativeDecoderLayerAttentionInput<'_>,
+) -> Result<Vec<f32>> {
+    let query_width = input.num_attention_heads * input.head_dim;
+    let kv_width = input.num_key_value_heads * input.head_dim;
+    let groups = input.num_attention_heads / input.num_key_value_heads;
+    let scale = 1.0 / (input.head_dim as f32).sqrt();
+    let mut output = vec![0.0f32; query_width];
+    let mut scores = vec![0.0f32; input.cache_len];
+    for head in 0..input.num_attention_heads {
+        scores.fill(0.0);
+        let kv_head = head / groups;
+        let query_offset = head * input.head_dim;
         for (key_token, score) in scores.iter_mut().enumerate() {
             let key_values = native_decoder_cache_kv_slice(NativeDecoderCacheSliceRequest {
                 cache: input.cache,

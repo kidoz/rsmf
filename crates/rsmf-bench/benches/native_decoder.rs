@@ -2,8 +2,9 @@ use criterion::{Criterion, criterion_group, criterion_main};
 use rsmf_core::writer::{AssetInput, RsmfWriter, TensorInput, VariantInput};
 use rsmf_core::{LogicalDtype, RsmfFile};
 use rsmf_runtime::{
-    Engine, NATIVE_DECODER_CONFIG_ASSET, NATIVE_DECODER_TOKENIZER_ASSET, NativeDecoderBackend,
-    NativeDecoderPerformanceOptions, NativeDecoderRunOptions,
+    Engine, NATIVE_DECODER_CONFIG_ASSET, NATIVE_DECODER_TOKENIZER_ASSET,
+    NativeDecoderAttentionImplementation, NativeDecoderBackend,
+    NativeDecoderContinuousBatchRequest, NativeDecoderPerformanceOptions, NativeDecoderRunOptions,
 };
 use tempfile::tempdir;
 
@@ -169,6 +170,81 @@ fn bench_native_decoder(c: &mut Criterion) {
             });
         },
     );
+
+    let prefix_options = NativeDecoderRunOptions {
+        max_new_tokens: 1,
+        performance: NativeDecoderPerformanceOptions {
+            prefix_cache_max_entries: Some(8),
+            ..NativeDecoderPerformanceOptions::default()
+        },
+        ..NativeDecoderRunOptions::default()
+    };
+    resident_session
+        .generate_token_ids(&prompt_three, prefix_options.clone())
+        .expect("warm resident native decoder prefix cache");
+    c.bench_function("native_decoder/resident_prefix_cache_hit", |b| {
+        b.iter(|| {
+            resident_session
+                .generate_token_ids(std::hint::black_box(&prompt_three), prefix_options.clone())
+                .expect("generate resident native decoder tokens with prefix cache")
+        });
+    });
+
+    c.bench_function("native_decoder/cpu_tiled_attention", |b| {
+        b.iter(|| {
+            resident_session
+                .generate_token_ids(
+                    std::hint::black_box(&prompt_three),
+                    NativeDecoderRunOptions {
+                        max_new_tokens: 1,
+                        performance: NativeDecoderPerformanceOptions {
+                            attention: NativeDecoderAttentionImplementation::CpuTiled,
+                            kv_cache_page_size_tokens: Some(1),
+                            ..NativeDecoderPerformanceOptions::default()
+                        },
+                        ..NativeDecoderRunOptions::default()
+                    },
+                )
+                .expect("generate resident native decoder tokens with tiled attention")
+        });
+    });
+
+    c.bench_function("native_decoder/continuous_batch_two_requests", |b| {
+        b.iter(|| {
+            resident_session
+                .generate_token_ids_continuous_batch(vec![
+                    NativeDecoderContinuousBatchRequest {
+                        request_id: "0".to_string(),
+                        input_token_ids: std::hint::black_box(prompt_one.clone()),
+                        options: NativeDecoderRunOptions {
+                            max_new_tokens: 2,
+                            performance: NativeDecoderPerformanceOptions {
+                                continuous_batch_max_requests: Some(2),
+                                ..NativeDecoderPerformanceOptions::default()
+                            },
+                            ..NativeDecoderRunOptions::default()
+                        },
+                        deadline: None,
+                        cancelled: false,
+                    },
+                    NativeDecoderContinuousBatchRequest {
+                        request_id: "1".to_string(),
+                        input_token_ids: std::hint::black_box(prompt_one.clone()),
+                        options: NativeDecoderRunOptions {
+                            max_new_tokens: 2,
+                            performance: NativeDecoderPerformanceOptions {
+                                continuous_batch_max_requests: Some(2),
+                                ..NativeDecoderPerformanceOptions::default()
+                            },
+                            ..NativeDecoderRunOptions::default()
+                        },
+                        deadline: None,
+                        cancelled: false,
+                    },
+                ])
+                .expect("generate continuous native decoder batch")
+        });
+    });
 }
 
 fn build_tiny_native_decoder(path: &std::path::Path) {

@@ -50,6 +50,21 @@ pub(crate) fn validate_native_decoder_performance_options(
             reason: "prefill_chunk_size must be positive".to_string(),
         });
     }
+    if matches!(options.prefix_cache_max_entries, Some(0)) {
+        return Err(RuntimeError::NativeDecoderConfigInvalid {
+            reason: "prefix_cache_max_entries must be positive".to_string(),
+        });
+    }
+    if matches!(options.prefix_cache_max_bytes, Some(0)) {
+        return Err(RuntimeError::NativeDecoderConfigInvalid {
+            reason: "prefix_cache_max_bytes must be positive".to_string(),
+        });
+    }
+    if matches!(options.continuous_batch_max_requests, Some(0)) {
+        return Err(RuntimeError::NativeDecoderConfigInvalid {
+            reason: "continuous_batch_max_requests must be positive".to_string(),
+        });
+    }
     Ok(())
 }
 

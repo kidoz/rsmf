@@ -412,7 +412,12 @@ pub(crate) fn validate_native_decoder_tensor(
 
 pub(crate) fn validate_native_decoder_weight_dtype(tensor: &TensorDescriptor) -> Result<()> {
     match tensor.dtype {
-        LogicalDtype::F32 | LogicalDtype::F16 | LogicalDtype::BF16 => Ok(()),
+        LogicalDtype::F32
+        | LogicalDtype::F16
+        | LogicalDtype::BF16
+        | LogicalDtype::I8
+        | LogicalDtype::I16
+        | LogicalDtype::I32 => Ok(()),
         dtype => Err(RuntimeError::NativeDecoderTensorDtypeUnsupported {
             tensor_name: tensor.name.clone(),
             dtype: format!("{dtype:?}"),

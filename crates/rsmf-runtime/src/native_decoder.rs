@@ -12,7 +12,9 @@ mod generation;
 mod kv_cache;
 mod ops;
 mod options;
+mod prefix_cache;
 mod sampling;
+mod scheduler;
 mod tokenizer;
 mod weights;
 
@@ -34,9 +36,14 @@ pub use ops::{
     native_decoder_cpu_rms_norm, native_decoder_cpu_silu,
 };
 pub use options::{
-    NativeDecoderBackend, NativeDecoderPerformanceOptions, NativeDecoderReferenceLogitCheck,
-    NativeDecoderReferenceLogitReport, NativeDecoderRunOptions, NativeDecoderSamplingOptions,
-    NativeDecoderWeightOptions,
+    NativeDecoderAttentionImplementation, NativeDecoderBackend, NativeDecoderPerformanceOptions,
+    NativeDecoderReferenceLogitCheck, NativeDecoderReferenceLogitReport, NativeDecoderRunOptions,
+    NativeDecoderSamplingOptions, NativeDecoderWeightOptions,
+};
+pub use prefix_cache::{NativeDecoderPerformanceReport, NativeDecoderPrefixCacheReport};
+pub use scheduler::{
+    NativeDecoderContinuousBatchOutput, NativeDecoderContinuousBatchReport,
+    NativeDecoderContinuousBatchRequest,
 };
 pub use tokenizer::{NativeDecoderChatMessage, NativeDecoderTokenizer};
 pub use weights::{NativeDecoderLayerWeights, NativeDecoderWeights};
@@ -46,5 +53,6 @@ pub(crate) use contract::*;
 pub(crate) use generation::*;
 pub(crate) use kv_cache::*;
 pub(crate) use ops::*;
+pub(crate) use prefix_cache::*;
 pub(crate) use sampling::*;
 pub(crate) use weights::*;

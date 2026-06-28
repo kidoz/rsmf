@@ -230,6 +230,7 @@ impl Engine {
         Ok(NativeDecoderSession {
             weights: self.native_decoder_weights_with_options(options)?,
             tokenizer: self.native_decoder_tokenizer()?,
+            prefix_cache: Default::default(),
         })
     }
 

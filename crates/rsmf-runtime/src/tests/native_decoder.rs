@@ -856,6 +856,37 @@ fn engine_native_decoder_session_reuses_resident_weights() {
 }
 
 #[test]
+fn engine_native_decoder_session_prefix_cache_reuses_prompt_kv() {
+    let dir = tempdir().unwrap();
+    let engine = tiny_native_decoder_generation_engine(dir.path().join("native-decode.rsmf"));
+    let session = engine.native_decoder_session().unwrap();
+    let options = NativeDecoderRunOptions {
+        max_new_tokens: 1,
+        performance: NativeDecoderPerformanceOptions {
+            prefix_cache_max_entries: Some(4),
+            ..NativeDecoderPerformanceOptions::default()
+        },
+        ..NativeDecoderRunOptions::default()
+    };
+
+    let first = session
+        .generate_token_ids(&[0, 1], options.clone())
+        .unwrap();
+    let second = session.generate_token_ids(&[0, 1], options).unwrap();
+    let report = session.prefix_cache_report();
+
+    assert_eq!(first.performance.prefix_cache_hit_tokens, 0);
+    assert_eq!(first.performance.prefix_cache_miss_tokens, 2);
+    assert_eq!(second.performance.prefix_cache_hit_tokens, 2);
+    assert_eq!(second.performance.prefix_cache_miss_tokens, 0);
+    assert_eq!(first.generated_token_ids, second.generated_token_ids);
+    assert_eq!(report.entries, 1);
+    assert_eq!(report.lookups, 2);
+    assert_eq!(report.hits, 1);
+    assert!(session.residency_report().resident_kv_cache_bytes > 0);
+}
+
+#[test]
 fn engine_native_decoder_return_prompt_logits_reports_prefill_rows() {
     let dir = tempdir().unwrap();
     let engine = tiny_native_decoder_generation_engine(dir.path().join("native-decode.rsmf"));
@@ -1322,6 +1353,128 @@ fn engine_native_decoder_paged_generation_matches_flat_cache() {
 }
 
 #[test]
+fn engine_native_decoder_cpu_tiled_attention_matches_scalar() {
+    let dir = tempdir().unwrap();
+    let engine = tiny_native_decoder_generation_engine(dir.path().join("native-decode.rsmf"));
+    let scalar = engine
+        .native_decoder_greedy_decode(
+            &[0, 1, 0],
+            NativeDecoderRunOptions {
+                max_new_tokens: 2,
+                stop_token_ids: vec![3],
+                ..NativeDecoderRunOptions::default()
+            },
+        )
+        .unwrap();
+    let tiled = engine
+        .native_decoder_greedy_decode(
+            &[0, 1, 0],
+            NativeDecoderRunOptions {
+                max_new_tokens: 2,
+                stop_token_ids: vec![3],
+                performance: NativeDecoderPerformanceOptions {
+                    attention: NativeDecoderAttentionImplementation::CpuTiled,
+                    kv_cache_page_size_tokens: Some(1),
+                    ..NativeDecoderPerformanceOptions::default()
+                },
+                ..NativeDecoderRunOptions::default()
+            },
+        )
+        .unwrap();
+
+    assert_eq!(tiled.generated_token_ids, scalar.generated_token_ids);
+    assert_eq!(tiled.logits, scalar.logits);
+}
+
+#[test]
+fn engine_native_decoder_loads_raw_f16_weights_into_f32_path() {
+    let dir = tempdir().unwrap();
+    let engine = tiny_native_decoder_generation_engine_with_dtype(
+        dir.path().join("native-decode-f16.rsmf"),
+        LogicalDtype::F16,
+    );
+
+    let output = engine
+        .native_decoder_greedy_decode(
+            &[0],
+            NativeDecoderRunOptions {
+                max_new_tokens: 2,
+                ..NativeDecoderRunOptions::default()
+            },
+        )
+        .unwrap();
+
+    assert_eq!(output.generated_token_ids, vec![1, 2]);
+}
+
+#[test]
+fn engine_native_decoder_raw_i8_weights_require_lossy_quantized_opt_in() {
+    let dir = tempdir().unwrap();
+    let engine = tiny_native_decoder_generation_engine_with_dtype(
+        dir.path().join("native-decode-i8.rsmf"),
+        LogicalDtype::I8,
+    );
+
+    let err = engine.native_decoder_weights().unwrap_err();
+    assert!(matches!(
+        err,
+        RuntimeError::NativeDecoderTensorDtypeUnsupported { dtype, .. } if dtype == "I8"
+    ));
+
+    let weights = engine
+        .native_decoder_weights_with_options(&NativeDecoderWeightOptions {
+            allow_lossy_quantized: true,
+            ..NativeDecoderWeightOptions::default()
+        })
+        .unwrap();
+    assert_eq!(weights.token_embedding[0], 1.0);
+    assert_eq!(weights.lm_head.as_ref().unwrap()[6], -1.0);
+}
+
+#[test]
+fn engine_native_decoder_continuous_batch_interleaves_decode_steps() {
+    let dir = tempdir().unwrap();
+    let engine = tiny_native_decoder_generation_engine(dir.path().join("native-decode.rsmf"));
+    let session = engine.native_decoder_session().unwrap();
+    let options = NativeDecoderRunOptions {
+        max_new_tokens: 2,
+        performance: NativeDecoderPerformanceOptions {
+            continuous_batch_max_requests: Some(2),
+            ..NativeDecoderPerformanceOptions::default()
+        },
+        ..NativeDecoderRunOptions::default()
+    };
+
+    let (outputs, report) = session
+        .generate_token_ids_continuous_batch(vec![
+            NativeDecoderContinuousBatchRequest {
+                request_id: "first".to_string(),
+                input_token_ids: vec![0],
+                options: options.clone(),
+                deadline: None,
+                cancelled: false,
+            },
+            NativeDecoderContinuousBatchRequest {
+                request_id: "second".to_string(),
+                input_token_ids: vec![0],
+                options,
+                deadline: None,
+                cancelled: false,
+            },
+        ])
+        .unwrap();
+
+    assert_eq!(outputs.len(), 2);
+    assert_eq!(outputs[0].request_id, "first");
+    assert_eq!(outputs[1].request_id, "second");
+    assert_eq!(outputs[0].output.generated_token_ids, vec![1, 2]);
+    assert_eq!(outputs[1].output.generated_token_ids, vec![1, 2]);
+    assert_eq!(report.admitted_requests, 2);
+    assert_eq!(report.decode_rounds, 2);
+    assert_eq!(report.scheduled_decode_steps, 4);
+}
+
+#[test]
 fn native_decoder_threaded_linear_matches_reference() {
     let input = vec![1.0, 2.0];
     let weight = vec![3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
@@ -1443,6 +1596,13 @@ fn tiny_native_decoder_engine(
 }
 
 fn tiny_native_decoder_generation_engine(path: std::path::PathBuf) -> Engine {
+    tiny_native_decoder_generation_engine_with_dtype(path, LogicalDtype::F32)
+}
+
+fn tiny_native_decoder_generation_engine_with_dtype(
+    path: std::path::PathBuf,
+    dtype: LogicalDtype,
+) -> Engine {
     let config = tiny_native_decoder_cpu_config();
     let mut writer = RsmfWriter::new()
         .with_metadata("model.arch", "llama")
@@ -1457,9 +1617,10 @@ fn tiny_native_decoder_generation_engine(path: std::path::PathBuf) -> Engine {
     for expected in expected_native_decoder_tensors(&config).unwrap() {
         let values =
             tiny_native_decoder_generation_tensor_values(&expected.tensor_name, &expected.shape);
-        writer = writer.with_tensor(native_decoder_tensor_with_values(
+        writer = writer.with_tensor(native_decoder_tensor_with_dtype_values(
             &expected.tensor_name,
             expected.shape,
+            dtype,
             values,
         ));
     }
@@ -1610,16 +1771,55 @@ fn native_decoder_tensor(name: &str, shape: Vec<u64>) -> TensorInput {
     }
 }
 
-fn native_decoder_tensor_with_values(name: &str, shape: Vec<u64>, values: Vec<f32>) -> TensorInput {
+fn native_decoder_tensor_with_dtype_values(
+    name: &str,
+    shape: Vec<u64>,
+    dtype: LogicalDtype,
+    values: Vec<f32>,
+) -> TensorInput {
     assert_eq!(values.len(), shape.iter().product::<u64>() as usize);
     TensorInput {
         name: name.to_string(),
-        dtype: LogicalDtype::F32,
+        dtype,
         shape,
         shard_id: 0,
         metadata: Vec::new(),
-        canonical: VariantInput::canonical_raw(f32_bytes(&values)),
+        canonical: VariantInput::canonical_raw(native_decoder_value_bytes(dtype, &values)),
         packed: Vec::new(),
+    }
+}
+
+fn native_decoder_value_bytes(dtype: LogicalDtype, values: &[f32]) -> Vec<u8> {
+    match dtype {
+        LogicalDtype::F32 => f32_bytes(values),
+        LogicalDtype::F16 => values
+            .iter()
+            .flat_map(|value| match *value {
+                0.0 => [0x00, 0x00],
+                1.0 => [0x00, 0x3c],
+                -1.0 => [0x00, 0xbc],
+                other => panic!("test F16 helper only supports -1/0/1, got {other}"),
+            })
+            .collect(),
+        LogicalDtype::BF16 => values
+            .iter()
+            .flat_map(|value| match *value {
+                0.0 => [0x00, 0x00],
+                1.0 => [0x80, 0x3f],
+                -1.0 => [0x80, 0xbf],
+                other => panic!("test BF16 helper only supports -1/0/1, got {other}"),
+            })
+            .collect(),
+        LogicalDtype::I8 => values
+            .iter()
+            .map(|value| match *value {
+                0.0 => 0u8,
+                1.0 => 1u8,
+                -1.0 => 255u8,
+                other => panic!("test I8 helper only supports -1/0/1, got {other}"),
+            })
+            .collect(),
+        other => panic!("unsupported test dtype {other:?}"),
     }
 }
 

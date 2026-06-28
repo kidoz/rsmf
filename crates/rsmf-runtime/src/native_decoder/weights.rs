@@ -204,7 +204,25 @@ pub(crate) fn load_native_decoder_tensor_f32(
         });
     }
     validate_native_decoder_weight_dtype(view.descriptor)?;
-    if view.layout != LayoutTag::RowMajor {
+    if matches!(
+        view.descriptor.dtype,
+        LogicalDtype::I8 | LogicalDtype::I16 | LogicalDtype::I32
+    ) && !options.allow_lossy_quantized
+    {
+        return Err(RuntimeError::NativeDecoderTensorDtypeUnsupported {
+            tensor_name: tensor_name.to_string(),
+            dtype: format!("{:?}", view.descriptor.dtype),
+        });
+    }
+    if view.encoding == rsmf_core::EncodingKind::BlockQuantized && !options.allow_lossy_quantized {
+        return Err(RuntimeError::NativeDecoderTensorDtypeUnsupported {
+            tensor_name: tensor_name.to_string(),
+            dtype: format!("{:?}", view.storage_dtype),
+        });
+    }
+    if view.layout != LayoutTag::RowMajor
+        && view.encoding != rsmf_core::EncodingKind::BlockQuantized
+    {
         return Err(RuntimeError::NativeDecoderTensorUnsupported {
             tensor_name: tensor_name.to_string(),
             reason: format!(

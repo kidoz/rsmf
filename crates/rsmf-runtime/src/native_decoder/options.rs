@@ -30,6 +30,13 @@ pub struct NativeDecoderWeightOptions {
     /// Optional global RSMF variant index per tensor name. Missing names load
     /// the canonical variant.
     pub tensor_variants: HashMap<String, u32>,
+    /// Allow native decoder weights stored as lower-precision or quantized
+    /// dtypes to be decoded into the CPU f32 execution path.
+    ///
+    /// `F16`/`BF16` are always accepted by the native decoder contract. Raw
+    /// integer weights are accepted only when this flag is set, because they
+    /// imply a lossy dequantization policy.
+    pub allow_lossy_quantized: bool,
 }
 
 /// Token sampling controls for native decoder generation.
@@ -62,6 +69,29 @@ pub struct NativeDecoderPerformanceOptions {
     /// token steps serially inside each chunk, but this bounds the scheduling
     /// unit for longer prompts and future chunked kernels.
     pub prefill_chunk_size: Option<usize>,
+    /// Optional prefix-cache entry limit for resident sessions. `None` disables
+    /// prefix cache lookup/insertion.
+    pub prefix_cache_max_entries: Option<usize>,
+    /// Optional prefix-cache resident byte limit. When omitted, entries are
+    /// limited only by `prefix_cache_max_entries`.
+    pub prefix_cache_max_bytes: Option<usize>,
+    /// CPU attention implementation to use for cached decode steps.
+    pub attention: NativeDecoderAttentionImplementation,
+    /// Optional maximum requests to admit into one native token-level
+    /// continuous-batching scheduling pass.
+    pub continuous_batch_max_requests: Option<usize>,
+}
+
+/// CPU attention implementation for native decoder cached decode steps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeDecoderAttentionImplementation {
+    /// Scalar reference implementation.
+    #[default]
+    Scalar,
+    /// Allocation-reduced CPU implementation that reuses per-head score
+    /// scratch space while preserving paged KV-cache semantics.
+    CpuTiled,
 }
 
 /// Options for native decoder greedy generation.
