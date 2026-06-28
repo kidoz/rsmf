@@ -532,21 +532,24 @@ post-process; a later minor release may add it.
 
 ---
 
-## 10. Runtime proof-of-concept status
+## 10. Runtime status
 
 The `rsmf-moe-runtime` crate is not part of the on-disk format. It consumes the
-metadata conventions and placement/sharding structures specified above to run a
-minimal one-layer MoE proof of concept:
+metadata conventions and placement/sharding structures specified above to run
+the optional expert-parallel runtime foundation:
 
 - host-side top-1 gating from `moe.role=router`,
 - token batching by `moe.expert`,
 - expert shard routing through `PlacementManifest`,
 - optional use of `prefetch.*` groups for report/planning metadata,
+- resident prepared layer plans with per-expert and per-device byte accounting,
+- placement device capacity checks when capacities are declared,
 - WGPU expert matmuls when the optional runtime feature and adapter are
   available,
 - runtime-level limits for token batches, decoded tensor elements, and output
   allocations,
-- CPU reference execution for correctness.
+- CPU reference execution and measured routed/reference comparison for
+  correctness.
 
 No activation payloads, network transport, graph IR, or runtime dispatch format
 are added to RSMF v1 by this crate. Readers that do not link the runtime are

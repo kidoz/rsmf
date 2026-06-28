@@ -1,7 +1,10 @@
-# RSMF — Minimal MoE Runtime PoC
+# RSMF — MoE Runtime
 
-`rsmf-moe-runtime` is a proof-of-concept runtime. It is not a
-general inference engine and is excluded from `default-members`.
+`rsmf-moe-runtime` is the optional expert-parallel runtime foundation. It is
+excluded from `default-members` so default workspace builds remain
+hardware-free, but the crate exposes production contracts for placement
+planning, resident layer preparation, deterministic routing, and reference
+comparison.
 
 ## Pipeline
 
@@ -14,10 +17,19 @@ For one MoE layer, the runtime:
 3. Batches tokens by destination expert.
 4. Resolves each expert's `shard_id` through `PlacementManifest`.
 5. Loads expert weights through the normal `RsmfFile` sharded tensor path.
-6. Runs F32 expert matmuls and scatters rows back into token order.
+6. Prepares a resident `MoeLayerPlan` with decoded router/expert weights,
+   per-device resident byte accounting, placement capacity checks, and
+   prefetch-group summaries.
+7. Runs F32 expert matmuls by placement device and scatters rows back into
+   token order.
 
 The reference path uses the same router and expert math without placement-based
 batching. Tests compare the two paths on a fixed 2-shard fixture.
+
+`MoeRuntime::run_layer_top1_checked` and
+`MoeRuntime::run_prepared_layer_top1_checked` execute the routed path, execute
+the single-device reference path, report maximum absolute difference, and record
+the measured routed/reference wall-time ratio.
 
 ## Runtime Contract
 
@@ -31,21 +43,23 @@ The runtime is intentionally stricter than the metadata index:
 - `SiluGated` activation requires exactly one `gate` tensor per expert.
 - Expert `up` / `down` / `gate` tensors must live on the same `shard_id` so a
   placement record names one owning device for the expert.
-- Shared MoE experts are rejected by this crate; the PoC covers routed top-1
+- Placement device capacity is enforced when `capacity_bytes` is non-zero.
+- Shared MoE experts are rejected by this crate; the runtime covers routed top-1
   experts only.
 
 `MoeRuntimeOptions::limits` rejects oversized token batches, decoded rank-2
-tensors, and output buffers before the runtime allocates large working memory.
-The defaults are deliberately finite and can be widened or disabled per field
-by callers that own the deployment envelope.
+tensors, prepared-layer device/expert counts, per-device resident bytes, and
+output buffers before the runtime allocates large working memory. The defaults
+are deliberately finite and can be widened or disabled per field by callers
+that own the deployment envelope.
 
 ## WGPU Execution And Fallback
 
 The optional `wgpu` feature runs expert `up` / `down` matmuls through a small
 WGPU compute shader when an adapter is available. The shader pipeline is created
 once per runtime and reused across expert batches. A single physical adapter may
-back multiple logical WGPU placement devices in this PoC; the placement records
-are still used for routing and reporting.
+back multiple logical WGPU placement devices in the current implementation; the
+placement records are still used for routing and reporting.
 
 If the build lacks the feature, or no adapter is available, the runtime reports
 `RuntimeBackend::CpuFallback` and continues on CPU. This keeps CI hardware-free
@@ -55,11 +69,19 @@ while preserving the placement and routing contract.
 
 `MoeRunReport` records:
 
+- prepared `plan` residency and placement details
+- per-run `device_batches`
+- per-device `device_runs`
 - `gating_time`
 - `dispatch_time`
 - `compute_time`
 - `combine_time`
 - `tokens_per_second()`
+
+Tensor-parallel collectives are not implemented yet. Prepared layer plans report
+`TensorParallelismStatus::NotRequired` for the current expert-sharded contract
+where each expert is owned by one shard/device. Future tensor-sliced experts
+must report an explicit unavailable status until real collectives exist.
 
 The Criterion `moe_dispatch` bench isolates token batching throughput. Use it
 with:

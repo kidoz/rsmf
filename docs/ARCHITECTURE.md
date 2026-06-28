@@ -9,7 +9,7 @@ rsmf-core  (library)           ← format, reader, writer, validator, selection
    ├── rsmf-wgpu  (library)     ← portable WGPU chunked-staging upload path (excluded from default-members)
    ├── rsmf-cuda  (library)     ← synchronous CUDA host→device upload helper (excluded from default-members)
    ├── rsmf-metal (library)     ← synchronous Metal host→GPU upload helper (excluded from default-members)
-   ├── rsmf-moe-runtime (library) ← experimental placement-aware MoE runtime PoC (excluded from default-members)
+   ├── rsmf-moe-runtime (library) ← optional placement-aware MoE runtime (excluded from default-members)
    ├── rsmf-runtime (library)   ← production-oriented inference engine (ONNX Runtime / ort)
    ├── rsmf-python (library)    ← PyO3 bindings for Python / NumPy
    └── rsmf-bench (library+bench) ← criterion benchmarks
@@ -90,10 +90,15 @@ rsmf-core  (library)           ← format, reader, writer, validator, selection
   projection, optional Apple Accelerate f32 linear projections, and Criterion
   benches without adding GPU dependencies. Metal/WGPU and CoreML native decoder
   backend selectors currently return typed unavailable errors.
-- `rsmf-moe-runtime` is a proof-of-concept runtime for one MoE layer: host-side
-  top-1 gating, token batching by destination expert, placement-aware expert
-  shard lookup, WGPU expert matmuls when available, and a CPU reference path.
-  Its optional `wgpu` feature reports CPU fallback when no adapter is available.
+- `rsmf-moe-runtime` is the optional placement-aware MoE runtime foundation.
+  It prepares resident validated layer plans from `moe.*`, sharding,
+  `PlacementManifest`, and prefetch metadata; performs host-side top-1 gating;
+  batches tokens by destination expert and placement device; exposes
+  per-device residency and execution metrics; runs WGPU expert matmuls when
+  available; and provides measured CPU reference comparison. Its optional
+  `wgpu` feature reports CPU fallback when no adapter is available. Top-k
+  routing, real tensor-parallel collectives, and multi-adapter execution remain
+  future work.
 - `rsmf-python` enables high-performance access to RSMF models from Python. See the "Python surface" section below.
 
 ## Module map inside `rsmf-core`
