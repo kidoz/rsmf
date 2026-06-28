@@ -101,7 +101,9 @@ tiny LLaMA-style fixture:
 - prompt length 3 with chunked prefill scheduling.
 - resident prefix-cache hit cost,
 - CPU tiled cached-attention mode,
-- two-request token-level continuous batch scheduling.
+- prompt length 7 with chunked prefill,
+- two-request and four-request token-level continuous batch scheduling,
+- selected-variant Q8_0 LM-head direct quantized projection.
 
 ```sh
 cargo bench -p rsmf-bench --bench native_decoder
