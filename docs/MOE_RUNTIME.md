@@ -63,7 +63,8 @@ Prepared plans also report:
 - `MoeTransferPlan`, an observability contract for host/device transfer intent
   based on placement device kind and memory tier,
 - `MultiAdapterStatus`, which distinguishes CPU-only execution, available WGPU
-  adapter coverage, and logical single-adapter fallback,
+  adapter coverage, partial adapter coverage, and logical single-adapter
+  fallback,
 - `MoeCollectivePlan`, currently empty because expert-sharded execution does
   not require tensor-parallel collectives.
 
@@ -73,15 +74,19 @@ helpers for future tensor-parallel backend validation.
 ## WGPU Execution And Fallback
 
 The optional `wgpu` feature runs expert `up` / `down` matmuls through a small
-WGPU compute shader when an adapter is available. The shader pipeline is created
-once per physical adapter executor and reused across expert batches. Runtime
-construction enumerates physical WGPU adapters, creates an executor pool up to
-the number of logical WGPU placement devices, and assigns logical placement
-device ids to physical executors. If fewer physical adapters are available than
-logical placement devices, multiple logical devices share an executor and the
-plan reports `MultiAdapterStatus::Partial` or
-`MultiAdapterStatus::LogicalSingleAdapter`, depending on how many physical
-executors are active.
+WGPU compute shader when an adapter is available. The shader pipeline and
+resident weight-buffer cache are created once per physical adapter executor and
+reused across expert batches. Runtime construction enumerates physical WGPU
+adapters, creates an executor pool up to the number of logical WGPU placement
+devices, and assigns logical placement device ids to physical executors. If
+fewer physical adapters are available than logical placement devices, multiple
+logical devices share an executor and the plan reports
+`MultiAdapterStatus::Partial` or `MultiAdapterStatus::LogicalSingleAdapter`,
+depending on how many physical executors are active.
+
+WGPU placement-device groups are dispatched in scoped host threads per physical
+executor slot. Each slot processes its assigned logical devices sequentially,
+then the host combines per-device outputs after the scoped threads join.
 
 Mixed placement is supported at the batch boundary: WGPU placement devices use
 the executor pool, while unmapped/CPU placement devices fall back to the CPU
@@ -98,6 +103,7 @@ while preserving the placement and routing contract.
 - prepared `plan` residency and placement details
 - per-run `device_batches`
 - per-device `device_runs`
+- per-device WGPU `weight_cache_hits` / `weight_cache_misses`
 - `gating_time`
 - `dispatch_time`
 - `compute_time`
