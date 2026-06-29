@@ -67,33 +67,55 @@ fn bench_cpu_prepared_runtime(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("moe_runtime_cpu");
     for case in cases {
-        let top1_fixture =
-            build_fixture(case, None).expect("CPU MoE top-1 benchmark fixture should build");
-        let topk_fixture =
-            build_fixture(case, Some(2)).expect("CPU MoE top-k benchmark fixture should build");
+        let top1_single_fixture = build_fixture(case, None, PlacementShape::SingleDevice)
+            .expect("CPU MoE top-1 single-device benchmark fixture should build");
+        let top1_multi_fixture = build_fixture(case, None, PlacementShape::MultiDevice)
+            .expect("CPU MoE top-1 multi-device benchmark fixture should build");
+        let topk_multi_fixture = build_fixture(case, Some(2), PlacementShape::MultiDevice)
+            .expect("CPU MoE top-k benchmark fixture should build");
         let input = deterministic_input(case.tokens, case.width);
 
-        let top1_runtime =
-            MoeRuntime::new(top1_fixture.open(), MoeRuntimeOptions::default()).expect("runtime");
-        let top1_plan = top1_runtime
+        let top1_single_runtime =
+            MoeRuntime::new(top1_single_fixture.open(), MoeRuntimeOptions::default())
+                .expect("single-device runtime");
+        let top1_single_plan = top1_single_runtime
             .prepare_layer(0, case.width)
-            .expect("top-1 plan");
+            .expect("single-device top-1 plan");
         group.throughput(Throughput::Elements(case.tokens as u64));
         group.bench_with_input(
-            BenchmarkId::new("top1_prepared", case.name),
+            BenchmarkId::new("top1_single_device_baseline", case.name),
             &case,
             |b, _| {
                 b.iter(|| {
-                    let output = top1_runtime
-                        .run_prepared_layer_top1(black_box(&top1_plan), black_box(&input))
-                        .expect("top-1 prepared run");
+                    let output = top1_single_runtime
+                        .run_prepared_layer_top1(black_box(&top1_single_plan), black_box(&input))
+                        .expect("single-device top-1 prepared run");
                     black_box(output);
                 });
             },
         );
 
-        let topk_runtime = MoeRuntime::new(
-            topk_fixture.open(),
+        let top1_multi_runtime =
+            MoeRuntime::new(top1_multi_fixture.open(), MoeRuntimeOptions::default())
+                .expect("multi-device runtime");
+        let top1_multi_plan = top1_multi_runtime
+            .prepare_layer(0, case.width)
+            .expect("multi-device top-1 plan");
+        group.bench_with_input(
+            BenchmarkId::new("top1_multi_device_placement", case.name),
+            &case,
+            |b, _| {
+                b.iter(|| {
+                    let output = top1_multi_runtime
+                        .run_prepared_layer_top1(black_box(&top1_multi_plan), black_box(&input))
+                        .expect("multi-device top-1 prepared run");
+                    black_box(output);
+                });
+            },
+        );
+
+        let topk_multi_runtime = MoeRuntime::new(
+            topk_multi_fixture.open(),
             MoeRuntimeOptions {
                 routing: MoeRoutingPolicy::TopK {
                     k: 2,
@@ -102,17 +124,17 @@ fn bench_cpu_prepared_runtime(c: &mut Criterion) {
                 ..MoeRuntimeOptions::default()
             },
         )
-        .expect("runtime");
-        let topk_plan = topk_runtime
+        .expect("top-k multi-device runtime");
+        let topk_multi_plan = topk_multi_runtime
             .prepare_layer(0, case.width)
-            .expect("top-k plan");
+            .expect("top-k multi-device plan");
         group.bench_with_input(
-            BenchmarkId::new("topk_prepared", case.name),
+            BenchmarkId::new("topk_multi_device_placement", case.name),
             &case,
             |b, _| {
                 b.iter(|| {
-                    let output = topk_runtime
-                        .run_prepared_layer_routed(black_box(&topk_plan), black_box(&input))
+                    let output = topk_multi_runtime
+                        .run_prepared_layer_routed(black_box(&topk_multi_plan), black_box(&input))
                         .expect("top-k prepared run");
                     black_box(output);
                 });
@@ -131,7 +153,7 @@ fn bench_wgpu_prepared_runtime(c: &mut Criterion) {
         width: 16,
         hidden: 32,
     };
-    let fixture = match build_fixture(case, Some(2)) {
+    let fixture = match build_fixture(case, Some(2), PlacementShape::MultiDevice) {
         Ok(fixture) => fixture,
         Err(error) => {
             eprintln!("skipping moe_runtime_wgpu bench: fixture build failed: {error:#}");
@@ -167,13 +189,26 @@ fn bench_wgpu_prepared_runtime(c: &mut Criterion) {
             return;
         }
     };
+    let cold_probe = runtime
+        .run_prepared_layer_routed(&plan, &input)
+        .expect("WGPU cold-cache probe");
+    let warm_probe = runtime
+        .run_prepared_layer_routed(&plan, &input)
+        .expect("WGPU warm-cache probe");
+    eprintln!(
+        "moe_runtime_wgpu fixed-hardware probe: backend={:?}, cold={}, warm={}",
+        runtime.backend(),
+        transfer_summary(&cold_probe.report.device_runs),
+        transfer_summary(&warm_probe.report.device_runs)
+    );
 
     let mut group = c.benchmark_group("moe_runtime_wgpu");
     group.throughput(Throughput::Elements(case.tokens as u64));
-    group.bench_function("topk_cache_miss", |b| {
+    group.bench_function("topk_cold_cache", |b| {
         b.iter_batched(
             || {
-                let fixture = build_fixture(case, Some(2)).expect("fixture");
+                let fixture =
+                    build_fixture(case, Some(2), PlacementShape::MultiDevice).expect("fixture");
                 let runtime = MoeRuntime::new(
                     fixture.open(),
                     MoeRuntimeOptions {
@@ -193,33 +228,24 @@ fn bench_wgpu_prepared_runtime(c: &mut Criterion) {
                 let output = runtime
                     .run_prepared_layer_routed(black_box(&plan), black_box(&input))
                     .expect("WGPU cache-miss run");
-                let misses = output
-                    .report
-                    .device_runs
-                    .iter()
-                    .map(|run| run.weight_cache_misses)
-                    .sum::<usize>();
+                let misses = weight_cache_misses(&output.report.device_runs);
+                let transfer_bytes = transfer_bytes(&output.report.device_runs);
                 assert!(misses > 0);
+                assert!(transfer_bytes > 0);
                 black_box(output);
             },
             criterion::BatchSize::SmallInput,
         );
     });
-    group.bench_function("topk_cache_hit", |b| {
-        let _warmup = runtime
-            .run_prepared_layer_routed(&plan, &input)
-            .expect("WGPU cache warmup");
+    group.bench_function("topk_warm_cache", |b| {
         b.iter(|| {
             let output = runtime
                 .run_prepared_layer_routed(black_box(&plan), black_box(&input))
                 .expect("WGPU cache-hit run");
-            let misses = output
-                .report
-                .device_runs
-                .iter()
-                .map(|run| run.weight_cache_misses)
-                .sum::<usize>();
+            let misses = weight_cache_misses(&output.report.device_runs);
+            let transfer_bytes = transfer_bytes(&output.report.device_runs);
             assert_eq!(misses, 0);
+            assert_eq!(transfer_bytes, 0);
             black_box(output);
         });
     });
@@ -235,6 +261,12 @@ struct BenchCase {
     hidden: usize,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum PlacementShape {
+    SingleDevice,
+    MultiDevice,
+}
+
 struct Fixture {
     _dir: TempDir,
     master_path: PathBuf,
@@ -248,7 +280,11 @@ impl Fixture {
     }
 }
 
-fn build_fixture(case: BenchCase, top_k: Option<u32>) -> Result<Fixture> {
+fn build_fixture(
+    case: BenchCase,
+    top_k: Option<u32>,
+    placement_shape: PlacementShape,
+) -> Result<Fixture> {
     let dir = tempdir()?;
     let master_path = dir.path().join(format!("{}-moe.rsmf", case.name));
     let tensors = tensors(case)?;
@@ -262,7 +298,7 @@ fn build_fixture(case: BenchCase, top_k: Option<u32>) -> Result<Fixture> {
             writer.with_metadata("moe.top_k", top_k.to_string())
         })
         .with_metadata("moe.n_experts", case.experts.to_string())
-        .with_placement_manifest(&placement(case.experts))?;
+        .with_placement_manifest(&placement(case.experts, placement_shape))?;
     let writer = tensors
         .into_iter()
         .fold(writer, |writer, tensor| writer.with_tensor(tensor));
@@ -324,29 +360,25 @@ fn tensor(
     }
 }
 
-fn placement(experts: u32) -> PlacementManifest {
-    let devices = vec![
-        DeviceDescriptor {
-            id: 0,
+fn placement(experts: u32, shape: PlacementShape) -> PlacementManifest {
+    let device_count = match shape {
+        PlacementShape::SingleDevice => 1,
+        PlacementShape::MultiDevice => 2,
+    };
+    let devices = (0..device_count)
+        .map(|device_id| DeviceDescriptor {
+            id: device_id,
             kind: DeviceKind::Wgpu,
             tier: MemoryTier::Vram,
             capacity_bytes: 0,
             bandwidth_mbps: 0,
-            metadata: vec![("name".into(), "logical-wgpu-0".into())],
-        },
-        DeviceDescriptor {
-            id: 1,
-            kind: DeviceKind::Wgpu,
-            tier: MemoryTier::Vram,
-            capacity_bytes: 0,
-            bandwidth_mbps: 0,
-            metadata: vec![("name".into(), "logical-wgpu-1".into())],
-        },
-    ];
+            metadata: vec![("name".into(), format!("logical-wgpu-{device_id}"))],
+        })
+        .collect();
     let placements = (0..experts)
         .map(|expert| PlacementRecord {
             shard_id: u64::from(expert) + 1,
-            primary_device: expert % 2,
+            primary_device: expert % device_count,
             prefetch_priority: 0,
             flags: PLACEMENT_FLAG_PIN,
             replicas: Vec::new(),
@@ -441,6 +473,36 @@ fn write_shards(
         out.push((shard_id, path));
     }
     Ok(out)
+}
+
+#[cfg(feature = "wgpu")]
+fn weight_cache_misses(device_runs: &[rsmf_moe_runtime::DeviceRunReport]) -> usize {
+    device_runs.iter().map(|run| run.weight_cache_misses).sum()
+}
+
+#[cfg(feature = "wgpu")]
+fn transfer_bytes(device_runs: &[rsmf_moe_runtime::DeviceRunReport]) -> usize {
+    device_runs.iter().map(|run| run.transfer.bytes).sum()
+}
+
+#[cfg(feature = "wgpu")]
+fn transfer_summary(device_runs: &[rsmf_moe_runtime::DeviceRunReport]) -> String {
+    let hits = device_runs
+        .iter()
+        .map(|run| run.transfer.cache_hits)
+        .sum::<usize>();
+    let misses = device_runs
+        .iter()
+        .map(|run| run.transfer.cache_misses)
+        .sum::<usize>();
+    let bytes = transfer_bytes(device_runs);
+    let micros = device_runs
+        .iter()
+        .map(|run| run.transfer.duration.as_micros())
+        .sum::<u128>();
+    format!(
+        "transfer_bytes={bytes}, cache_hits={hits}, cache_misses={misses}, transfer_us={micros}"
+    )
 }
 
 fn f32_bytes(values: &[f32]) -> Vec<u8> {
