@@ -11,7 +11,8 @@ comparison.
 For one MoE layer, the runtime:
 
 1. Reads `moe.*` metadata to find the layer router and expert `up` / `down`
-   tensors.
+   tensors. Expert `down` may be a single tensor or a CPU row-gather tensor
+   partition set.
 2. Runs host-side routing with a router tensor shaped
    `[n_experts, input_width]`. `run_layer_top1` remains the compatibility
    path; `run_layer_routed` uses `MoeRuntimeOptions::routing` for top-1 or
@@ -43,16 +44,16 @@ The runtime is intentionally stricter than the metadata index:
   stable-softmax weights or equal `1.0` weights.
 - A layer must have exactly one router tensor, and router tensors must not set
   `moe.expert`.
-- Each router row must have a matching expert id with exactly one `up` and one
-  `down` tensor.
+- Each router row must have a matching expert id with exactly one `up` tensor
+  and either one `down` tensor or a complete row-partitioned `down` tensor set.
 - `SiluGated` activation requires exactly one `gate` tensor per expert.
 - Expert `up` / `down` / `gate` tensors must live on the same `shard_id` so a
   placement record names one owning device for the expert.
 - Tensors may declare additive tensor-parallel metadata with
   `moe.parallel=tensor`, `moe.partition_axis`, `moe.partition_index`,
   `moe.partition_count`, and `moe.collective`. The runtime validates this
-  metadata, surfaces a `MoeCollectivePlan`, and reports tensor-parallel
-  execution as unavailable.
+  metadata, surfaces a `MoeCollectivePlan`, and reports whether the plan is
+  unavailable or executable by the CPU reference row-gather path.
 - Placement device capacity is enforced when `capacity_bytes` is non-zero.
 - Shared MoE experts are rejected by this crate; the runtime covers routed
   expert-sharded layers where each expert is resident on one primary shard.
@@ -70,8 +71,8 @@ Prepared plans also report:
 - `MultiAdapterStatus`, which distinguishes CPU-only execution, available WGPU
   adapter coverage, partial adapter coverage, and logical single-adapter
   fallback,
-- `MoeCollectivePlan`, currently empty because expert-sharded execution does
-  not require tensor-parallel collectives.
+- `MoeCollectivePlan`, empty for one-shard-per-expert execution and populated
+  for tensor-sliced down projections.
 
 `CpuCollectives` provides hermetic reference `all_reduce_sum`, `gather`, and
 reported `execute` helpers for future tensor-parallel backend validation.
@@ -130,13 +131,19 @@ while preserving the placement and routing contract.
 - `tokens_per_second()`
 
 CPU reference tensor-parallel collectives are available through
-`CpuCollectives::execute`. Device-backed tensor-parallel collectives are not
-implemented yet. Prepared layer plans report `TensorParallelismStatus::NotRequired`
-for the current expert-sharded contract where each expert is owned by one
-shard/device. Tensor-sliced experts declared with `moe.parallel=tensor` produce
-a non-empty `MoeCollectivePlan` and `TensorParallelismStatus::Unavailable`;
-attempting to run them returns a typed unsupported error until real
-tensor-parallel execution exists.
+`CpuCollectives::execute`. The runtime can execute one narrow tensor-sliced
+expert pattern on CPU: multiple expert `down` tensors with
+`moe.partition_axis=rows`, contiguous `moe.partition_index` values covering
+`moe.partition_count`, and `moe.collective=gather`. These plans report
+`TensorParallelismStatus::CpuReference`, run the partition matvecs on CPU,
+gather partition outputs, and populate `MoeRunReport::collective_runs`.
+
+Device-backed tensor-parallel collectives are not implemented yet. Column
+partitions, all-reduce partitions, tensor-sliced `up` / `gate` tensors, and
+active WGPU execution for tensor-sliced plans return typed unsupported errors.
+Prepared layer plans still report `TensorParallelismStatus::NotRequired` for
+the ordinary expert-sharded contract where each expert is owned by one
+shard/device.
 
 The Criterion `moe_dispatch` bench isolates token batching throughput and also
 includes a tiny end-to-end routed top-k fixture. Use it with:
