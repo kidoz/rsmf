@@ -68,8 +68,8 @@ Prepared plans also report:
 - `MoeCollectivePlan`, currently empty because expert-sharded execution does
   not require tensor-parallel collectives.
 
-`CpuCollectives` provides hermetic reference `all_reduce_sum` and `gather`
-helpers for future tensor-parallel backend validation.
+`CpuCollectives` provides hermetic reference `all_reduce_sum`, `gather`, and
+reported `execute` helpers for future tensor-parallel backend validation.
 
 ## WGPU Execution And Fallback
 
@@ -116,17 +116,20 @@ while preserving the placement and routing contract.
 - per-device `device_runs`
 - per-device WGPU `weight_cache_hits` / `weight_cache_misses`
 - per-device executed `transfer` kind, bytes, duration, and cache events
+- per-run `collective_runs`, currently empty for expert-sharded execution and
+  populated by CPU reference collective helpers
 - `gating_time`
 - `dispatch_time`
 - `compute_time`
 - `combine_time`
 - `tokens_per_second()`
 
-Device-backed tensor-parallel collectives are not implemented yet. Prepared
-layer plans report `TensorParallelismStatus::NotRequired` for the current
-expert-sharded contract where each expert is owned by one shard/device. Future
-tensor-sliced experts must report an explicit unavailable status until real
-collectives exist.
+CPU reference tensor-parallel collectives are available through
+`CpuCollectives::execute`. Device-backed tensor-parallel collectives are not
+implemented yet. Prepared layer plans report
+`TensorParallelismStatus::NotRequired` for the current expert-sharded contract
+where each expert is owned by one shard/device. Future tensor-sliced experts
+must report an explicit unavailable status until real device collectives exist.
 
 The Criterion `moe_dispatch` bench isolates token batching throughput and also
 includes a tiny end-to-end routed top-k fixture. Use it with:

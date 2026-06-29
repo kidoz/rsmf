@@ -98,7 +98,8 @@ rsmf-core  (library)           ← format, reader, writer, validator, selection
   collective-contract, and execution metrics; runs WGPU expert matmuls through
   a physical-adapter executor pool with resident weight-buffer caching,
   internal transfer-executor accounting for host-to-device cache misses, and
-  per-adapter scoped dispatch; and provides measured CPU reference comparison.
+  per-adapter scoped dispatch; provides measured CPU reference comparison; and
+  exposes reported CPU reference collectives for tensor-parallel validation.
   Its optional `wgpu` feature reports CPU fallback when no adapter is
   available. Real tensor-parallel device collectives and peer transfer
   execution remain future work.
