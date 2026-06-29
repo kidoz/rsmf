@@ -60,7 +60,7 @@ pub use prefetch::{
     PREFETCH_AFFINITY_KEY, PREFETCH_GROUP_KEY, PrefetchEntry, PrefetchGroup, PrefetchIndex,
     PrefetchVariantRef, prefetch_index_from_manifest,
 };
-pub use reader::{AssetRef, CustomSectionPayload, GraphPayload, RsmfFile};
+pub use reader::{AssetRef, CustomSectionPayload, GraphPayload, RsmfFile, TensorEntryView};
 pub use section::{SectionDescriptor, SectionKind};
 pub use selection::{
     Capabilities, CpuFeatures, ExecutionMode, GpuBackend, SelectedVariant, TensorPlan,

@@ -1186,9 +1186,9 @@ impl RsmfWriter {
             let layout = &canonical_layout[ti];
             let descr = VariantDescriptor {
                 target: TargetTag::Canonical,
-                encoding: EncodingKind::Raw,
+                encoding: t.canonical.encoding,
                 storage_dtype: layout.storage_dtype,
-                layout: LayoutTag::RowMajor,
+                layout: t.canonical.layout,
                 alignment: t.canonical.alignment,
                 section_relative_offset: layout.offset,
                 length: layout.length,
@@ -1453,22 +1453,44 @@ impl RsmfWriter {
                     t.name
                 )));
             }
-            if t.canonical.target != TargetTag::Canonical
-                || t.canonical.encoding != EncodingKind::Raw
-            {
+            if t.canonical.target != TargetTag::Canonical {
                 return Err(RsmfError::structural(format!(
                     "tensor {} canonical variant is invalid",
                     t.name
                 )));
             }
-            let expected_bytes = t
-                .canonical_bytes_expected()
-                .ok_or_else(|| RsmfError::structural("shape overflow"))?;
-            if t.canonical.bytes.len() as u64 != expected_bytes {
-                return Err(RsmfError::structural(format!(
-                    "tensor {} byte length mismatch",
-                    t.name
-                )));
+            match t.canonical.encoding {
+                EncodingKind::Raw => {
+                    let expected_bytes = t
+                        .canonical_bytes_expected()
+                        .ok_or_else(|| RsmfError::structural("shape overflow"))?;
+                    if t.canonical.bytes.len() as u64 != expected_bytes {
+                        return Err(RsmfError::structural(format!(
+                            "tensor {} byte length mismatch",
+                            t.name
+                        )));
+                    }
+                }
+                EncodingKind::BlockQuantized => {
+                    if t.canonical.storage_dtype.is_none() {
+                        return Err(RsmfError::structural(format!(
+                            "tensor {} block-quantized canonical variant missing storage_dtype",
+                            t.name
+                        )));
+                    }
+                    if t.canonical.bytes.is_empty() {
+                        return Err(RsmfError::structural(format!(
+                            "tensor {} block-quantized canonical variant is empty",
+                            t.name
+                        )));
+                    }
+                }
+                EncodingKind::CastF16 => {
+                    return Err(RsmfError::structural(format!(
+                        "tensor {} canonical CastF16 variants are not supported",
+                        t.name
+                    )));
+                }
             }
             for p in &t.packed {
                 if p.target == TargetTag::Canonical {

@@ -142,6 +142,10 @@ pub enum StorageDtype {
     /// alongside Fp8E4M3 on H100/Blackwell inference for the layers
     /// that need larger dynamic range.
     Fp8E5M2 = 110,
+    /// Opaque GGUF quantized storage. RSMF preserves the bytes and records the
+    /// exact source type in tensor metadata (`gguf.storage`), but does not
+    /// dequantize this storage itself.
+    GgufOpaque = 111,
 }
 
 impl StorageDtype {
@@ -162,6 +166,7 @@ impl StorageDtype {
             108 => Self::Q6K,
             109 => Self::Q2K,
             110 => Self::Fp8E5M2,
+            111 => Self::GgufOpaque,
             other => {
                 return Err(RsmfError::structural(format!(
                     "unknown storage dtype {other}"
@@ -186,6 +191,7 @@ impl StorageDtype {
             Self::Q6K => 108,
             Self::Q2K => 109,
             Self::Fp8E5M2 => 110,
+            Self::GgufOpaque => 111,
         }
     }
 
@@ -205,6 +211,7 @@ impl StorageDtype {
             Self::Q6K => "q6_k",
             Self::Q2K => "q2_k",
             Self::Fp8E5M2 => "fp8_e5m2",
+            Self::GgufOpaque => "gguf_opaque",
         }
     }
 
@@ -223,7 +230,8 @@ impl StorageDtype {
             | Self::Q5_0
             | Self::Q5K
             | Self::Q6K
-            | Self::Q2K => None, // Blocked
+            | Self::Q2K
+            | Self::GgufOpaque => None, // Blocked or source-defined opaque
         }
     }
 }
@@ -231,3 +239,17 @@ impl StorageDtype {
 /// Sentinel value indicating an unset optional dtype field. Used for
 /// [`crate::tensor::variant::VariantMeta`] `scale_dtype` / `zero_point_dtype`.
 pub const DTYPE_NONE: u16 = 0xFFFF;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gguf_opaque_round_trips_storage_discriminant() {
+        let dtype = StorageDtype::from_raw(111).unwrap();
+        assert_eq!(dtype, StorageDtype::GgufOpaque);
+        assert_eq!(dtype.to_raw(), 111);
+        assert_eq!(dtype.name(), "gguf_opaque");
+        assert_eq!(dtype.size_bytes(), None);
+    }
+}

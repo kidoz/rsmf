@@ -302,6 +302,10 @@ impl<'a> TensorView<'a> {
                     StorageDtype::Q6K => crate::tensor::dequantize::dequantize_q6_k(self.bytes),
                     StorageDtype::Q2K => crate::tensor::dequantize::dequantize_q2_k(self.bytes),
                     StorageDtype::Q5_0 => crate::tensor::dequantize::dequantize_q5_0(self.bytes),
+                    StorageDtype::GgufOpaque => Err(RsmfError::unsupported(format!(
+                        "decode_f32 does not support opaque GGUF storage for tensor {}; use bytes() and gguf.storage metadata",
+                        self.descriptor.name
+                    ))),
                     _ => Err(RsmfError::unsupported(
                         "Storage dtype not supported".to_string(),
                     )),

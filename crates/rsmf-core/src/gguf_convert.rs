@@ -12,11 +12,11 @@
 //! (matching `TensorView::decode_f32`); raw floating-point and integer
 //! storage is imported with its native logical dtype.
 //!
-//! The non-standard `IQ*` / `Q4_1` / `Q8_1` / `Q4_2` / `Q4_3` / `Q5_1` /
-//! `Q8_K` formats are rejected with a typed
-//! [`RsmfError::GgufConversion`] — no dequantiser exists for those in
-//! RSMF and silently dropping them would produce a file that appears
-//! complete but cannot be read back.
+//! GGUF tensor formats without an RSMF-native dequantizer (`IQ*`, `Q4_1`,
+//! `Q8_1`, `Q4_2`, `Q4_3`, `Q5_1`, `Q8_K`) are imported as
+//! [`StorageDtype::GgufOpaque`]. RSMF preserves their bytes and records the
+//! exact source type in `gguf.storage`; consumers with their own GGUF kernels
+//! can read the bytes directly through `TensorView::bytes()`.
 //!
 //! GGUF file-level metadata is imported under the `gguf.*` namespace in
 //! the RSMF manifest so downstream tooling can recover the original
@@ -117,6 +117,8 @@ struct Mapping {
     /// downstream tooling can recover the original GGUF type name
     /// without re-deriving it from the storage-dtype discriminant.
     storage_name: &'static str,
+    /// Optional scale dtype recorded for RSMF-native block quantizers.
+    scale_dtype: Option<StorageDtype>,
 }
 
 fn build_canonical(m: &Mapping, bytes: Vec<u8>) -> VariantInput {
@@ -130,11 +132,7 @@ fn build_canonical(m: &Mapping, bytes: Vec<u8>) -> VariantInput {
         meta: VariantMeta {
             block_shape: m.block_shape.clone(),
             group_size: 0,
-            scale_dtype: if m.encoding == EncodingKind::BlockQuantized {
-                Some(StorageDtype::Logical(LogicalDtype::F16))
-            } else {
-                None
-            },
+            scale_dtype: m.scale_dtype,
             zero_point_dtype: None,
             extra: Vec::new(),
         },
@@ -151,6 +149,7 @@ fn map_ggml_type(ggml_type: GGUFTensorType) -> Result<Mapping> {
         layout: LayoutTag::RowMajor,
         block_shape: Vec::new(),
         storage_name: name,
+        scale_dtype: None,
     };
 
     // Block-quantised formats: canonical is BlockQuantized, logical is
@@ -163,6 +162,19 @@ fn map_ggml_type(ggml_type: GGUFTensorType) -> Result<Mapping> {
         layout: LayoutTag::Blocked,
         block_shape: vec![block],
         storage_name: name,
+        scale_dtype: Some(StorageDtype::Logical(LogicalDtype::F16)),
+    };
+
+    // Opaque GGUF formats are container-only: RSMF stores the exact bytes and
+    // source tag, while external engines remain responsible for interpretation.
+    let opaque = |name: &'static str| Mapping {
+        logical_dtype: LogicalDtype::F32,
+        storage_dtype: StorageDtype::GgufOpaque,
+        encoding: EncodingKind::BlockQuantized,
+        layout: LayoutTag::Blocked,
+        block_shape: Vec::new(),
+        storage_name: name,
+        scale_dtype: None,
     };
 
     Ok(match ggml_type {
@@ -184,30 +196,22 @@ fn map_ggml_type(ggml_type: GGUFTensorType) -> Result<Mapping> {
         GGUFTensorType::Q5_K => block(StorageDtype::Q5K, 256, "q5_k"),
         GGUFTensorType::Q6_K => block(StorageDtype::Q6K, 256, "q6_k"),
 
-        // No dequantiser path in RSMF for these; fail loud rather than
-        // silently drop tensors or write bytes the reader can't decode.
-        other @ (GGUFTensorType::Q4_1
-        | GGUFTensorType::Q4_2
-        | GGUFTensorType::Q4_3
-        | GGUFTensorType::Q5_1
-        | GGUFTensorType::Q8_1
-        | GGUFTensorType::Q8_K
-        | GGUFTensorType::IQ2_XXS
-        | GGUFTensorType::IQ2_XS
-        | GGUFTensorType::IQ3_XXS
-        | GGUFTensorType::IQ1_S
-        | GGUFTensorType::IQ4_NL
-        | GGUFTensorType::IQ3_S
-        | GGUFTensorType::IQ2_S
-        | GGUFTensorType::IQ4_XS
-        | GGUFTensorType::IQ1_M
-        | GGUFTensorType::IQ4_UNI) => {
-            return Err(RsmfError::GgufConversion(format!(
-                "GGUF type {other:?} has no RSMF storage dtype; \
-                 supported types: F32/F16/F64/BF16/I8/I16/I32/I64, \
-                 Q4_0/Q5_0/Q8_0, Q2_K/Q3_K/Q4_K/Q5_K/Q6_K"
-            )));
-        }
+        GGUFTensorType::Q4_1 => opaque("q4_1"),
+        GGUFTensorType::Q4_2 => opaque("q4_2"),
+        GGUFTensorType::Q4_3 => opaque("q4_3"),
+        GGUFTensorType::Q5_1 => opaque("q5_1"),
+        GGUFTensorType::Q8_1 => opaque("q8_1"),
+        GGUFTensorType::Q8_K => opaque("q8_k"),
+        GGUFTensorType::IQ2_XXS => opaque("iq2_xxs"),
+        GGUFTensorType::IQ2_XS => opaque("iq2_xs"),
+        GGUFTensorType::IQ3_XXS => opaque("iq3_xxs"),
+        GGUFTensorType::IQ1_S => opaque("iq1_s"),
+        GGUFTensorType::IQ4_NL => opaque("iq4_nl"),
+        GGUFTensorType::IQ3_S => opaque("iq3_s"),
+        GGUFTensorType::IQ2_S => opaque("iq2_s"),
+        GGUFTensorType::IQ4_XS => opaque("iq4_xs"),
+        GGUFTensorType::IQ1_M => opaque("iq1_m"),
+        GGUFTensorType::IQ4_UNI => opaque("iq4_uni"),
     })
 }
 
@@ -259,20 +263,35 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_types_reject_with_typed_error() {
-        for src in [
-            GGUFTensorType::Q4_1,
-            GGUFTensorType::Q5_1,
-            GGUFTensorType::Q8_1,
-            GGUFTensorType::Q8_K,
-            GGUFTensorType::IQ2_XXS,
-            GGUFTensorType::IQ4_XS,
-        ] {
-            let err = map_ggml_type(src).unwrap_err();
-            assert!(
-                matches!(err, RsmfError::GgufConversion(_)),
-                "expected GgufConversion error for {src:?}, got {err:?}"
-            );
+    fn gguf_only_quantized_types_map_to_opaque_passthrough() {
+        let cases = [
+            (GGUFTensorType::Q4_1, "q4_1"),
+            (GGUFTensorType::Q4_2, "q4_2"),
+            (GGUFTensorType::Q4_3, "q4_3"),
+            (GGUFTensorType::Q5_1, "q5_1"),
+            (GGUFTensorType::Q8_1, "q8_1"),
+            (GGUFTensorType::Q8_K, "q8_k"),
+            (GGUFTensorType::IQ2_XXS, "iq2_xxs"),
+            (GGUFTensorType::IQ2_XS, "iq2_xs"),
+            (GGUFTensorType::IQ3_XXS, "iq3_xxs"),
+            (GGUFTensorType::IQ1_S, "iq1_s"),
+            (GGUFTensorType::IQ4_NL, "iq4_nl"),
+            (GGUFTensorType::IQ3_S, "iq3_s"),
+            (GGUFTensorType::IQ2_S, "iq2_s"),
+            (GGUFTensorType::IQ4_XS, "iq4_xs"),
+            (GGUFTensorType::IQ1_M, "iq1_m"),
+            (GGUFTensorType::IQ4_UNI, "iq4_uni"),
+        ];
+
+        for (src, name) in cases {
+            let mapping = map_ggml_type(src).expect("opaque mapping");
+            assert_eq!(mapping.logical_dtype, LogicalDtype::F32);
+            assert_eq!(mapping.storage_dtype, StorageDtype::GgufOpaque);
+            assert_eq!(mapping.encoding, EncodingKind::BlockQuantized);
+            assert_eq!(mapping.layout, LayoutTag::Blocked);
+            assert_eq!(mapping.storage_name, name);
+            assert_eq!(mapping.scale_dtype, None);
+            assert!(mapping.block_shape.is_empty());
         }
     }
 }

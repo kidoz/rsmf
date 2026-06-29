@@ -22,7 +22,9 @@ use crate::placement::{PLACEMENT_SECTION_KIND, PlacementManifest};
 use crate::preamble::{PREAMBLE_LEN, Preamble};
 use crate::section::{SECTION_DESC_LEN, SectionDescriptor, SectionKind};
 use crate::selection::{Capabilities, ExecutionMode, TensorPlan, select_variants};
-use crate::tensor::variant::VariantDescriptor;
+use crate::tensor::descriptor::TensorDescriptor;
+use crate::tensor::dtype::{LogicalDtype, StorageDtype};
+use crate::tensor::variant::{EncodingKind, LayoutTag, VariantDescriptor, VariantMeta};
 use crate::tensor::view::TensorView;
 use crate::tier::{Tier, validate_tier_metadata};
 
@@ -82,6 +84,38 @@ pub struct CustomSectionPayload {
     pub alignment: u16,
     /// Section payload bytes after any supported decompression.
     pub bytes: Vec<u8>,
+}
+
+/// Borrowed tensor entry with resolved variant bytes and storage metadata.
+///
+/// This is intended for loader adapters that need to enumerate tensors once and
+/// hand raw mmap-backed bytes to their own runtime.
+#[derive(Debug, Clone)]
+pub struct TensorEntryView<'a> {
+    /// Tensor name.
+    pub name: &'a str,
+    /// Logical row-major shape.
+    pub shape: &'a [u64],
+    /// Logical dtype.
+    pub dtype: LogicalDtype,
+    /// Selected variant storage dtype.
+    pub storage_dtype: StorageDtype,
+    /// Selected variant index in the manifest's variant array.
+    pub variant_index: u32,
+    /// Selected variant target tag.
+    pub target: crate::tensor::variant::TargetTag,
+    /// Original GGUF storage tag, when present in tensor metadata.
+    pub gguf_storage: Option<&'a str>,
+    /// Selected variant bytes.
+    pub bytes: &'a [u8],
+    /// Tensor descriptor.
+    pub descriptor: &'a TensorDescriptor,
+    /// Selected variant encoding kind.
+    pub encoding: EncodingKind,
+    /// Selected variant layout.
+    pub layout: LayoutTag,
+    /// Selected variant metadata.
+    pub meta: &'a VariantMeta,
 }
 
 /// A validated, mmap-backed RSMF file.
@@ -408,6 +442,86 @@ impl RsmfFile {
     #[must_use]
     pub fn state_dict(&self) -> crate::state_dict::StateDict {
         crate::state_dict::StateDict::from_manifest(&self.manifest)
+    }
+
+    /// Return canonical tensor entries with mmap-backed bytes in manifest order.
+    ///
+    /// This resolves each tensor's canonical variant once and includes the
+    /// `gguf.storage` tensor metadata tag when present. If a tensor's bytes live
+    /// in an unattached shard, the shard error is returned.
+    pub fn tensor_entries(&self) -> Result<Vec<TensorEntryView<'_>>> {
+        let mut entries = Vec::with_capacity(self.manifest.tensors.len());
+        for tensor in &self.manifest.tensors {
+            entries.push(self.tensor_entry_for_variant(tensor, tensor.canonical_variant)?);
+        }
+        Ok(entries)
+    }
+
+    /// Return tensor entries for a precomputed variant selection plan.
+    ///
+    /// The returned entries follow `plan.selections` order. Each selected
+    /// variant must belong to the named tensor; otherwise a structural error is
+    /// returned.
+    pub fn tensor_entries_for_plan(&self, plan: &TensorPlan) -> Result<Vec<TensorEntryView<'_>>> {
+        let mut entries = Vec::with_capacity(plan.selections.len());
+        for selection in &plan.selections {
+            let tensor_index =
+                self.tensor_by_name
+                    .get(&selection.tensor_name)
+                    .ok_or_else(|| {
+                        RsmfError::structural(format!(
+                            "selection references missing tensor {}",
+                            selection.tensor_name
+                        ))
+                    })?;
+            let tensor = &self.manifest.tensors[*tensor_index];
+            entries.push(self.tensor_entry_for_variant(tensor, selection.variant_index)?);
+        }
+        Ok(entries)
+    }
+
+    fn tensor_entry_for_variant<'a>(
+        &'a self,
+        tensor: &'a TensorDescriptor,
+        variant_index: u32,
+    ) -> Result<TensorEntryView<'a>> {
+        if tensor.canonical_variant != variant_index
+            && !tensor.packed_variants.contains(&variant_index)
+        {
+            return Err(RsmfError::structural(format!(
+                "tensor {} does not own selected variant {}",
+                tensor.name, variant_index
+            )));
+        }
+        let variant = self
+            .manifest
+            .variants
+            .get(variant_index as usize)
+            .ok_or_else(|| {
+                RsmfError::structural(format!(
+                    "tensor {} references missing variant {}",
+                    tensor.name, variant_index
+                ))
+            })?;
+        let bytes = self.variant_bytes(variant)?;
+        let gguf_storage = tensor
+            .metadata
+            .iter()
+            .find_map(|(key, value)| (key == "gguf.storage").then_some(value.as_str()));
+        Ok(TensorEntryView {
+            name: &tensor.name,
+            shape: &tensor.shape,
+            dtype: tensor.dtype,
+            storage_dtype: variant.storage_dtype,
+            variant_index,
+            target: variant.target,
+            gguf_storage,
+            bytes,
+            descriptor: tensor,
+            encoding: variant.encoding,
+            layout: variant.layout,
+            meta: &variant.meta,
+        })
     }
 
     /// Index the file's adapter tensors (LoRA / DoRA / IA³).
