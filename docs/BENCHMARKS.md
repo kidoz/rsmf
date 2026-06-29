@@ -84,17 +84,21 @@ Measures host-side dispatch grouping and prepared MoE runtime gates:
 - reports throughput as tokens/second through Criterion's `Throughput::Elements`.
 - builds deterministic local RSMF MoE fixtures for tiny, token-scaling, and
   expert-scaling cases,
-- measures CPU prepared-plan top-1 and top-k execution,
-- with `--features wgpu`, measures WGPU top-k first-run cache miss and warmed
-  cache-hit execution when a WGPU adapter is available.
+- measures CPU prepared-plan top-1 single-device placement as the local
+  baseline,
+- measures CPU prepared-plan top-1 multi-device placement overhead,
+- measures CPU prepared-plan top-k multi-device execution,
+- with `--features wgpu`, measures WGPU top-k cold-cache and warm-cache
+  execution when a WGPU adapter is available.
 
 The grouping benchmark isolates the routing-to-batch step. The prepared runtime
 benchmarks exercise routing, weighted expert combine, resident plan reuse,
 token/expert scaling, WGPU resident weight cache miss/hit behavior, and backend
 selection. End-to-end MoE layer timings are also exposed per run through
 `MoeRunReport` (`gating_time`, `dispatch_time`, `compute_time`, `combine_time`,
-`tokens_per_second()`, and per-device `weight_cache_hits` /
-`weight_cache_misses`).
+`tokens_per_second()`, per-device `weight_cache_hits` /
+`weight_cache_misses`, and per-device executed transfer kind/bytes/time/cache
+events).
 
 Hardware-free CPU run:
 
@@ -110,8 +114,31 @@ cargo bench -p rsmf-bench --features wgpu --bench moe_dispatch
 
 Record the CPU model, GPU/adapter name, OS, power mode, `rustc -Vv`, command
 line, and whether `RuntimeBackend::WgpuCompute.active_adapters` is `1` or
-greater when comparing results across changes. The WGPU group skips gracefully
-when no adapter is available.
+greater when comparing results across changes. The WGPU group prints one
+fixed-hardware probe line with cold/warm transfer bytes, cache hits/misses, and
+transfer microseconds before Criterion starts the timed group. The WGPU group
+skips gracefully when no adapter is available.
+
+Use this local results template when tracking fixed-hardware changes:
+
+```text
+date:
+git commit:
+command:
+cpu:
+gpu/adapters:
+os:
+power mode:
+rustc -Vv:
+moe_runtime_cpu/top1_single_device_baseline:
+moe_runtime_cpu/top1_multi_device_placement:
+moe_runtime_cpu/topk_multi_device_placement:
+moe_runtime_wgpu/topk_cold_cache:
+moe_runtime_wgpu/topk_warm_cache:
+probe cold transfer_bytes/cache_misses:
+probe warm transfer_bytes/cache_hits:
+notes:
+```
 
 Source: `crates/rsmf-bench/benches/moe_dispatch.rs`.
 
