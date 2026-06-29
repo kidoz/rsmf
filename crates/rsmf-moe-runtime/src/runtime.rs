@@ -341,6 +341,19 @@ pub struct MoeCollectivePlan {
     pub required: bool,
 }
 
+/// Executed collective metrics observed during one routed run.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CollectiveRunReport {
+    /// Collective kind.
+    pub kind: MoeCollectiveKind,
+    /// Participating placement device ids.
+    pub device_ids: Vec<u32>,
+    /// Number of f32 elements processed by the collective.
+    pub element_count: usize,
+    /// Wall time spent executing the collective.
+    pub duration: Duration,
+}
+
 /// Prepared layer placement and residency summary.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MoeLayerPlanReport {
@@ -390,6 +403,40 @@ pub enum TensorParallelismStatus {
 pub struct CpuCollectives;
 
 impl CpuCollectives {
+    /// Execute one CPU reference collective step over f32 partitions.
+    ///
+    /// Returns the collective output and an execution report. This is the
+    /// tensor-parallel correctness prototype used before device-backed
+    /// collectives exist.
+    pub fn execute(
+        step: &MoeCollectiveStep,
+        parts: &[&[f32]],
+    ) -> Result<(Vec<f32>, CollectiveRunReport)> {
+        let start = Instant::now();
+        let output = match step.kind {
+            MoeCollectiveKind::AllReduceSum => Self::all_reduce_sum(parts)?,
+            MoeCollectiveKind::Gather => Self::gather(parts),
+        };
+        let actual_elements = collective_element_count(step.kind, parts)?;
+        if let Some(expected_elements) = step.element_count
+            && expected_elements != actual_elements
+        {
+            return Err(MoeRuntimeError::Shape(format!(
+                "collective {:?} expected {expected_elements} elements, got {actual_elements}",
+                step.kind
+            )));
+        }
+        Ok((
+            output,
+            CollectiveRunReport {
+                kind: step.kind,
+                device_ids: step.device_ids.clone(),
+                element_count: actual_elements,
+                duration: start.elapsed(),
+            },
+        ))
+    }
+
     /// Sum equally-shaped f32 partitions element-wise.
     pub fn all_reduce_sum(parts: &[&[f32]]) -> Result<Vec<f32>> {
         let Some(first) = parts.first() else {
@@ -709,6 +756,7 @@ impl MoeRuntime {
                 gating_time,
                 dispatch_time,
                 compute_time,
+                collective_runs: Vec::new(),
                 combine_time,
             },
         })
@@ -2017,6 +2065,38 @@ fn collective_plan_for_devices(
     }
 }
 
+fn collective_element_count(kind: MoeCollectiveKind, parts: &[&[f32]]) -> Result<usize> {
+    match kind {
+        MoeCollectiveKind::AllReduceSum => {
+            let Some(first) = parts.first() else {
+                return Ok(0);
+            };
+            for (idx, part) in parts.iter().enumerate() {
+                if part.len() != first.len() {
+                    return Err(MoeRuntimeError::Shape(format!(
+                        "all_reduce_sum part {idx} has length {}, expected {}",
+                        part.len(),
+                        first.len()
+                    )));
+                }
+            }
+            Ok(first.len())
+        }
+        MoeCollectiveKind::Gather => parts.iter().try_fold(0usize, |acc, part| {
+            acc.checked_add(part.len())
+                .ok_or_else(|| MoeRuntimeError::Shape("gather element count overflow".to_string()))
+        }),
+    }
+}
+
+#[cfg(test)]
+fn reject_device_collective(step: &MoeCollectiveStep, backend: &str) -> Result<()> {
+    Err(MoeRuntimeError::Unsupported(format!(
+        "{backend} device collective {:?} is not implemented for devices {:?}",
+        step.kind, step.device_ids
+    )))
+}
+
 fn eval_expert(
     input: &[f32],
     expert: &ExpertWeights,
@@ -2202,5 +2282,26 @@ fn select_backend(placement: &PlacementManifest, prefer_wgpu: bool) -> RuntimeBa
         reason: format!(
             "requested {requested_devices} WGPU placement devices but rsmf-moe-runtime was built without the wgpu feature"
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn device_collective_execution_is_explicitly_unavailable() {
+        let step = MoeCollectiveStep {
+            kind: MoeCollectiveKind::AllReduceSum,
+            device_ids: vec![0, 1],
+            element_count: Some(4),
+            reason: "device all-reduce".to_string(),
+        };
+
+        let err = reject_device_collective(&step, "WGPU").unwrap_err();
+
+        assert!(
+            matches!(err, MoeRuntimeError::Unsupported(message) if message.contains("WGPU") && message.contains("AllReduceSum"))
+        );
     }
 }

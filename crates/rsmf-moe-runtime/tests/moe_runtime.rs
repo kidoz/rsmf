@@ -313,6 +313,7 @@ fn prepared_layer_plan_reports_residency_and_reuses_weights() {
     assert_eq!(output.report.device_runs[0].transfer.bytes, 0);
     assert_eq!(output.report.device_runs[0].transfer.cache_hits, 0);
     assert_eq!(output.report.device_runs[0].transfer.cache_misses, 0);
+    assert!(output.report.collective_runs.is_empty());
     assert_eq!(output.report.device_runs[1].device_id, 1);
     assert_eq!(output.report.device_runs[1].expert_ids, vec![1]);
     assert_eq!(output.report.device_runs[1].token_count, 2);
@@ -428,6 +429,54 @@ fn cpu_collectives_sum_and_gather_partitions() {
 
     assert_eq!(reduced, vec![5.0, 7.0, 9.0]);
     assert_eq!(gathered, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+}
+
+#[test]
+fn cpu_collectives_execute_reports_metrics() {
+    let left = [1.0, 2.0, 3.0];
+    let right = [4.0, 5.0, 6.0];
+    let reduce_step = rsmf_moe_runtime::MoeCollectiveStep {
+        kind: rsmf_moe_runtime::MoeCollectiveKind::AllReduceSum,
+        device_ids: vec![0, 1],
+        element_count: Some(3),
+        reason: "test all-reduce".to_string(),
+    };
+    let gather_step = rsmf_moe_runtime::MoeCollectiveStep {
+        kind: rsmf_moe_runtime::MoeCollectiveKind::Gather,
+        device_ids: vec![0, 1],
+        element_count: Some(6),
+        reason: "test gather".to_string(),
+    };
+
+    let (reduced, reduce_report) = CpuCollectives::execute(&reduce_step, &[&left, &right]).unwrap();
+    let (gathered, gather_report) =
+        CpuCollectives::execute(&gather_step, &[&left, &right]).unwrap();
+
+    assert_eq!(reduced, vec![5.0, 7.0, 9.0]);
+    assert_eq!(reduce_report.kind, reduce_step.kind);
+    assert_eq!(reduce_report.device_ids, vec![0, 1]);
+    assert_eq!(reduce_report.element_count, 3);
+    assert_eq!(gathered, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+    assert_eq!(gather_report.kind, gather_step.kind);
+    assert_eq!(gather_report.element_count, 6);
+}
+
+#[test]
+fn cpu_collectives_execute_rejects_plan_element_mismatch() {
+    let left = [1.0, 2.0, 3.0];
+    let right = [4.0, 5.0, 6.0];
+    let step = rsmf_moe_runtime::MoeCollectiveStep {
+        kind: rsmf_moe_runtime::MoeCollectiveKind::Gather,
+        device_ids: vec![0, 1],
+        element_count: Some(5),
+        reason: "bad gather".to_string(),
+    };
+
+    let err = CpuCollectives::execute(&step, &[&left, &right]).unwrap_err();
+
+    assert!(
+        matches!(err, MoeRuntimeError::Shape(message) if message.contains("expected 5 elements"))
+    );
 }
 
 #[test]

@@ -11,8 +11,9 @@
 //! placement, and sharded-read contracts. With the feature enabled and an
 //! adapter available, expert matmuls run through a small WGPU compute shader.
 //! When multiple physical adapters are exposed by WGPU, logical WGPU placement
-//! devices are assigned across an executor pool. Tensor-parallel collectives are
-//! not implemented yet and are reported explicitly in prepared layer plans.
+//! devices are assigned across an executor pool. CPU reference collectives are
+//! available for tensor-parallel validation; device-backed collectives are not
+//! implemented yet and are reported explicitly in prepared layer plans.
 //!
 //! ```
 //! use rsmf_moe_runtime::batch_by_destination;
@@ -38,11 +39,11 @@ mod wgpu_compute;
 
 pub use routing::{RoutingBatch, batch_by_destination};
 pub use runtime::{
-    CpuCollectives, DeviceRunReport, ExpertActivation, MoeCheckedRunOutput, MoeCollectiveKind,
-    MoeCollectivePlan, MoeCollectiveStep, MoeLayerPlan, MoeLayerPlanReport, MoeReferenceComparison,
-    MoeRoutingPolicy, MoeRuntime, MoeRuntimeOptions, MoeTransferKind, MoeTransferPlan,
-    MoeTransferStep, MultiAdapterStatus, PlannedDevice, PlannedExpert, RuntimeLimits,
-    TensorParallelismStatus, TransferRunReport,
+    CollectiveRunReport, CpuCollectives, DeviceRunReport, ExpertActivation, MoeCheckedRunOutput,
+    MoeCollectiveKind, MoeCollectivePlan, MoeCollectiveStep, MoeLayerPlan, MoeLayerPlanReport,
+    MoeReferenceComparison, MoeRoutingPolicy, MoeRuntime, MoeRuntimeOptions, MoeTransferKind,
+    MoeTransferPlan, MoeTransferStep, MultiAdapterStatus, PlannedDevice, PlannedExpert,
+    RuntimeLimits, TensorParallelismStatus, TransferRunReport,
 };
 
 /// Result alias for the MoE runtime crate.
@@ -129,6 +130,11 @@ pub struct MoeRunReport {
     pub dispatch_time: Duration,
     /// Expert matmul time.
     pub compute_time: Duration,
+    /// Tensor-parallel collective execution metrics.
+    ///
+    /// Expert-sharded runs currently report an empty vector. Tensor-sliced
+    /// execution will populate this when device collectives are implemented.
+    pub collective_runs: Vec<CollectiveRunReport>,
     /// Output combine/scatter time.
     pub combine_time: Duration,
 }
