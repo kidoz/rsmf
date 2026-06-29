@@ -100,6 +100,9 @@ rsmf-core  (library)           ← format, reader, writer, validator, selection
   internal transfer-executor accounting for host-to-device cache misses, and
   per-adapter scoped dispatch; provides measured CPU reference comparison; and
   exposes reported CPU reference collectives for tensor-parallel validation.
+  Tensor-parallel MoE metadata is additive under `moe.parallel=tensor`; the
+  runtime plans collectives from it and returns typed unavailable errors for
+  execution until tensor-sliced expert kernels exist.
   Its optional `wgpu` feature reports CPU fallback when no adapter is
   available. Real tensor-parallel device collectives and peer transfer
   execution remain future work.

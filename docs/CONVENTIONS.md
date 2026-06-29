@@ -237,15 +237,30 @@ annotated tensors by layer, expert id, shared flag, and role.
 | `moe.expert` | Decimal expert id within the layer. Absent means dense, router, or shared tensor. |
 | `moe.shared` | `1` if this tensor belongs to an always-active shared expert. Omit otherwise. |
 | `moe.role` | FFN/router role: `gate`, `up`, `down`, `router`, or a preserved unknown string. |
+| `moe.parallel` | Optional parallelism mode. `tensor` declares a tensor-parallel partition. |
+| `moe.partition_axis` | Required when `moe.parallel=tensor`. `rows` or `cols`. |
+| `moe.partition_index` | Required when `moe.parallel=tensor`. Zero-based partition index. |
+| `moe.partition_count` | Required when `moe.parallel=tensor`. Total partition count. |
+| `moe.collective` | Required when `moe.parallel=tensor`. `gather` or `all_reduce_sum`. |
 
 Readers that do not understand MoE metadata ignore these keys and read tensors
 normally. The typed accessor returns `Structural` errors for malformed decimal
 fields or invalid `moe.shared` values because silently mis-grouping experts can
 route weights incorrectly.
 
+Tensor-parallel keys are additive metadata conventions. A tensor carrying
+`moe.parallel=tensor` declares that its logical tensor is one partition of a
+larger expert tensor and that execution needs the named collective to assemble
+or combine partial results. The partition axis is interpreted against the
+tensor's logical row-major shape. `rows` slices dimension 0; `cols` slices
+dimension 1. Runtimes MUST reject missing partition fields, out-of-range
+partition indices, and inconsistent tensor-parallel metadata within one expert.
+
 The experimental `rsmf-moe-runtime` crate consumes these annotations together
 with `PlacementManifest` and `prefetch.*` hints for its one-layer proof of
-concept. That runtime does not add new metadata keys.
+concept. It currently plans tensor-parallel collectives from these keys and
+reports tensor-parallel execution as unavailable until full tensor-sliced expert
+execution exists.
 
 ---
 

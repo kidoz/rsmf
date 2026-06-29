@@ -72,6 +72,13 @@ The typed `RsmfFile::moe_experts()` accessor validates decimal fields and
 groups tensors by layer, expert id, shared flag, and role for runtimes that
 need expert routing metadata.
 
+Tensor-parallel MoE planning extends the same convention with optional
+per-tensor keys (`moe.parallel=tensor`, partition axis/index/count, and
+`moe.collective`). These keys declare tensor partitions and required
+collectives without introducing graph semantics or changing the binary format.
+Runtimes that cannot execute tensor-sliced experts must fail explicitly rather
+than silently treating partitions as full expert tensors.
+
 ## D12 — PlacementManifest as Custom(128)
 
 Shard/device placement is represented by an optional

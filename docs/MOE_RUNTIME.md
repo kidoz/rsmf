@@ -48,6 +48,11 @@ The runtime is intentionally stricter than the metadata index:
 - `SiluGated` activation requires exactly one `gate` tensor per expert.
 - Expert `up` / `down` / `gate` tensors must live on the same `shard_id` so a
   placement record names one owning device for the expert.
+- Tensors may declare additive tensor-parallel metadata with
+  `moe.parallel=tensor`, `moe.partition_axis`, `moe.partition_index`,
+  `moe.partition_count`, and `moe.collective`. The runtime validates this
+  metadata, surfaces a `MoeCollectivePlan`, and reports tensor-parallel
+  execution as unavailable.
 - Placement device capacity is enforced when `capacity_bytes` is non-zero.
 - Shared MoE experts are rejected by this crate; the runtime covers routed
   expert-sharded layers where each expert is resident on one primary shard.
@@ -126,10 +131,12 @@ while preserving the placement and routing contract.
 
 CPU reference tensor-parallel collectives are available through
 `CpuCollectives::execute`. Device-backed tensor-parallel collectives are not
-implemented yet. Prepared layer plans report
-`TensorParallelismStatus::NotRequired` for the current expert-sharded contract
-where each expert is owned by one shard/device. Future tensor-sliced experts
-must report an explicit unavailable status until real device collectives exist.
+implemented yet. Prepared layer plans report `TensorParallelismStatus::NotRequired`
+for the current expert-sharded contract where each expert is owned by one
+shard/device. Tensor-sliced experts declared with `moe.parallel=tensor` produce
+a non-empty `MoeCollectivePlan` and `TensorParallelismStatus::Unavailable`;
+attempting to run them returns a typed unsupported error until real
+tensor-parallel execution exists.
 
 The Criterion `moe_dispatch` bench isolates token batching throughput and also
 includes a tiny end-to-end routed top-k fixture. Use it with:
