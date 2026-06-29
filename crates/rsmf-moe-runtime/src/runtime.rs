@@ -398,6 +398,30 @@ pub enum TensorParallelismStatus {
     },
 }
 
+/// Tensor-parallel partition axis declared by MoE tensor metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TensorParallelAxis {
+    Rows,
+    Cols,
+}
+
+/// Tensor-parallel collective declared by MoE tensor metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TensorParallelCollective {
+    Gather,
+    AllReduceSum,
+}
+
+/// Tensor-parallel partition metadata declared on one MoE tensor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TensorParallelSpec {
+    axis: TensorParallelAxis,
+    partition_index: usize,
+    partition_count: usize,
+    collective: TensorParallelCollective,
+    element_count: Option<usize>,
+}
+
 /// CPU reference collectives used to validate future tensor-parallel backends.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CpuCollectives;
@@ -714,6 +738,12 @@ impl MoeRuntime {
         input: &[f32],
         routing_policy: MoeRoutingPolicy,
     ) -> Result<MoeRunOutput> {
+        if plan.report.collective_plan.required {
+            return Err(MoeRuntimeError::Unsupported(format!(
+                "tensor-parallel MoE execution is not implemented: {}",
+                tensor_parallel_unavailable_reason(&plan.report.collective_plan)
+            )));
+        }
         let token_count = checked_token_count(input, plan.input_width)?;
         self.options.limits.check_tokens(token_count)?;
 
@@ -812,6 +842,12 @@ impl MoeRuntime {
         input: &[f32],
         routing_policy: MoeRoutingPolicy,
     ) -> Result<Vec<f32>> {
+        if plan.report.collective_plan.required {
+            return Err(MoeRuntimeError::Unsupported(format!(
+                "tensor-parallel reference execution is not implemented: {}",
+                tensor_parallel_unavailable_reason(&plan.report.collective_plan)
+            )));
+        }
         let token_count = checked_token_count(input, plan.input_width)?;
         self.options.limits.check_tokens(token_count)?;
         let assignments =
@@ -1095,8 +1131,11 @@ impl MoeRuntime {
             if let Some(gate_name) = &gate_name {
                 shard_tensor_names.push(gate_name.as_str());
             }
+            let tensor_parallel =
+                tensor_parallel_spec_for_tensors(&self.file, &shard_tensor_names)?;
             let shard_id = shared_expert_shard(&self.file, &shard_tensor_names)?;
             let placement = self.placement_for_shard(shard_id)?;
+            let device_ids = placement_device_ids(placement);
             let prefetch_groups = self.prefetch_groups_for_tensors(shard_tensor_names);
             experts.insert(
                 expert_id,
@@ -1109,7 +1148,9 @@ impl MoeRuntime {
                     gate,
                     shard_id,
                     device_id: placement.primary_device,
+                    device_ids,
                     prefetch_groups,
+                    tensor_parallel,
                 },
             );
         }
@@ -1170,7 +1211,9 @@ impl MoeRuntime {
         }
 
         let transfer_plan = self.transfer_plan(&experts)?;
-        let collective_plan = collective_plan_for_devices(&devices);
+        let tensor_parallel_plan = tensor_parallel_plan_for_experts(&loaded.experts);
+        let collective_plan = tensor_parallel_plan.collective_plan;
+        let tensor_parallelism = tensor_parallel_plan.status;
         let devices = devices
             .into_values()
             .map(PlannedDeviceBuilder::finish)
@@ -1187,7 +1230,7 @@ impl MoeRuntime {
             experts,
             devices,
             multi_device,
-            tensor_parallelism: TensorParallelismStatus::NotRequired,
+            tensor_parallelism,
             transfer_plan,
             multi_adapter,
             collective_plan,
@@ -1720,7 +1763,9 @@ struct ExpertWeights {
     gate: Option<Matrix>,
     shard_id: u64,
     device_id: u32,
+    device_ids: Vec<u32>,
     prefetch_groups: Vec<String>,
+    tensor_parallel: Option<TensorParallelSpec>,
 }
 
 impl ExpertWeights {
@@ -2056,13 +2101,198 @@ fn weighted_batches_by_destination(assignments: &[RoutedAssignment]) -> Vec<Weig
     batches
 }
 
-fn collective_plan_for_devices(
-    _devices: &BTreeMap<u32, PlannedDeviceBuilder>,
-) -> MoeCollectivePlan {
-    MoeCollectivePlan {
-        steps: Vec::new(),
-        required: false,
+#[derive(Debug)]
+struct TensorParallelPlan {
+    status: TensorParallelismStatus,
+    collective_plan: MoeCollectivePlan,
+}
+
+fn tensor_parallel_plan_for_experts(experts: &BTreeMap<u32, ExpertWeights>) -> TensorParallelPlan {
+    let mut steps = Vec::new();
+    for (&expert_id, expert) in experts {
+        let Some(spec) = &expert.tensor_parallel else {
+            continue;
+        };
+        let kind = match spec.collective {
+            TensorParallelCollective::Gather => MoeCollectiveKind::Gather,
+            TensorParallelCollective::AllReduceSum => MoeCollectiveKind::AllReduceSum,
+        };
+        steps.push(MoeCollectiveStep {
+            kind,
+            device_ids: expert.device_ids.clone(),
+            element_count: spec.element_count,
+            reason: format!(
+                "expert {expert_id} declares tensor parallel {:?} partition {}/{} on {:?}",
+                spec.axis, spec.partition_index, spec.partition_count, expert.device_ids
+            ),
+        });
     }
+    if steps.is_empty() {
+        return TensorParallelPlan {
+            status: TensorParallelismStatus::NotRequired,
+            collective_plan: MoeCollectivePlan {
+                steps,
+                required: false,
+            },
+        };
+    }
+    TensorParallelPlan {
+        status: TensorParallelismStatus::Unavailable {
+            reason: tensor_parallel_unavailable_reason_for_steps(&steps),
+        },
+        collective_plan: MoeCollectivePlan {
+            steps,
+            required: true,
+        },
+    }
+}
+
+fn tensor_parallel_unavailable_reason(plan: &MoeCollectivePlan) -> String {
+    tensor_parallel_unavailable_reason_for_steps(&plan.steps)
+}
+
+fn tensor_parallel_unavailable_reason_for_steps(steps: &[MoeCollectiveStep]) -> String {
+    format!(
+        "tensor-sliced expert metadata requires {} collective step(s), but tensor-parallel MoE execution is not implemented",
+        steps.len()
+    )
+}
+
+fn placement_device_ids(placement: &rsmf_core::PlacementRecord) -> Vec<u32> {
+    let mut device_ids = vec![placement.primary_device];
+    for &replica in &placement.replicas {
+        if !device_ids.contains(&replica) {
+            device_ids.push(replica);
+        }
+    }
+    device_ids
+}
+
+fn tensor_parallel_spec_for_tensors(
+    file: &RsmfFile,
+    tensor_names: &[&str],
+) -> Result<Option<TensorParallelSpec>> {
+    let mut spec: Option<TensorParallelSpec> = None;
+    let mut spec_tensor_name = None;
+    for tensor_name in tensor_names {
+        let tensor = tensor_descriptor(file, tensor_name)?;
+        let Some(next) = parse_tensor_parallel_spec(tensor)? else {
+            continue;
+        };
+        if let Some(existing) = &spec
+            && (existing.axis != next.axis
+                || existing.partition_index != next.partition_index
+                || existing.partition_count != next.partition_count
+                || existing.collective != next.collective)
+        {
+            return Err(MoeRuntimeError::Shape(format!(
+                "tensor-parallel metadata for {tensor_name} is inconsistent with {}",
+                spec_tensor_name.unwrap_or("earlier tensor")
+            )));
+        }
+        spec = Some(next);
+        spec_tensor_name = Some(*tensor_name);
+    }
+    Ok(spec)
+}
+
+fn parse_tensor_parallel_spec(tensor: &TensorDescriptor) -> Result<Option<TensorParallelSpec>> {
+    let Some(parallel) = metadata_value(&tensor.metadata, "moe.parallel") else {
+        return Ok(None);
+    };
+    if parallel != "tensor" {
+        return Err(MoeRuntimeError::Shape(format!(
+            "{} has unsupported moe.parallel={parallel:?}; expected \"tensor\"",
+            tensor.name
+        )));
+    }
+    let axis = match required_metadata(&tensor.name, &tensor.metadata, "moe.partition_axis")? {
+        "rows" => TensorParallelAxis::Rows,
+        "cols" => TensorParallelAxis::Cols,
+        other => {
+            return Err(MoeRuntimeError::Shape(format!(
+                "{} has unsupported moe.partition_axis={other:?}; expected \"rows\" or \"cols\"",
+                tensor.name
+            )));
+        }
+    };
+    let partition_index =
+        parse_usize_metadata(&tensor.name, &tensor.metadata, "moe.partition_index")?;
+    let partition_count =
+        parse_usize_metadata(&tensor.name, &tensor.metadata, "moe.partition_count")?;
+    if partition_count == 0 {
+        return Err(MoeRuntimeError::Shape(format!(
+            "{} has moe.partition_count=0",
+            tensor.name
+        )));
+    }
+    if partition_index >= partition_count {
+        return Err(MoeRuntimeError::Shape(format!(
+            "{} has moe.partition_index={partition_index} outside partition_count={partition_count}",
+            tensor.name
+        )));
+    }
+    let collective = match required_metadata(&tensor.name, &tensor.metadata, "moe.collective")? {
+        "gather" => TensorParallelCollective::Gather,
+        "all_reduce_sum" => TensorParallelCollective::AllReduceSum,
+        other => {
+            return Err(MoeRuntimeError::Shape(format!(
+                "{} has unsupported moe.collective={other:?}; expected \"gather\" or \"all_reduce_sum\"",
+                tensor.name
+            )));
+        }
+    };
+    let axis_dim = match axis {
+        TensorParallelAxis::Rows => tensor.shape.first().copied(),
+        TensorParallelAxis::Cols => tensor.shape.get(1).copied(),
+    };
+    let element_count = axis_dim
+        .map(|dim| {
+            usize::try_from(dim).map_err(|_| {
+                MoeRuntimeError::Shape(format!(
+                    "{} tensor-parallel dimension exceeds usize::MAX",
+                    tensor.name
+                ))
+            })
+        })
+        .transpose()?;
+    Ok(Some(TensorParallelSpec {
+        axis,
+        partition_index,
+        partition_count,
+        collective,
+        element_count,
+    }))
+}
+
+fn metadata_value<'a>(metadata: &'a [(String, String)], key: &str) -> Option<&'a str> {
+    metadata
+        .iter()
+        .find(|(candidate, _)| candidate == key)
+        .map(|(_, value)| value.as_str())
+}
+
+fn required_metadata<'a>(
+    tensor_name: &str,
+    metadata: &'a [(String, String)],
+    key: &str,
+) -> Result<&'a str> {
+    metadata_value(metadata, key).ok_or_else(|| {
+        MoeRuntimeError::Shape(format!(
+            "{tensor_name} has moe.parallel=\"tensor\" but no {key}"
+        ))
+    })
+}
+
+fn parse_usize_metadata(
+    tensor_name: &str,
+    metadata: &[(String, String)],
+    key: &str,
+) -> Result<usize> {
+    let value = required_metadata(tensor_name, metadata, key)?;
+    value.parse::<usize>().map_err(|e| {
+        MoeRuntimeError::Shape(format!("{tensor_name} has invalid {key}={value:?}: {e}"))
+    })
 }
 
 fn collective_element_count(kind: MoeCollectiveKind, parts: &[&[f32]]) -> Result<usize> {

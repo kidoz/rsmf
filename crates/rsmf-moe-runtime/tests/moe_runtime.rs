@@ -159,6 +159,18 @@ fn build_fixture() -> Fixture {
     build_fixture_with(Vec::new(), fixture_tensors(), fixture_placement())
 }
 
+fn add_tensor_metadata(tensors: &mut [TensorInput], tensor_name: &str, extra: &[(&str, &str)]) {
+    let tensor = tensors
+        .iter_mut()
+        .find(|tensor| tensor.name == tensor_name)
+        .unwrap_or_else(|| panic!("missing fixture tensor {tensor_name}"));
+    tensor.metadata.extend(
+        extra
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string())),
+    );
+}
+
 fn build_fixture_with(
     metadata: Vec<(&str, &str)>,
     tensors: Vec<TensorInput>,
@@ -326,6 +338,111 @@ fn prepared_layer_plan_reports_residency_and_reuses_weights() {
     assert_eq!(output.report.device_runs[1].transfer.bytes, 0);
     assert_eq!(output.report.device_runs[1].transfer.cache_hits, 0);
     assert_eq!(output.report.device_runs[1].transfer.cache_misses, 0);
+}
+
+#[test]
+fn tensor_parallel_metadata_builds_collective_plan_and_rejects_execution() {
+    let mut tensors = fixture_tensors();
+    add_tensor_metadata(
+        &mut tensors,
+        "layers.0.experts.0.down",
+        &[
+            ("moe.parallel", "tensor"),
+            ("moe.partition_axis", "rows"),
+            ("moe.partition_index", "0"),
+            ("moe.partition_count", "2"),
+            ("moe.collective", "gather"),
+        ],
+    );
+    let mut placement = fixture_placement();
+    placement.placements[0].replicas = vec![1];
+    let fixture = build_fixture_with(Vec::new(), tensors, placement);
+    let runtime = MoeRuntime::new(fixture.open(), MoeRuntimeOptions::default()).unwrap();
+
+    let plan = runtime.prepare_layer(0, 2).unwrap();
+
+    assert!(plan.report().collective_plan.required);
+    assert_eq!(plan.report().collective_plan.steps.len(), 1);
+    assert_eq!(
+        plan.report().collective_plan.steps[0].kind,
+        rsmf_moe_runtime::MoeCollectiveKind::Gather
+    );
+    assert_eq!(
+        plan.report().collective_plan.steps[0].device_ids,
+        vec![0, 1]
+    );
+    assert_eq!(
+        plan.report().collective_plan.steps[0].element_count,
+        Some(2)
+    );
+    assert!(matches!(
+        plan.report().tensor_parallelism,
+        rsmf_moe_runtime::TensorParallelismStatus::Unavailable { .. }
+    ));
+
+    let err = runtime
+        .run_prepared_layer_top1(&plan, &[2.0, 1.0])
+        .unwrap_err();
+
+    assert!(
+        matches!(err, MoeRuntimeError::Unsupported(message) if message.contains("tensor-parallel MoE execution"))
+    );
+}
+
+#[test]
+fn tensor_parallel_metadata_requires_partition_fields() {
+    let mut tensors = fixture_tensors();
+    add_tensor_metadata(
+        &mut tensors,
+        "layers.0.experts.0.down",
+        &[
+            ("moe.parallel", "tensor"),
+            ("moe.partition_axis", "rows"),
+            ("moe.partition_count", "2"),
+            ("moe.collective", "gather"),
+        ],
+    );
+    let fixture = build_fixture_with(Vec::new(), tensors, fixture_placement());
+    let runtime = MoeRuntime::new(fixture.open(), MoeRuntimeOptions::default()).unwrap();
+
+    let err = runtime.prepare_layer(0, 2).unwrap_err();
+
+    assert!(
+        matches!(err, MoeRuntimeError::Shape(message) if message.contains("moe.partition_index"))
+    );
+}
+
+#[test]
+fn tensor_parallel_metadata_rejects_inconsistent_partition_counts() {
+    let mut tensors = fixture_tensors();
+    add_tensor_metadata(
+        &mut tensors,
+        "layers.0.experts.0.up",
+        &[
+            ("moe.parallel", "tensor"),
+            ("moe.partition_axis", "rows"),
+            ("moe.partition_index", "0"),
+            ("moe.partition_count", "2"),
+            ("moe.collective", "gather"),
+        ],
+    );
+    add_tensor_metadata(
+        &mut tensors,
+        "layers.0.experts.0.down",
+        &[
+            ("moe.parallel", "tensor"),
+            ("moe.partition_axis", "rows"),
+            ("moe.partition_index", "0"),
+            ("moe.partition_count", "3"),
+            ("moe.collective", "gather"),
+        ],
+    );
+    let fixture = build_fixture_with(Vec::new(), tensors, fixture_placement());
+    let runtime = MoeRuntime::new(fixture.open(), MoeRuntimeOptions::default()).unwrap();
+
+    let err = runtime.prepare_layer(0, 2).unwrap_err();
+
+    assert!(matches!(err, MoeRuntimeError::Shape(message) if message.contains("inconsistent")));
 }
 
 #[test]
