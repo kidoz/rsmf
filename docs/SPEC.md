@@ -353,6 +353,7 @@ before the logical tensor can be observed.
 | 108 | `Q6K`     | 256 | 210 | llama.cpp K-quant, 6-bit (near-lossless). |
 | 109 | `Q2K`     | 256 |  84 | llama.cpp K-quant, 2-bit (extreme compression). |
 | 110 | `Fp8E5M2` |   1 |   1 | OCP FP8 E5M2 (bias 15, IEEE-754-shaped, supports ±∞ and NaN). |
+| 111 | `GgufOpaque` | source-defined | source-defined | Opaque GGUF quantized bytes. The exact source type is recorded in tensor metadata `gguf.storage`; RSMF readers preserve bytes but do not dequantize them. |
 
 Unknown discriminants MUST be rejected with a `Structural` error. The
 absent-dtype sentinel `0xFFFF` is reserved for `VariantMeta` and MUST

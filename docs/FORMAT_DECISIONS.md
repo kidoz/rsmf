@@ -153,6 +153,21 @@ prototype, and compares against a single-device CPU reference. WGPU support
 falls back to CPU when adapters are unavailable. No format version bump is
 required because the runtime adds no on-disk semantics.
 
+## D17 — Opaque GGUF quantized storage
+
+`StorageDtype::GgufOpaque = 111` lets GGUF conversion preserve tensor formats
+for which RSMF has no native dequantizer yet, including IQ quants and older
+llama.cpp quant variants. The tensor bytes are stored unchanged and the exact
+source type is carried in per-tensor metadata as `gguf.storage`.
+
+This keeps RSMF useful as a container for runtimes that already implement those
+formats. RSMF's own numeric decode path returns `Unsupported` for
+`GgufOpaque`; consumers must use `TensorView::bytes()` or `tensor_entries()` and
+interpret the payload according to `gguf.storage`.
+
+The change is additive. Older readers reject discriminant `111` with a
+structural error rather than silently misreading bytes.
+
 ## D8 — Source-format conversion priorities
 
 The `rsmf pack` and `rsmf import` CLIs ingest from a fixed priority-ordered
