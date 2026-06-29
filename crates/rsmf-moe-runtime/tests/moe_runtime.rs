@@ -12,8 +12,9 @@ use rsmf_core::{
 #[cfg(feature = "wgpu")]
 use rsmf_moe_runtime::MultiAdapterStatus;
 use rsmf_moe_runtime::{
-    CpuCollectives, ExpertActivation, MoeRoutingPolicy, MoeRuntime, MoeRuntimeError,
-    MoeRuntimeOptions, MoeTransferKind, RuntimeBackend, RuntimeLimits,
+    CpuCollectives, ExpertActivation, MoeCollectiveKind, MoeRoutingPolicy, MoeRuntime,
+    MoeRuntimeError, MoeRuntimeOptions, MoeTransferKind, RuntimeBackend, RuntimeLimits,
+    TensorParallelismStatus,
 };
 use tempfile::{TempDir, tempdir};
 
@@ -169,6 +170,59 @@ fn add_tensor_metadata(tensors: &mut [TensorInput], tensor_name: &str, extra: &[
             .iter()
             .map(|(key, value)| ((*key).to_string(), (*value).to_string())),
     );
+}
+
+fn tensor_parallel_meta(
+    layer: u32,
+    expert: u32,
+    role: &str,
+    axis: &str,
+    index: usize,
+    count: usize,
+    collective: &str,
+) -> Vec<(String, String)> {
+    let mut metadata = moe_meta(layer, Some(expert), role);
+    metadata.extend([
+        ("moe.parallel".to_string(), "tensor".to_string()),
+        ("moe.partition_axis".to_string(), axis.to_string()),
+        ("moe.partition_index".to_string(), index.to_string()),
+        ("moe.partition_count".to_string(), count.to_string()),
+        ("moe.collective".to_string(), collective.to_string()),
+    ]);
+    metadata
+}
+
+fn expert0_down_partitions(
+    axis: &str,
+    collective: &str,
+    indexes: &[usize],
+    count: usize,
+) -> Vec<TensorInput> {
+    let mut tensors = fixture_tensors()
+        .into_iter()
+        .filter(|tensor| tensor.name != "layers.0.experts.0.down")
+        .collect::<Vec<_>>();
+    for (ordinal, &index) in indexes.iter().enumerate() {
+        let (shape, values): ([u64; 2], Vec<f32>) = match (axis, collective, index) {
+            ("rows", "gather", 0) => ([1, 2], vec![1.0, 0.0]),
+            ("rows", "gather", 1) => ([1, 2], vec![0.0, 1.0]),
+            ("rows", "gather", _) => ([1, 2], vec![0.0, 0.0]),
+            ("cols", _, 0) => ([2, 1], vec![1.0, 0.0]),
+            ("cols", _, 1) => ([2, 1], vec![0.0, 1.0]),
+            ("cols", _, _) => ([2, 1], vec![0.0, 0.0]),
+            ("rows", "all_reduce_sum", _) => ([2, 2], vec![1.0, 0.0, 0.0, 1.0]),
+            _ => ([2, 2], vec![1.0, 0.0, 0.0, 1.0]),
+        };
+        tensors.push(tensor(
+            &format!("layers.0.experts.0.down.tp{ordinal}.p{index}"),
+            1,
+            shape,
+            tensor_parallel_meta(0, 0, "down", axis, index, count, collective),
+            &values,
+            Some("layer0.expert0"),
+        ));
+    }
+    tensors
 }
 
 fn build_fixture_with(
@@ -387,6 +441,119 @@ fn tensor_parallel_metadata_builds_collective_plan_and_rejects_execution() {
     assert!(
         matches!(err, MoeRuntimeError::Unsupported(message) if message.contains("tensor-parallel MoE execution"))
     );
+}
+
+#[test]
+fn row_sliced_down_projection_runs_on_cpu_and_reports_gather() {
+    let reference_fixture = build_fixture();
+    let reference_runtime =
+        MoeRuntime::new(reference_fixture.open(), MoeRuntimeOptions::default()).unwrap();
+    let reference = reference_runtime
+        .run_layer_reference_top1(0, &[2.0, 1.0], 2)
+        .unwrap();
+
+    let fixture = build_fixture_with(
+        Vec::new(),
+        expert0_down_partitions("rows", "gather", &[0, 1], 2),
+        fixture_placement(),
+    );
+    let runtime = MoeRuntime::new(fixture.open(), MoeRuntimeOptions::default()).unwrap();
+    let plan = runtime.prepare_layer(0, 2).unwrap();
+
+    assert!(plan.report().collective_plan.required);
+    assert!(matches!(
+        plan.report().tensor_parallelism,
+        TensorParallelismStatus::CpuReference {
+            collective_count: 1
+        }
+    ));
+
+    let output = runtime.run_prepared_layer_top1(&plan, &[2.0, 1.0]).unwrap();
+
+    assert_eq!(output.output_width, 2);
+    assert_eq!(output.output, reference);
+    assert_eq!(output.report.collective_runs.len(), 1);
+    assert_eq!(
+        output.report.collective_runs[0].kind,
+        MoeCollectiveKind::Gather
+    );
+    assert_eq!(output.report.collective_runs[0].element_count, 2);
+}
+
+#[test]
+fn unsupported_tensor_parallel_down_patterns_are_planned_but_not_executed() {
+    for (axis, collective) in [("cols", "gather"), ("rows", "all_reduce_sum")] {
+        let fixture = build_fixture_with(
+            Vec::new(),
+            expert0_down_partitions(axis, collective, &[0, 1], 2),
+            fixture_placement(),
+        );
+        let runtime = MoeRuntime::new(fixture.open(), MoeRuntimeOptions::default()).unwrap();
+        let plan = runtime.prepare_layer(0, 2).unwrap();
+
+        assert!(plan.report().collective_plan.required);
+        assert!(matches!(
+            plan.report().tensor_parallelism,
+            TensorParallelismStatus::Unavailable { .. }
+        ));
+
+        let err = runtime
+            .run_prepared_layer_top1(&plan, &[2.0, 1.0])
+            .unwrap_err();
+
+        assert!(
+            matches!(err, MoeRuntimeError::Unsupported(message) if message.contains("tensor-parallel MoE execution"))
+        );
+    }
+}
+
+#[test]
+fn tensor_parallel_down_partitions_must_be_contiguous() {
+    let fixture = build_fixture_with(
+        Vec::new(),
+        expert0_down_partitions("rows", "gather", &[0, 2, 2], 3),
+        fixture_placement(),
+    );
+    let runtime = MoeRuntime::new(fixture.open(), MoeRuntimeOptions::default()).unwrap();
+
+    let err = runtime.prepare_layer(0, 2).unwrap_err();
+
+    assert!(
+        matches!(err, MoeRuntimeError::Shape(message) if message.contains("contiguous from 0"))
+    );
+}
+
+#[cfg(feature = "wgpu")]
+#[test]
+fn tensor_parallel_down_projection_rejects_active_wgpu_backend() {
+    let fixture = build_fixture_with(
+        Vec::new(),
+        expert0_down_partitions("rows", "gather", &[0, 1], 2),
+        fixture_placement(),
+    );
+    let runtime = MoeRuntime::new(
+        fixture.open(),
+        MoeRuntimeOptions {
+            prefer_wgpu: true,
+            ..MoeRuntimeOptions::default()
+        },
+    )
+    .unwrap();
+    let plan = runtime.prepare_layer(0, 2).unwrap();
+
+    match runtime.backend() {
+        RuntimeBackend::WgpuCompute { .. } => {
+            let err = runtime
+                .run_prepared_layer_top1(&plan, &[2.0, 1.0])
+                .unwrap_err();
+            assert!(
+                matches!(err, MoeRuntimeError::Unsupported(message) if message.contains("WGPU execution is not implemented"))
+            );
+        }
+        RuntimeBackend::CpuFallback { .. } => {
+            runtime.run_prepared_layer_top1(&plan, &[2.0, 1.0]).unwrap();
+        }
+    }
 }
 
 #[test]

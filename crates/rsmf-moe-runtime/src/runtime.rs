@@ -396,6 +396,11 @@ pub enum TensorParallelismStatus {
         /// Human-readable reason.
         reason: String,
     },
+    /// CPU reference execution is available for this tensor-parallel plan.
+    CpuReference {
+        /// Number of CPU collective steps required by the plan.
+        collective_count: usize,
+    },
 }
 
 /// Tensor-parallel partition axis declared by MoE tensor metadata.
@@ -738,7 +743,27 @@ impl MoeRuntime {
         input: &[f32],
         routing_policy: MoeRoutingPolicy,
     ) -> Result<MoeRunOutput> {
-        if plan.report.collective_plan.required {
+        match &plan.report.tensor_parallelism {
+            TensorParallelismStatus::Unavailable { reason } => {
+                return Err(MoeRuntimeError::Unsupported(format!(
+                    "tensor-parallel MoE execution is not implemented: {reason}"
+                )));
+            }
+            TensorParallelismStatus::CpuReference { .. } => {
+                if matches!(self.backend, RuntimeBackend::WgpuCompute { .. }) {
+                    return Err(MoeRuntimeError::Unsupported(
+                        "tensor-parallel WGPU execution is not implemented".to_string(),
+                    ));
+                }
+            }
+            TensorParallelismStatus::NotRequired => {}
+        }
+        if plan.report.collective_plan.required
+            && matches!(
+                plan.report.tensor_parallelism,
+                TensorParallelismStatus::NotRequired
+            )
+        {
             return Err(MoeRuntimeError::Unsupported(format!(
                 "tensor-parallel MoE execution is not implemented: {}",
                 tensor_parallel_unavailable_reason(&plan.report.collective_plan)
@@ -757,7 +782,7 @@ impl MoeRuntime {
         let dispatch_time = dispatch_start.elapsed();
 
         let compute_start = Instant::now();
-        let (output, device_runs) = self.compute_batches(
+        let (output, device_runs, collective_runs) = self.compute_batches(
             &plan.loaded,
             input,
             plan.input_width,
@@ -786,7 +811,7 @@ impl MoeRuntime {
                 gating_time,
                 dispatch_time,
                 compute_time,
-                collective_runs: Vec::new(),
+                collective_runs,
                 combine_time,
             },
         })
@@ -867,7 +892,7 @@ impl MoeRuntime {
                 })?;
             let input_row = &input[assignment.token_idx * plan.input_width
                 ..(assignment.token_idx + 1) * plan.input_width];
-            let row = eval_expert(input_row, expert, self.options.activation)?;
+            let row = eval_expert(input_row, expert, self.options.activation)?.values;
             let out_start = assignment.token_idx * plan.loaded.output_width;
             for (dst, value) in output[out_start..out_start + plan.loaded.output_width]
                 .iter_mut()
@@ -1049,7 +1074,7 @@ impl MoeRuntime {
             }
             let builder = builders.entry(expert_id).or_insert_with(|| ExpertBuilder {
                 up_name: None,
-                down_name: None,
+                down_names: Vec::new(),
                 gate_name: None,
             });
             match &entry.role {
@@ -1060,13 +1085,7 @@ impl MoeRuntime {
                     layer,
                     expert_id,
                 )?,
-                MoeRole::Down => set_once(
-                    &mut builder.down_name,
-                    &entry.tensor_name,
-                    "down",
-                    layer,
-                    expert_id,
-                )?,
+                MoeRole::Down => builder.down_names.push(entry.tensor_name.clone()),
                 MoeRole::Gate => set_once(
                     &mut builder.gate_name,
                     &entry.tensor_name,
@@ -1084,31 +1103,30 @@ impl MoeRuntime {
             let up_name = builder.up_name.ok_or_else(|| {
                 MoeRuntimeError::Missing(format!("layer {layer} expert {expert_id} up tensor"))
             })?;
-            let down_name = builder.down_name.ok_or_else(|| {
-                MoeRuntimeError::Missing(format!("layer {layer} expert {expert_id} down tensor"))
-            })?;
+            if builder.down_names.is_empty() {
+                return Err(MoeRuntimeError::Missing(format!(
+                    "layer {layer} expert {expert_id} down tensor"
+                )));
+            }
             let up = self.load_matrix(&up_name)?;
-            let down = self.load_matrix(&down_name)?;
             if up.cols != input_width {
                 return Err(MoeRuntimeError::Shape(format!(
                     "{up_name} has input width {}, expected {input_width}",
                     up.cols
                 )));
             }
-            if down.cols != up.rows {
-                return Err(MoeRuntimeError::Shape(format!(
-                    "{down_name} input width {} does not match {up_name} hidden width {}",
-                    down.cols, up.rows
-                )));
-            }
+            let down =
+                self.load_down_weights(layer, expert_id, up.rows, builder.down_names.as_slice())?;
+            let down_output_width = down.output_width();
+            let primary_down_name = down.primary_name().to_string();
+            let down_tensor_names = down.tensor_names();
             match output_width {
-                Some(width) if width != down.rows => {
+                Some(width) if width != down_output_width => {
                     return Err(MoeRuntimeError::Shape(format!(
-                        "{down_name} output width {} differs from earlier expert output width {width}",
-                        down.rows
+                        "{primary_down_name} output width {down_output_width} differs from earlier expert output width {width}",
                     )));
                 }
-                _ => output_width = Some(down.rows),
+                _ => output_width = Some(down_output_width),
             }
             let gate_name = builder.gate_name;
             let gate = if let Some(gate_name) = &gate_name {
@@ -1127,24 +1145,43 @@ impl MoeRuntime {
             } else {
                 None
             };
-            let mut shard_tensor_names = vec![up_name.as_str(), down_name.as_str()];
+            let mut tensor_parallel_names = vec![up_name.as_str()];
+            if let Some(gate_name) = &gate_name {
+                tensor_parallel_names.push(gate_name.as_str());
+            }
+            let tensor_parallel =
+                tensor_parallel_spec_for_tensors(&self.file, &tensor_parallel_names)?;
+            if let (Some(non_down), Some(down_spec)) =
+                (&tensor_parallel, down.single_tensor_parallel_spec())
+                && non_down != down_spec
+            {
+                return Err(MoeRuntimeError::Shape(format!(
+                    "tensor-parallel metadata for {} is inconsistent with {}",
+                    down.primary_name(),
+                    tensor_parallel_names[0]
+                )));
+            }
+            let mut shard_tensor_names = vec![up_name.as_str()];
             if let Some(gate_name) = &gate_name {
                 shard_tensor_names.push(gate_name.as_str());
             }
-            let tensor_parallel =
-                tensor_parallel_spec_for_tensors(&self.file, &shard_tensor_names)?;
+            if down.is_single() {
+                shard_tensor_names.push(down.primary_name());
+            }
             let shard_id = shared_expert_shard(&self.file, &shard_tensor_names)?;
             let placement = self.placement_for_shard(shard_id)?;
             let device_ids = placement_device_ids(placement);
-            let prefetch_groups = self.prefetch_groups_for_tensors(shard_tensor_names);
+            let mut prefetch_tensor_names = shard_tensor_names;
+            prefetch_tensor_names.extend(down_tensor_names.iter().map(String::as_str));
+            let prefetch_groups = self.prefetch_groups_for_tensors(prefetch_tensor_names);
             experts.insert(
                 expert_id,
                 ExpertWeights {
                     up_name,
-                    down_name,
+                    down,
+                    down_name: primary_down_name,
                     gate_name,
                     up,
-                    down,
                     gate,
                     shard_id,
                     device_id: placement.primary_device,
@@ -1169,6 +1206,97 @@ impl MoeRuntime {
             experts,
             output_width,
         })
+    }
+
+    fn load_down_weights(
+        &self,
+        layer: u32,
+        expert_id: u32,
+        hidden_width: usize,
+        down_names: &[String],
+    ) -> Result<ExpertDownWeights> {
+        if down_names.len() == 1 {
+            let name = down_names[0].clone();
+            let matrix = self.load_matrix(&name)?;
+            if matrix.cols != hidden_width {
+                return Err(MoeRuntimeError::Shape(format!(
+                    "{name} input width {} does not match hidden width {hidden_width}",
+                    matrix.cols
+                )));
+            }
+            let spec = parse_tensor_parallel_spec(tensor_descriptor(&self.file, &name)?)?;
+            return Ok(ExpertDownWeights::Single { name, matrix, spec });
+        }
+
+        let mut partitions = Vec::with_capacity(down_names.len());
+        for name in down_names {
+            let tensor = tensor_descriptor(&self.file, name)?;
+            let spec = parse_tensor_parallel_spec(tensor)?.ok_or_else(|| {
+                MoeRuntimeError::Shape(format!(
+                    "layer {layer} expert {expert_id} has multiple down tensors; {name} must declare moe.parallel=\"tensor\""
+                ))
+            })?;
+            let matrix = self.load_matrix(name)?;
+            let placement = self.placement_for_shard(tensor.shard_id)?;
+            partitions.push(DownPartition {
+                name: name.clone(),
+                matrix,
+                spec,
+                shard_id: tensor.shard_id,
+                device_id: placement.primary_device,
+                device_ids: placement_device_ids(placement),
+            });
+        }
+        partitions.sort_by_key(|partition| partition.spec.partition_index);
+        validate_down_partition_set(layer, expert_id, hidden_width, &partitions)?;
+
+        let all_row_gather = partitions.iter().all(|partition| {
+            partition.spec.axis == TensorParallelAxis::Rows
+                && partition.spec.collective == TensorParallelCollective::Gather
+        });
+        if all_row_gather {
+            let output_width = partitions.iter().try_fold(0usize, |acc, partition| {
+                acc.checked_add(partition.matrix.rows).ok_or_else(|| {
+                    MoeRuntimeError::Shape("down row-gather output width overflow".to_string())
+                })
+            })?;
+            let device_ids = union_partition_device_ids(&partitions);
+            let step = MoeCollectiveStep {
+                kind: MoeCollectiveKind::Gather,
+                device_ids,
+                element_count: Some(output_width),
+                reason: format!(
+                    "expert {expert_id} down projection uses CPU row-gather across {} partitions",
+                    partitions.len()
+                ),
+            };
+            Ok(ExpertDownWeights::RowGather {
+                partitions,
+                output_width,
+                step,
+            })
+        } else {
+            let output_width = unsupported_down_output_width(&partitions)?;
+            let device_ids = union_partition_device_ids(&partitions);
+            let first_spec = &partitions[0].spec;
+            let step = MoeCollectiveStep {
+                kind: match first_spec.collective {
+                    TensorParallelCollective::Gather => MoeCollectiveKind::Gather,
+                    TensorParallelCollective::AllReduceSum => MoeCollectiveKind::AllReduceSum,
+                },
+                device_ids,
+                element_count: first_spec.element_count,
+                reason: format!(
+                    "expert {expert_id} down projection declares unsupported tensor-parallel {:?}/{:?}",
+                    first_spec.axis, first_spec.collective
+                ),
+            };
+            Ok(ExpertDownWeights::UnsupportedTensorParallel {
+                partitions,
+                output_width,
+                step,
+            })
+        }
     }
 
     fn plan_report(
@@ -1198,16 +1326,13 @@ impl MoeRuntime {
                 prefetch_groups: expert.prefetch_groups.clone(),
             });
 
-            let descriptor = self.device_descriptor(expert.device_id)?;
-            let device = devices
-                .entry(expert.device_id)
-                .or_insert_with(|| PlannedDeviceBuilder::new(descriptor));
-            device.add_expert(
-                expert_id,
-                expert.shard_id,
-                expert_bytes,
-                &expert.prefetch_groups,
-            )?;
+            for (device_id, shard_id, bytes) in expert.resident_device_entries()? {
+                let descriptor = self.device_descriptor(device_id)?;
+                let device = devices
+                    .entry(device_id)
+                    .or_insert_with(|| PlannedDeviceBuilder::new(descriptor));
+                device.add_expert(expert_id, shard_id, bytes, &expert.prefetch_groups)?;
+            }
         }
 
         let transfer_plan = self.transfer_plan(&experts)?;
@@ -1451,7 +1576,7 @@ impl MoeRuntime {
         input_width: usize,
         token_count: usize,
         device_batches: &[DeviceBatch],
-    ) -> Result<(Vec<f32>, Vec<DeviceRunReport>)> {
+    ) -> Result<(Vec<f32>, Vec<DeviceRunReport>, Vec<CollectiveRunReport>)> {
         #[cfg(feature = "wgpu")]
         if let Some(executor) = &self.wgpu {
             return self.compute_batches_wgpu(
@@ -1473,20 +1598,22 @@ impl MoeRuntime {
         input_width: usize,
         token_count: usize,
         device_batches: &[DeviceBatch],
-    ) -> Result<(Vec<f32>, Vec<DeviceRunReport>)> {
+    ) -> Result<(Vec<f32>, Vec<DeviceRunReport>, Vec<CollectiveRunReport>)> {
         let total_output_len = output_len(token_count, loaded.output_width)?;
         self.options
             .limits
             .check_output_elements(total_output_len)?;
         let mut output = vec![0.0; total_output_len];
         let mut device_runs = Vec::new();
+        let mut collective_runs = Vec::new();
         for (device_id, batches) in batches_by_device(device_batches) {
-            let (device_output, device_run) =
+            let (device_output, device_run, mut device_collectives) =
                 self.compute_device_batches_cpu(loaded, input, input_width, device_id, &batches)?;
             accumulate_output(&mut output, &device_output)?;
             device_runs.push(device_run);
+            collective_runs.append(&mut device_collectives);
         }
-        Ok((output, device_runs))
+        Ok((output, device_runs, collective_runs))
     }
 
     fn compute_device_batches_cpu(
@@ -1496,7 +1623,7 @@ impl MoeRuntime {
         input_width: usize,
         device_id: u32,
         batches: &[&DeviceBatch],
-    ) -> Result<(Vec<f32>, DeviceRunReport)> {
+    ) -> Result<(Vec<f32>, DeviceRunReport, Vec<CollectiveRunReport>)> {
         let token_count = checked_token_count(input, input_width)?;
         let total_output_len = output_len(token_count, loaded.output_width)?;
         self.options
@@ -1507,6 +1634,7 @@ impl MoeRuntime {
         let batch_count = batches.len();
         let mut expert_ids = BTreeSet::new();
         let mut device_token_count = 0usize;
+        let mut collective_runs = Vec::new();
         for batch in batches {
             expert_ids.insert(batch.expert_id);
             device_token_count = device_token_count
@@ -1518,11 +1646,12 @@ impl MoeRuntime {
                 .ok_or_else(|| MoeRuntimeError::Missing(format!("expert {}", batch.expert_id)))?;
             for (&token_idx, &weight) in batch.token_indices.iter().zip(&batch.token_weights) {
                 let input_row = &input[token_idx * input_width..(token_idx + 1) * input_width];
-                let row = eval_expert(input_row, expert, self.options.activation)?;
+                let evaluated = eval_expert(input_row, expert, self.options.activation)?;
+                collective_runs.extend(evaluated.collective_runs);
                 let out_start = token_idx * loaded.output_width;
                 for (dst, value) in output[out_start..out_start + loaded.output_width]
                     .iter_mut()
-                    .zip(row)
+                    .zip(evaluated.values)
                 {
                     *dst += value * weight;
                 }
@@ -1540,6 +1669,7 @@ impl MoeRuntime {
                 transfer: crate::transfer::TransferExecutor::cpu_ram().idle_report(),
                 compute_time: device_start.elapsed(),
             },
+            collective_runs,
         ))
     }
 
@@ -1552,7 +1682,7 @@ impl MoeRuntime {
         input_width: usize,
         token_count: usize,
         device_batches: &[DeviceBatch],
-    ) -> Result<(Vec<f32>, Vec<DeviceRunReport>)> {
+    ) -> Result<(Vec<f32>, Vec<DeviceRunReport>, Vec<CollectiveRunReport>)> {
         let total_output_len = output_len(token_count, loaded.output_width)?;
         self.options
             .limits
@@ -1562,7 +1692,7 @@ impl MoeRuntime {
         let mut wgpu_groups: BTreeMap<usize, Vec<(u32, Vec<&DeviceBatch>)>> = BTreeMap::new();
         for (device_id, batches) in batches_by_device(device_batches) {
             let Some(executor_idx) = executor_pool.executor_slot_for_device(device_id) else {
-                let (device_output, device_run) = self.compute_device_batches_cpu(
+                let (device_output, device_run, _) = self.compute_device_batches_cpu(
                     loaded,
                     input,
                     input_width,
@@ -1619,7 +1749,7 @@ impl MoeRuntime {
             accumulate_output(&mut output, &device_output)?;
             device_runs.push(device_run);
         }
-        Ok((output, device_runs))
+        Ok((output, device_runs, Vec::new()))
     }
 
     #[cfg(feature = "wgpu")]
@@ -1697,11 +1827,12 @@ impl MoeRuntime {
                         .collect()
                 }
             };
+            let (down_name, down) = expert.down.single_matrix()?;
             let batch_output = executor.matmul_cached(
-                &expert.down_name,
-                &expert.down.data,
-                expert.down.rows,
-                expert.down.cols,
+                down_name,
+                &down.data,
+                down.rows,
+                down.cols,
                 &hidden,
                 batch.token_indices.len(),
             )?;
@@ -1749,7 +1880,7 @@ struct LoadedLayer {
 #[derive(Debug)]
 struct ExpertBuilder {
     up_name: Option<String>,
-    down_name: Option<String>,
+    down_names: Vec<String>,
     gate_name: Option<String>,
 }
 
@@ -1759,7 +1890,7 @@ struct ExpertWeights {
     down_name: String,
     gate_name: Option<String>,
     up: Matrix,
-    down: Matrix,
+    down: ExpertDownWeights,
     gate: Option<Matrix>,
     shard_id: u64,
     device_id: u32,
@@ -1771,9 +1902,11 @@ struct ExpertWeights {
 impl ExpertWeights {
     fn resident_bytes(&self) -> Result<usize> {
         let mut bytes = self.up.byte_len()?;
-        bytes = bytes.checked_add(self.down.byte_len()?).ok_or_else(|| {
-            MoeRuntimeError::Shape("expert resident byte count overflow".to_string())
-        })?;
+        bytes = bytes
+            .checked_add(self.down.resident_bytes()?)
+            .ok_or_else(|| {
+                MoeRuntimeError::Shape("expert resident byte count overflow".to_string())
+            })?;
         if let Some(gate) = &self.gate {
             bytes = bytes.checked_add(gate.byte_len()?).ok_or_else(|| {
                 MoeRuntimeError::Shape("expert resident byte count overflow".to_string())
@@ -1781,6 +1914,158 @@ impl ExpertWeights {
         }
         Ok(bytes)
     }
+
+    fn resident_device_entries(&self) -> Result<Vec<(u32, u64, usize)>> {
+        let mut primary_bytes = self.up.byte_len()?;
+        if let Some(gate) = &self.gate {
+            primary_bytes = primary_bytes.checked_add(gate.byte_len()?).ok_or_else(|| {
+                MoeRuntimeError::Shape("expert primary resident byte count overflow".to_string())
+            })?;
+        }
+
+        let mut entries = Vec::new();
+        match &self.down {
+            ExpertDownWeights::Single { matrix, .. } => {
+                primary_bytes = primary_bytes
+                    .checked_add(matrix.byte_len()?)
+                    .ok_or_else(|| {
+                        MoeRuntimeError::Shape(
+                            "expert primary resident byte count overflow".to_string(),
+                        )
+                    })?;
+                entries.push((self.device_id, self.shard_id, primary_bytes));
+            }
+            ExpertDownWeights::RowGather { partitions, .. }
+            | ExpertDownWeights::UnsupportedTensorParallel { partitions, .. } => {
+                entries.push((self.device_id, self.shard_id, primary_bytes));
+                for partition in partitions {
+                    entries.push((
+                        partition.device_id,
+                        partition.shard_id,
+                        partition.matrix.byte_len()?,
+                    ));
+                }
+            }
+        }
+        Ok(entries)
+    }
+}
+
+#[derive(Debug)]
+enum ExpertDownWeights {
+    Single {
+        name: String,
+        matrix: Matrix,
+        spec: Option<TensorParallelSpec>,
+    },
+    RowGather {
+        partitions: Vec<DownPartition>,
+        output_width: usize,
+        step: MoeCollectiveStep,
+    },
+    UnsupportedTensorParallel {
+        partitions: Vec<DownPartition>,
+        output_width: usize,
+        step: MoeCollectiveStep,
+    },
+}
+
+impl ExpertDownWeights {
+    fn primary_name(&self) -> &str {
+        match self {
+            ExpertDownWeights::Single { name, .. } => name,
+            ExpertDownWeights::RowGather { partitions, .. }
+            | ExpertDownWeights::UnsupportedTensorParallel { partitions, .. } => {
+                &partitions[0].name
+            }
+        }
+    }
+
+    fn output_width(&self) -> usize {
+        match self {
+            ExpertDownWeights::Single { matrix, .. } => matrix.rows,
+            ExpertDownWeights::RowGather { output_width, .. }
+            | ExpertDownWeights::UnsupportedTensorParallel { output_width, .. } => *output_width,
+        }
+    }
+
+    fn tensor_names(&self) -> Vec<String> {
+        match self {
+            ExpertDownWeights::Single { name, .. } => vec![name.clone()],
+            ExpertDownWeights::RowGather { partitions, .. }
+            | ExpertDownWeights::UnsupportedTensorParallel { partitions, .. } => partitions
+                .iter()
+                .map(|partition| partition.name.clone())
+                .collect(),
+        }
+    }
+
+    fn resident_bytes(&self) -> Result<usize> {
+        match self {
+            ExpertDownWeights::Single { matrix, .. } => matrix.byte_len(),
+            ExpertDownWeights::RowGather { partitions, .. }
+            | ExpertDownWeights::UnsupportedTensorParallel { partitions, .. } => {
+                partitions.iter().try_fold(0usize, |bytes, partition| {
+                    bytes
+                        .checked_add(partition.matrix.byte_len()?)
+                        .ok_or_else(|| {
+                            MoeRuntimeError::Shape(
+                                "down partition resident byte count overflow".to_string(),
+                            )
+                        })
+                })
+            }
+        }
+    }
+
+    #[cfg(feature = "wgpu")]
+    fn single_matrix(&self) -> Result<(&str, &Matrix)> {
+        match self {
+            ExpertDownWeights::Single { name, matrix, .. } => Ok((name, matrix)),
+            ExpertDownWeights::RowGather { .. } => Err(MoeRuntimeError::Unsupported(
+                "row-gather tensor-parallel down projection is CPU-only".to_string(),
+            )),
+            ExpertDownWeights::UnsupportedTensorParallel { step, .. } => {
+                Err(MoeRuntimeError::Unsupported(format!(
+                    "unsupported tensor-parallel down projection requires {:?}",
+                    step.kind
+                )))
+            }
+        }
+    }
+
+    fn single_tensor_parallel_spec(&self) -> Option<&TensorParallelSpec> {
+        match self {
+            ExpertDownWeights::Single { spec, .. } => spec.as_ref(),
+            _ => None,
+        }
+    }
+
+    fn collective_step(&self) -> Option<&MoeCollectiveStep> {
+        match self {
+            ExpertDownWeights::RowGather { step, .. }
+            | ExpertDownWeights::UnsupportedTensorParallel { step, .. } => Some(step),
+            ExpertDownWeights::Single { .. } => None,
+        }
+    }
+
+    fn is_cpu_row_gather(&self) -> bool {
+        matches!(self, ExpertDownWeights::RowGather { .. })
+    }
+
+    fn is_single(&self) -> bool {
+        matches!(self, ExpertDownWeights::Single { .. })
+    }
+}
+
+#[derive(Debug)]
+struct DownPartition {
+    name: String,
+    matrix: Matrix,
+    spec: TensorParallelSpec,
+    shard_id: u64,
+    device_id: u32,
+    device_ids: Vec<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -1837,7 +2122,9 @@ impl PlannedDeviceBuilder {
         bytes: usize,
         prefetch_groups: &[String],
     ) -> Result<()> {
-        self.expert_ids.push(expert_id);
+        if !self.expert_ids.contains(&expert_id) {
+            self.expert_ids.push(expert_id);
+        }
         self.shard_ids.insert(shard_id);
         self.resident_bytes = self.resident_bytes.checked_add(bytes).ok_or_else(|| {
             MoeRuntimeError::Shape("planned device resident byte count overflow".to_string())
@@ -2109,23 +2396,24 @@ struct TensorParallelPlan {
 
 fn tensor_parallel_plan_for_experts(experts: &BTreeMap<u32, ExpertWeights>) -> TensorParallelPlan {
     let mut steps = Vec::new();
+    let mut unavailable_reasons = Vec::new();
     for (&expert_id, expert) in experts {
-        let Some(spec) = &expert.tensor_parallel else {
-            continue;
-        };
-        let kind = match spec.collective {
-            TensorParallelCollective::Gather => MoeCollectiveKind::Gather,
-            TensorParallelCollective::AllReduceSum => MoeCollectiveKind::AllReduceSum,
-        };
-        steps.push(MoeCollectiveStep {
-            kind,
-            device_ids: expert.device_ids.clone(),
-            element_count: spec.element_count,
-            reason: format!(
-                "expert {expert_id} declares tensor parallel {:?} partition {}/{} on {:?}",
-                spec.axis, spec.partition_index, spec.partition_count, expert.device_ids
-            ),
-        });
+        if let Some(spec) = &expert.tensor_parallel {
+            let step = tensor_parallel_step_for_spec(expert_id, spec, &expert.device_ids);
+            unavailable_reasons.push(step.reason.clone());
+            steps.push(step);
+        }
+        if let Some(spec) = expert.down.single_tensor_parallel_spec() {
+            let step = tensor_parallel_step_for_spec(expert_id, spec, &expert.device_ids);
+            unavailable_reasons.push(step.reason.clone());
+            steps.push(step);
+        }
+        if let Some(step) = expert.down.collective_step() {
+            if !expert.down.is_cpu_row_gather() {
+                unavailable_reasons.push(step.reason.clone());
+            }
+            steps.push(step.clone());
+        }
     }
     if steps.is_empty() {
         return TensorParallelPlan {
@@ -2136,14 +2424,45 @@ fn tensor_parallel_plan_for_experts(experts: &BTreeMap<u32, ExpertWeights>) -> T
             },
         };
     }
+    if unavailable_reasons.is_empty() {
+        return TensorParallelPlan {
+            status: TensorParallelismStatus::CpuReference {
+                collective_count: steps.len(),
+            },
+            collective_plan: MoeCollectivePlan {
+                steps,
+                required: true,
+            },
+        };
+    }
     TensorParallelPlan {
         status: TensorParallelismStatus::Unavailable {
-            reason: tensor_parallel_unavailable_reason_for_steps(&steps),
+            reason: unavailable_reasons.join("; "),
         },
         collective_plan: MoeCollectivePlan {
             steps,
             required: true,
         },
+    }
+}
+
+fn tensor_parallel_step_for_spec(
+    expert_id: u32,
+    spec: &TensorParallelSpec,
+    device_ids: &[u32],
+) -> MoeCollectiveStep {
+    let kind = match spec.collective {
+        TensorParallelCollective::Gather => MoeCollectiveKind::Gather,
+        TensorParallelCollective::AllReduceSum => MoeCollectiveKind::AllReduceSum,
+    };
+    MoeCollectiveStep {
+        kind,
+        device_ids: device_ids.to_vec(),
+        element_count: spec.element_count,
+        reason: format!(
+            "expert {expert_id} declares tensor parallel {:?} partition {}/{} on {:?}",
+            spec.axis, spec.partition_index, spec.partition_count, device_ids
+        ),
     }
 }
 
@@ -2156,6 +2475,127 @@ fn tensor_parallel_unavailable_reason_for_steps(steps: &[MoeCollectiveStep]) -> 
         "tensor-sliced expert metadata requires {} collective step(s), but tensor-parallel MoE execution is not implemented",
         steps.len()
     )
+}
+
+fn validate_down_partition_set(
+    layer: u32,
+    expert_id: u32,
+    hidden_width: usize,
+    partitions: &[DownPartition],
+) -> Result<()> {
+    let partition_count = partitions
+        .first()
+        .map(|partition| partition.spec.partition_count)
+        .ok_or_else(|| {
+            MoeRuntimeError::Missing(format!("layer {layer} expert {expert_id} down partitions"))
+        })?;
+    if partition_count != partitions.len() {
+        return Err(MoeRuntimeError::Shape(format!(
+            "layer {layer} expert {expert_id} has {} down partitions but metadata declares partition_count={partition_count}",
+            partitions.len()
+        )));
+    }
+    let mut seen = BTreeSet::new();
+    for (expected_index, partition) in partitions.iter().enumerate() {
+        if partition.spec.partition_count != partition_count {
+            return Err(MoeRuntimeError::Shape(format!(
+                "{} has inconsistent moe.partition_count={} for layer {layer} expert {expert_id}; expected {partition_count}",
+                partition.name, partition.spec.partition_count
+            )));
+        }
+        if !seen.insert(partition.spec.partition_index) {
+            return Err(MoeRuntimeError::Shape(format!(
+                "layer {layer} expert {expert_id} has duplicate down partition index {}",
+                partition.spec.partition_index
+            )));
+        }
+        if partition.spec.partition_index != expected_index {
+            return Err(MoeRuntimeError::Shape(format!(
+                "layer {layer} expert {expert_id} down partitions must be contiguous from 0; found {} at sorted position {expected_index}",
+                partition.spec.partition_index
+            )));
+        }
+    }
+
+    let axis = partitions[0].spec.axis;
+    let collective = partitions[0].spec.collective;
+    for partition in partitions {
+        if partition.spec.axis != axis || partition.spec.collective != collective {
+            return Err(MoeRuntimeError::Shape(format!(
+                "{} has tensor-parallel {:?}/{:?}, inconsistent with earlier {:?}/{:?}",
+                partition.name, partition.spec.axis, partition.spec.collective, axis, collective
+            )));
+        }
+    }
+
+    match (axis, collective) {
+        (TensorParallelAxis::Rows, TensorParallelCollective::Gather) => {
+            for partition in partitions {
+                if partition.matrix.cols != hidden_width {
+                    return Err(MoeRuntimeError::Shape(format!(
+                        "{} input width {} does not match hidden width {hidden_width}",
+                        partition.name, partition.matrix.cols
+                    )));
+                }
+            }
+        }
+        (TensorParallelAxis::Cols, _) => {
+            let rows = partitions[0].matrix.rows;
+            let total_cols = partitions.iter().try_fold(0usize, |cols, partition| {
+                if partition.matrix.rows != rows {
+                    return Err(MoeRuntimeError::Shape(format!(
+                        "{} output width {} differs from earlier partition output width {rows}",
+                        partition.name, partition.matrix.rows
+                    )));
+                }
+                cols.checked_add(partition.matrix.cols).ok_or_else(|| {
+                    MoeRuntimeError::Shape("down column partition width overflow".to_string())
+                })
+            })?;
+            if total_cols != hidden_width {
+                return Err(MoeRuntimeError::Shape(format!(
+                    "layer {layer} expert {expert_id} down column partitions cover hidden width {total_cols}, expected {hidden_width}"
+                )));
+            }
+        }
+        (TensorParallelAxis::Rows, TensorParallelCollective::AllReduceSum) => {
+            let rows = partitions[0].matrix.rows;
+            for partition in partitions {
+                if partition.matrix.rows != rows || partition.matrix.cols != hidden_width {
+                    return Err(MoeRuntimeError::Shape(format!(
+                        "{} shape [{}x{}] is inconsistent with row all-reduce [{}x{hidden_width}]",
+                        partition.name, partition.matrix.rows, partition.matrix.cols, rows
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn unsupported_down_output_width(partitions: &[DownPartition]) -> Result<usize> {
+    let first = partitions
+        .first()
+        .ok_or_else(|| MoeRuntimeError::Missing("down partitions".to_string()))?;
+    match first.spec.axis {
+        TensorParallelAxis::Rows => Ok(first.matrix.rows),
+        TensorParallelAxis::Cols => Ok(first.matrix.rows),
+    }
+}
+
+fn union_partition_device_ids(partitions: &[DownPartition]) -> Vec<u32> {
+    let mut out = Vec::new();
+    for partition in partitions {
+        if !out.contains(&partition.device_id) {
+            out.push(partition.device_id);
+        }
+        for &device_id in &partition.device_ids {
+            if !out.contains(&device_id) {
+                out.push(device_id);
+            }
+        }
+    }
+    out
 }
 
 fn placement_device_ids(placement: &rsmf_core::PlacementRecord) -> Vec<u32> {
@@ -2327,11 +2767,17 @@ fn reject_device_collective(step: &MoeCollectiveStep, backend: &str) -> Result<(
     )))
 }
 
+#[derive(Debug)]
+struct ExpertEvalOutput {
+    values: Vec<f32>,
+    collective_runs: Vec<CollectiveRunReport>,
+}
+
 fn eval_expert(
     input: &[f32],
     expert: &ExpertWeights,
     activation: ExpertActivation,
-) -> Result<Vec<f32>> {
+) -> Result<ExpertEvalOutput> {
     let up = mat_vec(&expert.up, input)?;
     let hidden = match activation {
         ExpertActivation::Identity => up,
@@ -2347,7 +2793,39 @@ fn eval_expert(
                 .collect()
         }
     };
-    mat_vec(&expert.down, &hidden)
+    eval_down(&expert.down, &hidden)
+}
+
+fn eval_down(down: &ExpertDownWeights, hidden: &[f32]) -> Result<ExpertEvalOutput> {
+    match down {
+        ExpertDownWeights::Single { matrix, .. } => Ok(ExpertEvalOutput {
+            values: mat_vec(matrix, hidden)?,
+            collective_runs: Vec::new(),
+        }),
+        ExpertDownWeights::RowGather {
+            partitions, step, ..
+        } => {
+            let mut partition_outputs = Vec::with_capacity(partitions.len());
+            for partition in partitions {
+                partition_outputs.push(mat_vec(&partition.matrix, hidden)?);
+            }
+            let parts = partition_outputs
+                .iter()
+                .map(Vec::as_slice)
+                .collect::<Vec<_>>();
+            let (values, report) = CpuCollectives::execute(step, &parts)?;
+            Ok(ExpertEvalOutput {
+                values,
+                collective_runs: vec![report],
+            })
+        }
+        ExpertDownWeights::UnsupportedTensorParallel { step, .. } => {
+            Err(MoeRuntimeError::Unsupported(format!(
+                "tensor-parallel down projection requiring {:?} is not implemented",
+                step.kind
+            )))
+        }
+    }
 }
 
 fn mat_vec(matrix: &Matrix, input: &[f32]) -> Result<Vec<f32>> {
