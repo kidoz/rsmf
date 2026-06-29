@@ -94,6 +94,11 @@ misses upload decoded resident weight bytes and record elapsed upload time,
 while cache hits report zero transfer bytes. CPU/RAM execution reports
 `MoeTransferKind::None` with zero transfer bytes.
 
+Transfer support is routed through an internal transfer executor boundary. The
+current executors support CPU/RAM no-op transfers and WGPU host-to-device
+resident weight uploads. Device-to-host and peer-to-peer movement remain typed
+unsupported operations until real backend copy paths exist.
+
 Mixed placement is supported at the batch boundary: WGPU placement devices use
 the executor pool, while unmapped/CPU placement devices fall back to the CPU
 expert path.
