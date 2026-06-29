@@ -1446,13 +1446,7 @@ impl MoeRuntime {
                 token_count: device_token_count,
                 weight_cache_hits: 0,
                 weight_cache_misses: 0,
-                transfer: TransferRunReport {
-                    kind: MoeTransferKind::None,
-                    bytes: 0,
-                    duration: Duration::ZERO,
-                    cache_hits: 0,
-                    cache_misses: 0,
-                },
+                transfer: crate::transfer::TransferExecutor::cpu_ram().idle_report(),
                 compute_time: device_start.elapsed(),
             },
         ))
@@ -1557,7 +1551,8 @@ impl MoeRuntime {
         let batch_count = batches.len();
         let mut expert_ids = BTreeSet::new();
         let mut device_token_count = 0usize;
-        let mut transfer = WgpuTransferStats::default();
+        let transfer_executor = crate::transfer::TransferExecutor::wgpu();
+        let mut transfer = transfer_executor.accumulator();
         for batch in batches {
             expert_ids.insert(batch.expert_id);
             device_token_count = device_token_count
@@ -1636,6 +1631,7 @@ impl MoeRuntime {
                 }
             }
         }
+        let transfer_report = transfer.finish();
         Ok((
             output,
             DeviceRunReport {
@@ -1643,9 +1639,9 @@ impl MoeRuntime {
                 expert_ids: expert_ids.into_iter().collect(),
                 batch_count,
                 token_count: device_token_count,
-                weight_cache_hits: transfer.cache_hits,
-                weight_cache_misses: transfer.cache_misses,
-                transfer: transfer.into_report(),
+                weight_cache_hits: transfer_report.cache_hits,
+                weight_cache_misses: transfer_report.cache_misses,
+                transfer: transfer_report,
                 compute_time: device_start.elapsed(),
             },
         ))
@@ -1818,55 +1814,16 @@ fn accumulate_output(output: &mut [f32], device_output: &[f32]) -> Result<()> {
 }
 
 #[cfg(feature = "wgpu")]
-#[derive(Debug, Default)]
-struct WgpuTransferStats {
-    bytes: usize,
-    duration: Duration,
-    cache_hits: usize,
-    cache_misses: usize,
-}
-
-#[cfg(feature = "wgpu")]
-impl WgpuTransferStats {
-    fn into_report(self) -> TransferRunReport {
-        TransferRunReport {
-            kind: MoeTransferKind::HostToDevice,
-            bytes: self.bytes,
-            duration: self.duration,
-            cache_hits: self.cache_hits,
-            cache_misses: self.cache_misses,
-        }
-    }
-}
-
-#[cfg(feature = "wgpu")]
 fn record_wgpu_transfer(
-    stats: &mut WgpuTransferStats,
+    accumulator: &mut crate::transfer::TransferAccumulator,
     output: &crate::wgpu_compute::WgpuMatmulOutput,
 ) -> Result<()> {
-    add_cache_event(
-        &mut stats.cache_hits,
-        &mut stats.cache_misses,
-        output.cache_hit,
-    )?;
-    stats.bytes = stats
-        .bytes
-        .checked_add(output.transfer_bytes)
-        .ok_or_else(|| MoeRuntimeError::Shape("WGPU transfer byte count overflow".to_string()))?;
-    stats.duration = stats
-        .duration
-        .checked_add(output.transfer_time)
-        .ok_or_else(|| MoeRuntimeError::Shape("WGPU transfer duration overflow".to_string()))?;
-    Ok(())
-}
-
-#[cfg(feature = "wgpu")]
-fn add_cache_event(hits: &mut usize, misses: &mut usize, cache_hit: bool) -> Result<()> {
-    let counter = if cache_hit { hits } else { misses };
-    *counter = counter
-        .checked_add(1)
-        .ok_or_else(|| MoeRuntimeError::Shape("WGPU weight cache counter overflow".to_string()))?;
-    Ok(())
+    if output.cache_hit != (output.transfer.cache_hits > 0) {
+        return Err(MoeRuntimeError::Shape(
+            "WGPU cache event does not match transfer report".to_string(),
+        ));
+    }
+    accumulator.record(&output.transfer)
 }
 
 fn max_abs_diff(left: &[f32], right: &[f32]) -> Result<f32> {

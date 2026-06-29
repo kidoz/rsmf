@@ -9,6 +9,8 @@ use pollster::FutureExt;
 use rsmf_core::{DeviceKind, PlacementManifest};
 use wgpu::util::DeviceExt;
 
+use crate::TransferRunReport;
+use crate::transfer::{TransferEvent, TransferExecutor};
 use crate::{MoeRuntimeError, Result};
 
 const SHADER: &str = r#"
@@ -70,10 +72,8 @@ pub(crate) struct WgpuMatmulOutput {
     pub(crate) values: Vec<f32>,
     /// True when the matrix buffer was already resident on the adapter.
     pub(crate) cache_hit: bool,
-    /// Host-to-device resident matrix bytes uploaded for this matmul.
-    pub(crate) transfer_bytes: usize,
-    /// Wall time spent materializing the resident matrix upload.
-    pub(crate) transfer_time: Duration,
+    /// Transfer report for the resident matrix buffer lookup/upload.
+    pub(crate) transfer: TransferRunReport,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -243,8 +243,11 @@ impl WgpuExecutor {
             return Ok(WgpuMatmulOutput {
                 values: Vec::new(),
                 cache_hit: true,
-                transfer_bytes: 0,
-                transfer_time: Duration::ZERO,
+                transfer: TransferExecutor::wgpu().execute(TransferEvent::host_to_device(
+                    0,
+                    Duration::ZERO,
+                    true,
+                ))?,
             });
         }
         let expected_matrix = rows.checked_mul(cols).ok_or_else(|| {
@@ -347,8 +350,7 @@ impl WgpuExecutor {
         Ok(WgpuMatmulOutput {
             values: out,
             cache_hit: cached_matrix.cache_hit,
-            transfer_bytes: cached_matrix.transfer_bytes,
-            transfer_time: cached_matrix.transfer_time,
+            transfer: cached_matrix.transfer,
         })
     }
 
@@ -374,8 +376,11 @@ impl WgpuExecutor {
             return Ok(CachedMatrixBuffer {
                 buffer,
                 cache_hit: true,
-                transfer_bytes: 0,
-                transfer_time: Duration::ZERO,
+                transfer: TransferExecutor::wgpu().execute(TransferEvent::host_to_device(
+                    0,
+                    Duration::ZERO,
+                    true,
+                ))?,
             });
         }
 
@@ -397,8 +402,11 @@ impl WgpuExecutor {
         Ok(CachedMatrixBuffer {
             buffer,
             cache_hit: false,
-            transfer_bytes,
-            transfer_time,
+            transfer: TransferExecutor::wgpu().execute(TransferEvent::host_to_device(
+                transfer_bytes,
+                transfer_time,
+                false,
+            ))?,
         })
     }
 }
@@ -407,8 +415,7 @@ impl WgpuExecutor {
 struct CachedMatrixBuffer {
     buffer: wgpu::Buffer,
     cache_hit: bool,
-    transfer_bytes: usize,
-    transfer_time: Duration,
+    transfer: TransferRunReport,
 }
 
 fn storage_entry(binding: u32, read_only: bool) -> wgpu::BindGroupLayoutEntry {

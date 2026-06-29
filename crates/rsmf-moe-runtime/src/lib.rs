@@ -32,6 +32,7 @@ use rsmf_core::RsmfError;
 
 mod routing;
 mod runtime;
+mod transfer;
 #[cfg(feature = "wgpu")]
 mod wgpu_compute;
 
