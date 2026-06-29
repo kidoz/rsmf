@@ -28,6 +28,7 @@ safetensors = { workspace = true, optional = true }
 gguf-rs-lib = { workspace = true, optional = true, features = ["mmap"] }
 ndarray = { version = "0.17", optional = true }
 ndarray-npy = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
 zstd = { workspace = true, optional = true }
 
 [features]
@@ -36,7 +37,7 @@ default = ["safetensors", "gguf", "npy"]
 # archives into RSMF files. Keeps the default build useful for the CLI.
 safetensors = ["dep:safetensors"]
 # Enables `rsmf_core::gguf` module for GGUF conversion.
-gguf = ["dep:gguf-rs-lib"]
+gguf = ["dep:gguf-rs-lib", "dep:serde_json"]
 # Enables `rsmf_core::npy` module for NumPy conversion.
 npy = ["dep:ndarray", "dep:ndarray-npy"]
 # Enables zstd compression for graph and asset sections.

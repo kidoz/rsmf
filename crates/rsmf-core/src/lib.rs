@@ -49,6 +49,8 @@ pub use adapter::{
     Adapter, AdapterEntry, AdapterIndex, AdapterKind, AdapterRole, adapter_index_from_manifest,
 };
 pub use error::{Result, RsmfError};
+#[cfg(feature = "gguf")]
+pub use gguf_convert::{GgufMetaValue, decode_gguf_metadata};
 pub use lazy_reader::{LazyRsmfFile, RangeReader, SliceRangeReader};
 pub use moe::{MoeEntry, MoeGroup, MoeIndex, MoeRole, moe_index_from_manifest};
 pub use placement::{

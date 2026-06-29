@@ -433,6 +433,16 @@ impl RsmfFile {
         &self.manifest
     }
 
+    /// Return typed GGUF metadata reconstructed from `gguf.*` manifest entries.
+    ///
+    /// Keys are returned without the `gguf.` prefix so callers can build
+    /// GGUF-style metadata maps directly.
+    #[cfg(feature = "gguf")]
+    #[must_use]
+    pub fn gguf_metadata(&self) -> std::collections::BTreeMap<String, crate::GgufMetaValue> {
+        crate::decode_gguf_metadata(&self.manifest.metadata)
+    }
+
     /// Return a PyTorch-style state dict view of tensor names, dtypes, shapes,
     /// variants, shard ids, and tensor metadata.
     ///
